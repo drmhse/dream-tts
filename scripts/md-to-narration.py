@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""Markdown -> narration text.
+"""Markdown -> narration text. **The reference implementation, not the runtime.**
+
+`crates/tts-narrate` is a port of this file and is what actually narrates — `dream-tts
+narrate` replaced `md-to-narration.py` in the pipeline, which is what removed Python from
+the critical path and made a curl-only install able to narrate a document.
+
+This stays in the tree for two jobs it does better than the port:
+
+  * It is the long-form record of *why* each rule exists. Every rule below was arrived at by
+    listening to a failure, and the paragraph explaining which failure is worth more here
+    than it would be inline in Rust.
+  * It is the oracle. `scripts/check-narrate.sh` runs both implementations over 6190 lines
+    and 621 documents and requires byte-identical output, which is the only real evidence
+    that a port of a thousand regexes matches the original.
+
+So a rule change belongs in *both*, and the harness is what stops one from drifting.
 
 Feeding raw markdown to a TTS engine reads the syntax aloud: "plus plus plus",
 "title equals", "hash hash". This strips the notation and keeps the prose, making the
@@ -697,6 +712,13 @@ def clean_inline(line: str) -> str:
     # string the listener cannot write down anyway. The host is the part that identifies it.
     line = re.sub(r"<(https?://[^>]*)>", lambda m: _speak_url(m.group(1)), line)
     line = re.sub(r"(?<![\w<])https?://\S+", lambda m: _speak_url(m.group(0)), line)
+    # A bare DOI. The `https://doi.org/...` form is handled above; this is the `doi:10.../...`
+    # spelling a reference list uses, and the rule above never sees it because it has no
+    # scheme. Twenty-six characters of digits, dots and slashes is the input most likely to
+    # send the AR loop into babble, and on this paper's abstract it did: the engine reported
+    # "segment 11 runs long -- 261 frames for 173 chars" and the audio was nonsense there.
+    # A narrator says "DOI" and moves on; the number is on the page for anyone who wants it.
+    line = re.sub(r"\bdoi:\s*10\.\d{4,9}/\S+", "DOI", line, flags=re.I)
     # Markdown task-list markers. `- [ ] item` keeps its bullet stripped elsewhere, but the
     # checkbox itself stayed, so the voice read the brackets: 24 of them in one chapter, 34 in
     # another. They carry no spoken meaning.

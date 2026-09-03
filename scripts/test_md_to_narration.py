@@ -148,6 +148,13 @@ class Citations(unittest.TestCase):
         self.assertEqual(clean("Data at https://doi.org/10.1234/abcd.5678 (accessed)"),
                          "Data at doi.org (accessed)")
 
+    def test_a_bare_doi_is_not_read_as_its_digits(self):
+        # This made the AR loop babble on a real paper: "segment 11 runs long -- 261 frames
+        # for 173 chars", and the audio there was nonsense.
+        self.assertEqual(clean("2025. doi:10.14778/3773749.3773760 PVLDB Artifact"),
+                         "2025. DOI PVLDB Artifact")
+        self.assertEqual(clean("doing 10.5 of them"), "doing 10.5 of them")
+
     def test_footnotes(self):
         out = convert("A claim.[^1]\n\n[^1]: The replication package.\n")
         self.assertEqual(out, "A claim.\n\nFootnote 1. The replication package.\n")

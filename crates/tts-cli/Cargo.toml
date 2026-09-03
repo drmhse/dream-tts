@@ -1,6 +1,6 @@
 [package]
 name = "tts-cli"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 
@@ -9,12 +9,24 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 tts-core = { path = "../tts-core", default-features = false }
 tts-engines = { path = "../tts-engines", default-features = false }
+tts-narrate = { path = "../tts-narrate" }
+tts-import = { path = "../tts-import" }
+tts-jobs = { path = "../tts-jobs" }
+# Talking to the local service. No TLS feature: the service binds loopback by default and
+# a TLS stack here would add megabytes and a dylib for a connection to 127.0.0.1.
+ureq = { version = "3", default-features = false, features = ["json"] }
 candle-core = { workspace = true }
+# `tts config` prints the settings back as JSON, which is the format they were written in.
+serde_json = "1"
+# Only for restoring SIGPIPE's default disposition; see main().
+libc = "0.2"
 
 [features]
 default = ["metal"]
 metal = ["tts-engines/metal", "tts-core/metal", "candle-core/metal"]
 
+# `tts` is taken: coqui-TTS installs a binary by that name. The crate keeps its internal
+# name; only what lands on a user's PATH is namespaced.
 [[bin]]
-name = "tts"
+name = "dream-tts"
 path = "src/main.rs"

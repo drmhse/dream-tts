@@ -5,6 +5,9 @@ members = [
     "crates/tts-nn",
     "crates/tts-bench",
     "crates/tts-engines",
+    "crates/tts-narrate",
+    "crates/tts-import",
+    "crates/tts-jobs",
     "crates/tts-cli",
     "crates/tts-serve",
     "crates/audio8",
@@ -14,6 +17,9 @@ members = [
 ]
 
 [workspace.package]
+# One version for the whole workspace, so a `v*` tag names exactly one artifact set and a
+# prebuilt binary can be matched against the source it was built from.
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.82"

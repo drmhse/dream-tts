@@ -1,0 +1,21 @@
+[package]
+name = "tts-import"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+# DOCX, ODT and EPUB are all a zip of XML, so one pair of dependencies covers three formats
+# and neither pulls a C library — which is what keeps `bin/` free of non-system dylibs.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+quick-xml = "0.37"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# PDF text extraction. PDFKit lives in /System/Library/Frameworks, so it costs nothing to
+# install and satisfies the release audit that refuses any non-system dynamic dependency.
+# The pure-Rust extractors are poor on real book layouts and none of them read the outline,
+# which is where chapter boundaries actually are.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL", "NSArray", "NSDictionary", "NSValue"] }
+objc2-pdf-kit = { version = "0.3", default-features = false, features = ["std", "PDFDocument", "PDFPage", "PDFOutline", "PDFDestination"] }

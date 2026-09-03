@@ -1,0 +1,15 @@
+[package]
+name = "tts-jobs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# For `kill(pid, 0)`: telling a live run from a job left behind by a killed server.
+libc = "0.2"
+# Job identity is a content hash, so the same book resubmitted is the same run. A
+# collision would silently merge two books, which rules out a short non-crypto hash.
+sha2 = "0.10"
