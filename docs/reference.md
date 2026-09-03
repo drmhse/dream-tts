@@ -1,4 +1,4 @@
-# tts-rs reference
+# dream-tts reference
 
 Everything beyond the README: setup, architecture, how it validates, how fast it is, the
 traps each port hit, and what did not work.
@@ -15,32 +15,68 @@ traps each port hit, and what did not work.
 
 ## Setup
 
+Two entry points. Neither needs anything the machine does not already have except `curl`.
+
 ```sh
-./scripts/bootstrap.sh                       # all three engines, ~13 GB, nothing manual
-./scripts/bootstrap.sh --list                # the ids, their models, what each costs
-./scripts/bootstrap.sh qwen3tts              # just one, ~4.3 GB
-./scripts/bootstrap.sh audio8 cosyvoice      # two
-./scripts/bootstrap.sh --force audio8        # redo a conversion that already ran
+# No toolchain, no clone: unpack a published release, then download the model.
+curl -fsSL https://raw.githubusercontent.com/drmhse/dream-tts/main/install.sh | sh
+cd dream-tts && ./scripts/bootstrap.sh
 ```
 
-That is the whole setup. It checks the toolchain, downloads and converts all three
-checkpoints, fetches the fixtures, and builds; every step is skipped if its output already
-exists, so re-running costs nothing. The rest of this section is what it does on your behalf,
-for when a step fails or you want to do one by hand.
+```sh
+# From a clone.
+./scripts/bootstrap.sh                       # qwen3tts, the default, ~4.3 GB
+./scripts/bootstrap.sh --all                 # all three engines, ~13 GB
+./scripts/bootstrap.sh --list                # the ids, their models, what each costs
+./scripts/bootstrap.sh audio8 cosyvoice      # two of them
+./scripts/bootstrap.sh --force audio8        # redo a conversion that already ran
+./scripts/bootstrap.sh --prebuilt            # download the binaries rather than build them
+```
 
-Voice assets are already in the repo (`voices/`, ~200 KB), so cloning a voice needs no
-PyTorch — only building a *new* one does. **No engine needs its upstream repository**: the two
-CosyVoice artifacts that cannot be derived without one are fetched as assets.
+That is the whole setup. It resolves how to get binaries, downloads and converts the
+checkpoints you asked for, fetches the fixtures, and either builds or downloads; every step
+is skipped if its output already exists, so re-running costs nothing. The rest of this
+section is what it does on your behalf, for when a step fails or you want to do one by hand.
+
+**Why the default is one engine.** `qwen3tts` alone is the only configuration whose setup is
+downloads and nothing else — no conversion, so no Python, so no torch venv. `audio8` folds a
+`weight_norm` pickle and `cosyvoice` re-serialises a `torch.load`, and both want python
+>= 3.10. Naming either is what buys that cost. The default used to be all three, which meant
+every first run paid ~13 GB and a 2.5 GB venv to get an engine that is also the slowest of
+the three on book-length text.
+
+**Building versus downloading.** `bootstrap.sh` builds when there is a toolchain *and*
+sources, and downloads `scripts/fetch-prebuilt.sh`'s archive otherwise; `--build` and
+`--prebuilt` force either. `cargo build` rebuilds when the source moved and a downloaded
+binary cannot, which is why building wins the tie. For the same reason `fetch-prebuilt.sh`
+refuses to install into a git checkout that is dirty or not exactly on the release tag: a
+fixture gate run by a binary built from other source is a gate that lies about the code you
+are reading. It resolves the release from the checkout's own version, never from "latest".
+
+`./dream-tts` and `./dream-tts-serve` are shims over both paths — `cargo run` when there is
+a toolchain and sources, `bin/<name>` when there is not. `DREAM_TTS_PREBUILT=1` forces the
+shipped binary; `DREAM_TTS_BIN_DIR` points at one somewhere else. Both resolve their own
+symlinks, so a link on PATH works. See [scripts/run-bin.sh](../scripts/run-bin.sh).
+
+Voice assets are already in the repo (`voices/`, ~450 KB) and in the release archive, so
+cloning a voice needs no PyTorch — only building a *new* one does. **No engine needs its
+upstream repository**: the two CosyVoice artifacts that cannot be derived without one are
+fetched as assets.
 
 | level | you get | needs |
 |---|---|---|
-| 1. Audio8 | `tts speak --engine audio8` | Rust, python ≥ 3.10, ~4 GB |
-| 2. CosyVoice / Qwen3-TTS | those engines | their checkpoints, ~4 GB each |
+| 0. Qwen3-TTS | `dream-tts speak`, the default engine | curl, ~4.3 GB |
+| 1. Audio8 | `dream-tts speak --engine audio8` | python >= 3.10, ~4 GB |
+| 2. CosyVoice | that engine | python >= 3.10, ~4 GB |
 | 3. Regenerate fixtures | the gates rebuilt from source | upstream CosyVoice repo, python 3.10 |
 
-Everything assumes macOS on Apple silicon. `cargo build --no-default-features` drops the
-Metal kernels for CPU fallbacks and is the only configuration Linux can build, since candle's
-`metal` feature does not exist off Apple platforms.
+Levels 1 and 2 need Rust only if you are building rather than downloading.
+
+Everything assumes macOS on Apple silicon; prebuilt binaries are published for
+`aarch64-apple-darwin` alone and target macOS 13 or newer.
+`cargo build --no-default-features` drops the Metal kernels for CPU fallbacks and is the
+only configuration Linux can build, since candle's `metal` feature does not exist off Apple
+platforms — a portability guarantee, not something a release ships.
 
 ### 1. Audio8
 
@@ -112,10 +148,10 @@ cd references/audio8 && .venv/bin/python dump_fixtures.py --weights weights --ou
 
 cd /path/to/CosyVoice            # needs the upstream repo on PYTHONPATH
 PYTHONPATH=.:third_party/Matcha-TTS .venv/bin/python \
-    /path/to/tts-rs/references/cosyvoice/dump_fixtures.py \
+    /path/to/dream-tts/references/cosyvoice/dump_fixtures.py \
     --model-dir pretrained_models/Fun-CosyVoice3-0.5B \
-    --voice /path/to/tts-rs/voices/cosy-default-cosyvoice \
-    --out /path/to/tts-rs/fixtures/cosyvoice
+    --voice /path/to/dream-tts/voices/cosy-default-cosyvoice \
+    --out /path/to/dream-tts/fixtures/cosyvoice
 
 references/qwen3tts/.venv/bin/python references/qwen3tts/dump_fixtures.py \
     --model references/qwen3tts/weights --voice voices/cosy-default-qwen3tts --out fixtures/qwen3tts
@@ -244,7 +280,7 @@ This is why the narration path uses `f16` and why `qwen3tts` is the default for 
 being the slowest of the three on a short passage. Reproduce with:
 
 ```sh
-cargo run -p tts-cli --release -- speak --engine qwen3tts \
+./dream-tts speak --engine qwen3tts \
     --voice voices/cosy-default-qwen3tts --quant f16 \
     --text-file examples/chapter.txt --out chapter.wav
 ```
@@ -377,7 +413,7 @@ one step earlier, to the traps.
 
 ## Serving and narration
 
-`tts-serve` replaces the Python FastAPI service and speaks the same protocol, verified side by
+`dream-tts-serve` replaces the Python FastAPI service and speaks the same protocol, verified side by
 side on the same request: identical WAV format (`RIFF`, PCM, mono, 16-bit), identical
 `X-Audio-Seconds` / `X-Wall-Seconds` / `X-RTF` / `X-Audio-Format` / `Content-Disposition`
 headers, identical auth (`Bearer` or `X-API-Key`, constant-time compare, `503` when no key is
@@ -399,10 +435,36 @@ One GPU, so synthesis is serialised behind a semaphore — two requests interlea
 queue make both slower and neither faster — and runs on `spawn_blocking` so it never occupies
 an async worker. `/tts/stream` is buffered, not incremental.
 
+**`GET /` has two audiences.** JSON to a client, a self-contained HTML page to a browser,
+negotiated on `Accept` and overridable with `?format=json` / `?format=html`. A wildcard
+`*/*` — what curl sends — counts as a machine and gets JSON; only a client that names
+`text/html` gets the page. The page carries the routes, the request body, the response
+headers, the auth rule, and this process's live engine, voice, port and settings file. It
+loads nothing from the network: a local service that cannot explain itself offline is broken
+in exactly the situation someone is most likely to be reading it. Everything interpolated
+into it is a number, an engine-supplied `&'static str`, or an HTML-escaped path.
+
+**`POST /tts` takes `text/plain` as well as JSON.** The body is the text; `X-Seed` and
+`X-Voice` carry what the JSON fields would. It exists because `narrate-book.sh` built its
+request body with a `python3 -c "import json…"` per chapter — a Python dependency on the
+critical path of the one feature that is supposed to run with nothing but curl, and quoting
+arbitrary prose into JSON from bash is a bug waiting for an apostrophe. JSON remains the
+default for any other content type, including none, so an existing client is unaffected.
+
+With that gone, `narrate-book.sh` needs **ffmpeg and nothing else** outside the binaries;
+`--no-align` drops the last optional interpreter. Verified by running a chapter end to end
+with `python3` replaced by a stub that exits 127.
+
+`DREAM_TTS_API_KEY` is checked first and `TTS_API_KEY` still works, because an existing
+deployment's environment is part of the wire compatibility this claims. The default port
+stays `3003` (via `PORT`, then `serve.port`, then that) for the same reason; a port already
+in use is answered with the `lsof` line that names the holder rather than a bare
+"Address already in use".
+
 ### Narrating a long document
 
 ```sh
-scripts/narrate-book.sh --book path/to/document --out narration --engine qwen3tts
+scripts/narrate-book.sh --book path/to/document --out narration
 scripts/verify-narration.py narration/*.webm
 ```
 
@@ -423,6 +485,400 @@ interpolated in every occurrence, which turns a 146,000-word book into a short l
 for free.
 
 ---
+
+## Settings and storage
+
+Everything in this section exists because the thing stopped being a repository you build and
+started being an application someone installs.
+
+### The settings file
+
+`dream-tts.json` beside the install, or `~/.config/dream-tts/config.json`.
+[`dream-tts.example.json`](../dream-tts.example.json) is the annotated copy.
+
+| | |
+|---|---|
+| `engine`, `voice`, `quant` | what to synthesize with |
+| `data_dir` | where the 4-13 GB lives |
+| `max_chars`, `gaps` | segmentation |
+| `gpu_lock` | the advisory lock below |
+| `serve.host`, `serve.port`, `serve.max_chars`, `serve.segment_chars` | the service |
+
+Precedence, written down once in `tts_core::config` and honoured by both binaries: **flag >
+environment > `dream-tts.json` > user config > built-in default**. Every key is optional.
+Keys beginning with `//` are comments, stripped before deserialization; every *other*
+unknown key is a hard error, because a misspelled key that silently does nothing is the
+worst outcome available — the user believes they configured something.
+
+`dream-tts config` prints what resolved and what decided it. Without that, a config file
+being ignored — wrong directory, `DREAM_TTS_CONFIG` set in a shell profile — is
+indistinguishable from one whose values happen to match the defaults.
+
+### Two roots, deliberately distinct
+
+**root** is the installation: binaries, `voices/`, `scripts/`. Small, replaced wholesale by
+an upgrade. `DREAM_TTS_ROOT`, which the shims export, else the working directory.
+
+**data_dir** is the downloads: checkpoints and fixtures. Survives an upgrade, and is the
+thing someone wants on an external disk. `DREAM_TTS_DATA_DIR`, else `data_dir`, else the
+root — which is exactly what every path in this repo meant before the setting existed, so
+relocation is opt-in and nothing changes for someone who never writes a config.
+
+Paths the *user* supplies are resolved leniently: as typed if that exists, otherwise against
+the install root. The working directory wins, so nothing shipped can shadow a local file —
+but `--voice voices/…`, the form every doc uses, keeps working when `dream-tts` is invoked
+from elsewhere through a symlink on PATH. And `--voice` may be omitted entirely: every engine
+here clones from an asset, so the shipped one is used rather than failing on a decision the
+caller has no information to make.
+
+### Downloading
+
+`scripts/fetch-weights.sh` HEADs every file before fetching any, so the progress bar knows
+the total byte count up front. Three properties the plain `curl -fsSL` loop it replaced did
+not have:
+
+- **Byte progress across the whole set.** A per-file percentage is useless when file 7 of 11
+  is 4 GB and the other ten are 2 KB each.
+- **Resume that is accounted for.** `curl -C -` already resumed, silently, so a resumed 4 GB
+  download looked identical to a stalled one. Bytes on disk now count as progress and the
+  summary says how many were skipped.
+- **Verification.** Hugging Face returns `x-linked-etag` for LFS-backed files and it is the
+  content's sha256, so the large files are checked rather than merely counted. Small files
+  have no such header and are checked by length. A failure deletes the file rather than
+  leaving a plausible-looking truncation.
+
+Verified digests go in `<data_dir>/references/<engine>/weights/.weights-manifest`, so a
+re-run costs three HEAD requests instead of re-hashing gigabytes. Delete it to force full
+re-verification.
+
+### One engine on the GPU
+
+A single render peaks well above what a 16 GB machine can spare alongside a second engine,
+and two resident engines drive it into swap — which looks like the models getting slower
+rather than like a mistake. `tts_core::lock` takes an advisory `flock` on
+`<data_dir>/.dream-tts-gpu.lock` for the lifetime of the render, or of the service process.
+
+Advisory is the right strength: it is per-weights rather than per-machine, two independent
+installs do not contend, and anything that declines to take it is simply uncovered rather
+than blocked. It is taken *before* the weights load, because the load is itself most of the
+memory pressure. A second process is refused immediately, naming the first — never made to
+wait silently, since these operations run for minutes. `--no-gpu-lock` opts out.
+
+This replaces a `pgrep` against `target/release/dream-tts` in the narration scripts, a
+heuristic that broke the moment binaries could also live in `bin/` and that never saw a
+process started any other way. The `pgrep` remains as belt, because it produces a better
+message before a 3 s model load than after one.
+
+### Terminal output
+
+Decoration is never part of the data. A pipe, a file, a CI log, `NO_COLOR=1`, `CLICOLOR=0`
+and `TERM=dumb` all get the same plain text, so `dream-tts storage | grep` and
+`dream-tts config > issue.txt` behave; `CLICOLOR_FORCE` overrides in the other direction.
+Escape codes leaking into a redirect is the classic way a pretty CLI becomes an unusable
+one. Progress goes to stderr and results to stdout, so redirecting either one still makes
+sense on its own.
+
+Engines report progress as **segments completed per stage** (`tts_core::ProgressEvent`) —
+the one unit every engine has, and the same unit the caller's text was split into. Each
+stage counts from zero, so a three-stage engine reports three passes rather than one merged
+fiction; that matches the stage breakdown printed at the end and is honest about where the
+time goes. A batched stage steps by the group size rather than interpolating inside a call
+it cannot see into.
+
+Progress lines carry **position only, never a duration.** A stage whose work happens inside
+one call reports a single event *after* it — the qwen3tts codec decodes a whole utterance at
+once — so timing from that event measures nothing and would print `0.0s` for 3.5 seconds of
+work. The synchronised breakdown is the only honest source for time, and progress does not
+compete with it. The live bar's ETA is derived from the running stage's own observed rate,
+which is legitimate while it is still running; extrapolating across stages would be a guess,
+since an engine's stages differ in cost per segment by an order of magnitude. See
+[How to measure without fooling yourself](#how-to-measure-without-fooling-yourself) for why
+this repo is careful here.
+
+### Namespacing
+
+`dream-tts`, `dream-tts-serve`, `dream-tts.json`, `DREAM_TTS_*`, `~/.config/dream-tts/`,
+`.dream-tts-gpu.lock`. `tts` alone belongs to whoever installed it first — coqui-TTS ships a
+binary by that name. The internal crates keep their `tts-*` names: they are path
+dependencies, never published, and can collide with nothing.
+
+### Uninstalling
+
+```sh
+./scripts/uninstall.sh                     # lists every category with its size; deletes nothing
+./scripts/uninstall.sh --weights qwen3tts  # one engine's checkpoint
+./scripts/uninstall.sh --all               # weights, venvs, fixtures, build output
+./scripts/uninstall.sh --everything --yes  # and the directory itself
+```
+
+It asks `dream-tts config` where `data_dir` actually points, so it finds checkpoints that
+were relocated. It refuses any path outside the install and the data directory, and refuses
+to run without a TTY unless `--yes` is passed — a piped invocation has no informed consent
+to give. A script rather than a subcommand on purpose: the thing that deletes an hour of
+downloading should be readable before it is run, and should keep working when the binary is
+the part that is broken.
+
+## Documents and narration
+
+### One stage in front of four that already worked
+
+`narrate-book.sh` takes its chapter structure from the *filesystem* — `chapter-NNN.md`, one
+per file — and four stages hang off that: verbalisation, WAV master, delivery encode,
+alignment manifest. So document import is a stage in front and changes none of them:
+
+```text
+document  ->  chapter-001.md, chapter-002.md, ...  ->  [the existing pipeline]
+```
+
+Which means the work is not extracting text; it is **splitting one monolithic document into
+chapters**. That is what decides which formats are easy, and it is why markdown is the
+intermediate rather than plain text: `tts-narrate` is built for markdown, and a heading is
+what produces the 320 ms paragraph gap a listener hears as a section break.
+
+| format | chapter signal | notes |
+|---|---|---|
+| EPUB | the OPF spine, in reading order | explicit; `linear="no"` front matter is skipped |
+| DOCX | `w:pStyle w:val="Heading1"` | `Heading1`, `heading 2`, `Title`, `Subtitle` all occur |
+| ODT | `text:h` with `text:outline-level` | explicit |
+| HTML | `<h1>`…`<h6>` | `script`, `style` and `head` contribute nothing |
+| Markdown | the shallowest heading level *present* | a book of `##` under one `#` still splits |
+| PDF | `PDFOutline`, else one chapter | see below |
+
+DOCX, ODT and EPUB are all a zip of XML, so one pair of dependencies — `zip` and `quick-xml`
+— covers three formats and pulls no C library, which is what keeps `bin/` free of
+non-system dylibs. macOS `textutil` reads DOCX too and is free, but it was measured against
+the same file and **flattens every heading to a styled `<p>`**; losing the headings loses the
+chapter boundaries the whole pipeline hangs off, so it is not used.
+
+### Why PDF goes through PDFKit
+
+PDF is the one format with no structure to read: it describes glyphs at positions, not
+paragraphs. Two consequences.
+
+**Extraction is delegated.** `PDFPage.string` applies Quartz's layout analysis — reading
+order, column detection, de-hyphenation — which is a large body of work no pure-Rust
+extractor matches. PDFKit is in `/System/Library/Frameworks`, so it costs nothing to install
+and stays inside the release audit that refuses any non-system dynamic dependency; the
+shipped `dream-tts` links Foundation, Metal, PDFKit and three `/usr/lib` dylibs, and nothing
+else.
+
+**Chapters come from the outline, or from nothing.** `PDFOutline` is the table of contents
+the file itself declares, naming both the chapter and the page it starts on. Without one this
+yields a single chapter rather than inferring headings from font size, because a wrong split
+is worse than none: it desynchronises the per-chapter resume the pipeline is built on. Only
+the top level is used — a nested outline describes sections within a chapter, and splitting
+on those gives a narration file per subsection, each too short for the engine to batch.
+
+Two details that are not obvious. Quartz returns a newline per *visual* line, and a newline
+is a paragraph break to the converter — so a chapter would arrive as several hundred one-line
+paragraphs, each getting the 320 ms gap, which reads as a stammer; lines are rejoined unless
+the previous one ends a sentence *and* is short enough to be the last line of one. And a
+hyphen at a line break is ambiguous — PDF hyphenates words and also wraps after a compound's
+own hyphen — so the hyphen is **kept**: a wrongly-kept hyphen narrates as separate words,
+while a wrongly-dropped one fuses two words into a non-word, and a fused non-word is
+precisely the input that sends the model into a repetition loop.
+
+**Marks are placed at the heading, not at the page.** An outline destination names a page,
+which is too coarse for anything but a book of chapter-per-page: a real paper puts "Abstract"
+and "1 Introduction" on page 0, and slicing by page has to drop one of them and gives the
+whole page to whichever survives. Measured on a 14-page VLDB paper, page-granular splitting
+lost **five of its thirteen chapters**. So each mark is placed where its own heading text
+appears within its page — matched with whitespace collapsed and case folded, since PDF layout
+breaks a heading across lines and prints it in capitals — and falls back to the page boundary
+only when the label does not match the printed heading, where merging is the honest outcome.
+The printed heading is then dropped from the body, because the chapter title already carries
+it and the voice would otherwise announce every section twice, in capitals, which it spells
+letter by letter.
+
+A scanned document has no text to find. That is reported with the fix named rather than
+returning an empty chapter; this extracts text and does not perform OCR.
+
+**What a paper still costs.** A research PDF is the hardest input this has: its figures,
+tables and algorithm blocks have no marker distinguishing them from prose, so a figure's axis
+labels and a comparison table's cells arrive as sentences. `dream-tts narrate` reports each
+one — surviving markup, and any sentence over 400 characters — and on the paper above that is
+six warnings across fourteen chapters, every one of them a figure or a table. There is no
+signal in extracted PDF text to fix this automatically; the warnings name the passages to
+check.
+
+### The narration port, and how it is checked
+
+`crates/tts-narrate` is a port of `scripts/md-to-narration.py`. The Python stays in the tree
+for two jobs: it is the long-form record of *why* each of its ~forty rules exists, and it is
+the reference the port is checked against.
+
+```sh
+./scripts/check-narrate.sh              # every function
+./scripts/check-narrate.sh clean_inline # one of them
+```
+
+Both implementations run over the same corpus and must produce byte-identical output for
+`speak_code`, `speak_math`, `speak_numbers`, `clean_inline`, `convert`, `page_text` and the
+word-alignment map. The corpus has three sources, because each catches a different class of
+mistake: one hand-written case per rule, so a mistranslated rule fails on its own line and
+says which; the real chapter in `prep-handbook/`, which contains combinations nobody would
+think to write; and seeded random recombinations of the fragments, because **most of the traps
+recorded in the Python are interactions between rules** — the currency rule consuming the
+number the magnitude rule wanted — and only recombination reaches those. 6190 lines and 621
+documents, in about seven seconds.
+
+That harness earned its place immediately. It found three bugs in the port that no
+hand-written case had caught:
+
+- **A Rust raw string does not process a backslash-newline continuation.** The currency
+  pattern, written across four lines the way the Python has it, kept the backslashes and
+  never matched — so every `$` was left for the inline-maths rule, which then paired two
+  prices and ran `speak_math` over the prose between them. `concat!` instead.
+- **`$$` is an escaped dollar in a replacement string.** `"$${1}"` emitted the literal text
+  `${1}` rather than a dollar and the group.
+- **The harness itself was wrong before the port was.** Python's `json.dumps` defaults to
+  `", "` separators and `\uXXXX` escapes and serde_json does neither, so a byte comparison
+  reported every case as differing on formatting alone.
+
+`crates/tts-narrate/tests/reference.rs` ports the Python's own suite case for case, so the
+crate is verified with nothing else installed; `check-narrate.sh` is the stronger evidence
+and needs python3, and `gates.sh` reports it as skipped when there is none.
+
+One deliberate transliteration rather than a rewrite: `align::Matcher` reproduces Python's
+`difflib.SequenceMatcher.get_matching_blocks`, including its tie-breaking and its recursive
+split. A generic LCS diff disagrees with it on real input, and the word map this feeds is
+consumed by a player that highlights the wrong word when they do.
+
+## Runs, and watching them
+
+### Why there is a server
+
+Everything in this section exists because a thousand-page reference book is hours of
+synthesis, and that length changes the requirements rather than just the runtime.
+
+A run has to survive its terminal closing, so the state cannot live only in the process
+doing the work. It has to be discoverable by a process that did not start it, or the second
+thing anyone does is start a second run on top of the first. And progress has to be fine
+enough to be worth watching, which means something must be emitting it while the work
+happens.
+
+All three want the work to outlive the command that asked for it. `dream-tts-serve` already
+held the engine resident, serialised GPU work behind a semaphore and held the GPU flock for
+its lifetime — so the queue went there rather than into a second daemon that would have
+fought it for the device. Its `/v1/tts-jobs` route had answered `501 "durable job queue"`
+since before any of this; the slot was reserved for exactly this.
+
+### Why the records are files, not the server's memory
+
+`crates/tts-jobs` writes one JSON file per run under `data_dir/jobs/`. The reason is the
+discovery question: **"is something already narrating?" has to be answerable when the
+service is not running**, because that is precisely the moment someone is about to start
+one. A database, or state held in the service, would make the service the only thing that
+can answer.
+
+That is also what makes the extensibility real rather than claimed. `dream-tts jobs` is one
+client; a status bar, a menu-bar app or a shell script reading the same files is another, and
+neither needs the HTTP API or to be trusted with its key.
+
+Every write is a write-and-rename. A reader is often a progress display refreshing several
+times a second, so a reader catching a half-written file would be the normal case rather than
+a rare one.
+
+### Identity is the document, so resume is the same command
+
+A job's id is a SHA-256 prefix over the text that will be spoken and the settings it will be
+spoken with. Resubmitting the same book therefore *is* the resume path — no `--resume`, no
+remembered id, just the command the user was going to type anyway.
+
+Settings are in the hash because they change the audio: narrating the same book in a
+different voice is a different run and must not adopt the first one's chapters. So is the
+text, which matters more — **editing a chapter changes the id**, because resuming onto audio
+of the old wording would be silent damage.
+
+Adoption is conservative in one further way: a finished chapter is only inherited if its WAV
+is still on disk. Deleting a WAV to force a re-render has to actually cause one, which is the
+documented way to redo a chapter.
+
+Resume needs no "where we were" marker, because finished work is the marker:
+`Job::next_chapter` is the first chapter that is not `Done`. A *failed* chapter is next again
+rather than skipped — the failure may have been the machine, and skipping would ship a book
+with a hole in it.
+
+### Pause, and what it costs
+
+Synthesis is minutes per chapter. "Stop" therefore has to mean something sooner than "when
+it finishes", and there are only two honest options:
+
+| | when | cost |
+|---|---|---|
+| `--control pause` | after the chapter in flight | none; its work is kept |
+| `--control pause --now` | within seconds | that chapter is discarded and redone on resume |
+
+`--now` works because `SynthesisRequest` carries an `Interrupt` — a `Fn() -> bool` the engines
+ask **between segments**, at the same boundary where they already report progress. That is
+where an engine's state is consistent; mid-segment there is a partly generated waveform that
+is not audio yet, so there is nothing to keep. An interrupted chapter is left `Pending`, not
+`Failed`: a caller stopped it, which is a run to resume rather than a fault to report.
+
+A queued pause is shown as **`pausing`**, in the CLI and on the page. A control that appears
+to have done nothing is worse than one that refuses, and on a twenty-minute chapter the gap
+between asking and its taking effect is long enough to look broken.
+
+### The estimate, and economies of scale
+
+A flat words-per-second rate is the obvious model and it is wrong by a factor of two and a
+half, in both directions.
+
+These engines have strong economies of scale. `qwen3tts` batches across segments and that
+only engages once a chapter has enough of them, so the documented figures are RTF **0.665**
+on `examples/senior.txt` (132 words) and **0.260** on `examples/chapter.txt` (1612 words) —
+0.287 s/word against 0.112 s/word for the same voice on the same machine. A rate learned
+from a short chapter and applied to a long one predicts 463 s where the truth is 181 s.
+
+It goes the other way too, and that was the first bug: a book's front matter is 27 words of
+title page, almost all fixed cost, and extrapolating from it put a real run's estimate at
+**2h 09m against an actual hour**.
+
+So the model is `wall ≈ fixed + marginal × words`, fitted by least squares over the chapters
+that have finished and applied to each remaining chapter *individually*. A long chapter
+amortises the fixed part the way it really does; a short one still pays it. Degenerate fits —
+one sample, chapters all the same length, or noise making longer chapters look cheaper in
+total — fall back to a flat rate, which is the honest answer when there is no slope to find.
+
+No estimate at all until there are two finished chapters or five percent of the words. A
+confident wrong number on an eight-hour run is worse than none, because the direction it errs
+in is the one that makes someone abandon a run that would have finished.
+
+### Stale runs
+
+A service killed mid-run leaves a record saying `Running` for ever. Each job carries the pid
+that owns it, `Job::is_stale` asks `kill(pid, 0)`, and both the service at startup and the
+CLI before it reports anything turn stale runs into **paused** ones. Paused, not failed:
+nothing went wrong with the work, and every finished chapter is still on disk.
+
+### What the machine can hold
+
+One resident engine is gigabytes and two on a 16 GB machine swap — which presents as the
+models getting slower rather than as a mistake. But refusing a second engine on a 64 GB
+machine would be wrong, so `tts_core::system` reports rather than decides: total memory, a
+measured per-engine footprint, and therefore roughly how many fit. `dream-tts book` prints
+it alongside anything already in flight and lets the user choose.
+
+### Incremental synthesis
+
+`POST /tts/stream` used to be buffered, and said so in an `x-streaming: buffered` header. It
+is now genuinely incremental: raw PCM per segment, chunked, first audio after one segment
+instead of after all of them. Measured on the same text, **2.7s to first audio against 5.5s
+buffered**; at `qwen3tts`'s RTF of 0.67 the stream outpaces playback, so a live listener
+never runs dry once it has started.
+
+It is **slower overall, deliberately.** `Engine::synthesize` batches across segments and that
+is worth 2x on book-length text; one segment at a time gives it up. What a realtime caller
+needs is not throughput but a short time to first audio, and those are different quantities —
+which is why the job runner does not use this path. A listener waiting on a live response
+cares about the first second; a book cares about the last hour.
+
+Segmenting outside the engine means reproducing what it does *between* segments — 90 ms
+within a paragraph, 320 ms between them. Without that, the same text would render differently
+depending on which URL was called.
+
+The chunk queue is two deep on purpose: a client that stops reading should stop the work
+rather than let the server run a chapter ahead into memory.
 
 ## What did not work
 

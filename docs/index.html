@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>tts-rs — local text-to-speech in Rust</title>
+<title>dream-tts — local text-to-speech in Rust</title>
 <meta name="description" content="Three PyTorch speech models ported to Rust. Hear the same chapter narrated by each, and what it cost to render.">
 <style>
   :root {
@@ -76,14 +76,14 @@
 <body>
 <div class="wrap">
 
-  <h1>tts-rs</h1>
+  <h1>dream-tts</h1>
   <p class="lede">
     Local text-to-speech in Rust. Three voice-cloning speech models ported from PyTorch,
     validated stage by stage against fp32 activations dumped from their references.
     One process, no Python at runtime.
   </p>
   <p class="caveat">
-    <a href="https://github.com/drmhse/tts-rs">Source on GitHub</a> ·
+    <a href="https://github.com/drmhse/dream-tts">Source on GitHub</a> ·
     Apache-2.0 · macOS on Apple silicon
   </p>
 
@@ -165,17 +165,19 @@
   </p>
 
   <h2>Try it</h2>
-<pre><code>git clone https://github.com/drmhse/tts-rs &amp;&amp; cd tts-rs
-./scripts/bootstrap.sh
+<pre><code>curl -fsSL https://raw.githubusercontent.com/drmhse/dream-tts/main/install.sh | sh
+cd dream-tts &amp;&amp; ./scripts/bootstrap.sh
 
-cargo run -p tts-cli --release -- speak --engine qwen3tts \
-    --voice voices/cosy-default-qwen3tts --quant f16 \
+./dream-tts speak --quant f16 \
     --text-file examples/chapter.txt --out chapter.wav</code></pre>
   <p class="caveat">
-    <code>bootstrap.sh</code> downloads and converts the checkpoints, fetches the fixtures for
-    the correctness gates, and builds — one command, nothing manual. Name the engines you want
-    (<code>bootstrap.sh qwen3tts</code>, ~4.3&nbsp;GB) or take all three, at ~13&nbsp;GB;
-    <code>--list</code> prints the ids and what each costs.
+    <strong><code>curl</code> is the only prerequisite</strong> — no Rust toolchain and no
+    Python. The default engine, <code>qwen3tts</code>, has no conversion step, and a tagged
+    release publishes prebuilt Apple-silicon binaries. <code>bootstrap.sh</code> downloads
+    the checkpoint (~4.3&nbsp;GB, resumable, sha256-verified) and the correctness fixtures.
+    Add the other two with <code>bootstrap.sh audio8 cosyvoice</code> — those convert their
+    checkpoints with PyTorch, which is why they are not the default. <code>--list</code>
+    prints the ids and what each costs.
   </p>
 
   <h2>Or run it as an HTTP API</h2>
@@ -186,7 +188,7 @@ cargo run -p tts-cli --release -- speak --engine qwen3tts \
     client switches by pointing at a different port.
   </p>
 
-<pre><code>TTS_API_KEY=secret cargo run -p tts-serve --release -- --port 3003
+<pre><code>DREAM_TTS_API_KEY=secret ./dream-tts-serve --port 3003
 
 curl -X POST localhost:3003/tts -H "X-API-Key: secret" \
      -H 'content-type: application/json' \
@@ -254,7 +256,7 @@ curl -X POST localhost:3003/tts -H "X-API-Key: secret" \
     <code>ras_sampling</code> draws from torch’s generator, so a sampled sequence is not
     reproducible across implementations. Quality is checked separately by word error rate.
     Known limitations, including an undiagnosed regression in two convolution stages, are in
-    the <a href="https://github.com/drmhse/tts-rs#honest-limitations">README</a>.
+    the <a href="https://github.com/drmhse/dream-tts#honest-limitations">README</a>.
   </p>
 
   <footer>
