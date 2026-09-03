@@ -2,14 +2,20 @@
 #
 # From a fresh clone to working speech. Nothing here is manual.
 #
-#   ./scripts/bootstrap.sh                              all three engines, ~13 GB
-#   ./scripts/bootstrap.sh qwen3tts                     one engine, ~4.3 GB
+#   ./scripts/bootstrap.sh                              qwen3tts, the default, ~4.3 GB
+#   ./scripts/bootstrap.sh --all                        all three engines, ~13 GB
 #   ./scripts/bootstrap.sh audio8 cosyvoice             two of them
 #   ./scripts/bootstrap.sh --list                       what the ids are, and what each costs
 #   ./scripts/bootstrap.sh --force audio8               redo a conversion that already ran
+#   ./scripts/bootstrap.sh --prebuilt                   download the binaries, do not build
 #
 # Whichever engines you name, it checks the toolchain, downloads and converts their
 # checkpoints, fetches the fixtures for every gate (~130 MB, cheap, so always), and builds.
+#
+# The default is qwen3tts alone, and that is the whole reason the default path needs
+# nothing but curl: its checkpoint is a plain download and it has no conversion step.
+# audio8 and cosyvoice both want python and a torch venv, so asking for either is what
+# buys you that cost — it is never paid by someone who did not ask.
 #
 # No engine needs its upstream *repository*. CosyVoice's two un-derivable artifacts are
 # fetched as assets, so converting its checkpoint is a plain `torch.load`.
@@ -20,15 +26,20 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 
-ALL_ENGINES="audio8 cosyvoice qwen3tts"
+# Catalogue order, matching `tts_engines::catalogue()`: the default leads.
+ALL_ENGINES="qwen3tts audio8 cosyvoice"
 FORCE=""
 ENGINES=""
+BUILD_MODE=auto
 
 usage() {
   cat <<'USAGE'
 usage: scripts/bootstrap.sh [--force] [--list] [engine ...]
 
-  engine    audio8 | cosyvoice | qwen3tts   (default: all three)
+  engine    audio8 | cosyvoice | qwen3tts   (default: qwen3tts alone)
+  --all     every engine, ~13 GB, and a torch venv
+  --prebuilt  download this version's release binaries instead of building
+  --build     build from source even on a machine that could download
   --force   redo a conversion whose output already exists
   --list    print the engines, their models and their disk cost, then exit
 USAGE
@@ -37,11 +48,15 @@ USAGE
 while [ $# -gt 0 ]; do
   case "$1" in
     --force) FORCE=1; shift ;;
+    --all) ENGINES="$ENGINES $ALL_ENGINES"; shift ;;
+    --prebuilt) BUILD_MODE=prebuilt; shift ;;
+    --build) BUILD_MODE=build; shift ;;
     --list)
-      printf '%-11s %-34s %8s  %s\n' engine model disk notes
-      printf '%-11s %-34s %8s  %s\n' audio8    Audio8-TTS-Preview-0.6b   "~4 GB"   "44.1 kHz, highest fidelity"
-      printf '%-11s %-34s %8s  %s\n' cosyvoice Fun-CosyVoice3-0.5B       "~4 GB"   "widest language coverage"
-      printf '%-11s %-34s %8s  %s\n' qwen3tts  Qwen3-TTS-12Hz-1.7B-Base  "~4.3 GB" "batches; best for long documents"
+      printf '%-11s %-34s %8s %-8s %s\n' engine model disk needs notes
+      printf '%-11s %-34s %8s %-8s %s\n' qwen3tts  Qwen3-TTS-12Hz-1.7B-Base  "~4.3 GB" curl  "the default. Batches; best for long documents"
+      printf '%-11s %-34s %8s %-8s %s\n' audio8    Audio8-TTS-Preview-0.6b   "~4 GB"   python "44.1 kHz, highest fidelity"
+      printf '%-11s %-34s %8s %-8s %s\n' cosyvoice Fun-CosyVoice3-0.5B       "~4 GB"   python "widest language coverage"
+      printf '\n%s\n' "python means a torch venv (~2.5 GB) for the conversion step, and python >= 3.10."
       exit 0 ;;
     -h|--help) usage; exit 0 ;;
     audio8|cosyvoice|qwen3tts) ENGINES="$ENGINES $1"; shift ;;
@@ -50,10 +65,18 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -n "$ENGINES" ] || ENGINES="$ALL_ENGINES"
-# Normalise: the loop above leaves a leading space, which would make `${ENGINES%% *}` empty.
+# qwen3tts alone, because it is the fastest, the best quality here, and the only engine
+# whose setup is curl and nothing else. `--all` is one flag away.
+[ -n "$ENGINES" ] || ENGINES="qwen3tts"
+# Normalise: the loop above leaves a leading space, which would make `${ENGINES%% *}` empty,
+# and `--all qwen3tts` would name one engine twice. Rebuild from ALL_ENGINES so the result
+# is deduplicated and in catalogue order whatever the arguments looked like.
+selected=""
+for e in $ALL_ENGINES; do
+  case " $ENGINES " in *" $e "*) selected="$selected $e" ;; esac
+done
 # shellcheck disable=SC2086
-set -- $ENGINES
+set -- $selected
 ENGINES="$*"
 wants() { case " $ENGINES " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
@@ -65,8 +88,33 @@ die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 say "Checking the toolchain"
 
-command -v cargo >/dev/null || die "cargo not found — install Rust from https://rustup.rs"
-cargo --version
+# `auto` prefers building, because `cargo build` rebuilds when the source moved and a
+# downloaded binary cannot. Both halves are required: a machine can have cargo and still be
+# sitting in an unpacked release archive, which has binaries and no sources.
+if [ "$BUILD_MODE" = auto ]; then
+  if [ -f Cargo.toml ] && command -v cargo >/dev/null; then
+    BUILD_MODE=build
+  else
+    BUILD_MODE=prebuilt
+  fi
+fi
+
+case "$BUILD_MODE" in
+  build)
+    [ -f Cargo.toml ] || die "no Cargo.toml here — --build needs a source checkout"
+    command -v cargo >/dev/null || die \
+      "cargo not found. Either install Rust from https://rustup.rs, or download the
+   prebuilt binaries instead:  $0 --prebuilt"
+    cargo --version
+    ;;
+  prebuilt)
+    command -v curl >/dev/null || die "curl not found, and --prebuilt is all curl"
+    # Checked now, not in step 6: the alternative is failing after several minutes of
+    # checkpoint HEAD requests and asset fetching, for a reason that was knowable up front.
+    "$ROOT/scripts/fetch-prebuilt.sh" --check || exit 1
+    say "No build: this will download the release binaries for this version"
+    ;;
+esac
 
 if [ "$(uname -s)" != "Darwin" ]; then
   warn "This is not macOS. The engines build and run on CPU, but every performance"
@@ -183,21 +231,17 @@ fi
 if ! wants qwen3tts; then
   say "Skipping the Qwen3-TTS checkpoint (not selected)"
 else
-  if [ -f "$QWEN_W/model.safetensors" ]; then
-    say "Qwen3-TTS checkpoint already present — skipping"
-  else
-    say "Downloading Qwen3-TTS-12Hz-1.7B-Base (~4.3 GB)"
-    mkdir -p "$QWEN_W/speech_tokenizer"
-    B=https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main
-    for f in config.json generation_config.json preprocessor_config.json \
-             tokenizer_config.json vocab.json merges.txt model.safetensors; do
-      curl -fsSL -C - -o "$QWEN_W/$f" "$B/$f" || die "failed to download $f"
-    done
-    for f in config.json configuration.json preprocessor_config.json model.safetensors; do
-      curl -fsSL -C - -o "$QWEN_W/speech_tokenizer/$f" "$B/speech_tokenizer/$f" \
-        || die "failed to download speech_tokenizer/$f"
-    done
-  fi
+  # No `already present` short-circuit here: fetch-weights.sh decides that per file, by
+  # length and digest, and a set that is already complete costs three HEAD requests. The
+  # old guard on model.safetensors alone could not see a truncated tokenizer beside it.
+  say "Fetching Qwen3-TTS-12Hz-1.7B-Base (~4.3 GB, resumable)"
+  "$ROOT/scripts/fetch-weights.sh" "$QWEN_W" \
+    https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main \
+    config.json generation_config.json preprocessor_config.json \
+    tokenizer_config.json vocab.json merges.txt model.safetensors \
+    speech_tokenizer/config.json speech_tokenizer/configuration.json \
+    speech_tokenizer/preprocessor_config.json speech_tokenizer/model.safetensors \
+    || die "Qwen3-TTS download failed. Re-run to resume where it stopped."
 fi
 
 # ------------------------------------------------------------------ 5. derived assets
@@ -212,10 +256,18 @@ say "Fetching the derived assets"
 
 # ------------------------------------------------------------------ 6. build
 
-say "Building the workspace"
-cargo build --release
+if [ "$BUILD_MODE" = build ]; then
+  say "Building the workspace"
+  cargo build --release
+else
+  say "Installing the prebuilt binaries"
+  "$ROOT/scripts/fetch-prebuilt.sh" ${FORCE:+--force} || die \
+    "could not install prebuilt binaries. Build from source instead: $0 --build"
+fi
 
-# Show the command for an engine that was actually set up, not always the first one.
+# Show the command for an engine that was actually set up, not always the first one. The
+# `--engine` flag is printed even for the default, because a copy-pasted command should
+# keep working when a later bootstrap adds a second engine.
 first="${ENGINES%% *}"
 case "$first" in
   audio8)    voice=voices/cosy-default ;;
@@ -226,13 +278,17 @@ esac
 say "Done — set up: $ENGINES"
 cat <<EOF
 
-    cargo run -p tts-cli --release -- speak \\
-        --engine $first --voice $voice \\
+    ./dream-tts speak --engine $first --voice $voice \\
         --text "Hello from a fresh checkout." --out hello.wav
 
-    cargo run -p tts-cli --release -- engines     # what is available, and what each supports
-    ./scripts/gates.sh                            # everything verifiable
-    TTS_API_KEY=secret cargo run -p tts-serve --release -- --port 3003   # the HTTP API
+    ./dream-tts engines           # what is installed, and what each supports
+    ./dream-tts config            # settings, and what decided each one
+    ./dream-tts storage           # what is on disk, and what removes it
+    ./scripts/gates.sh            # everything verifiable
+    ./scripts/uninstall.sh        # reports; deletes nothing without a flag
+
+    DREAM_TTS_API_KEY=secret ./dream-tts-serve --port 3003   # the HTTP API,
+                                                             # open it in a browser
 EOF
 
 # Report what is missing rather than assuming. An engine that was not asked for is not

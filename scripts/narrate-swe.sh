@@ -12,7 +12,7 @@
 # What it does, per book:
 #   1. discover chapters                    narrate-book.sh --list  (nested part-NN/ layout)
 #   2. markdown -> narration text + map     md-to-narration.py
-#   3. text -> WAV -> WebM/Opus             tts-serve + ffmpeg
+#   3. text -> WAV -> WebM/Opus             dream-tts-serve + ffmpeg
 #   4. word-level alignment manifest        align-narration.py
 #   5. install into the site + rewrite paths  publish-narration.py
 #

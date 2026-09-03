@@ -1,6 +1,20 @@
 # Build output
 /target/
 
+# Prebuilt binaries, from `scripts/fetch-prebuilt.sh` or a release archive, and the staging
+# directory the release workflow assembles in. Both are outputs of a published tag.
+/bin/
+/dist/
+
+# A user's own settings. `dream-tts.example.json` is the tracked one.
+/dream-tts.json
+# The advisory GPU lock, created wherever data_dir points.
+.dream-tts-gpu.lock
+# Narration job records, written under data_dir by the service.
+/jobs/
+# Digests of verified checkpoint downloads, written by scripts/fetch-weights.sh.
+.weights-manifest
+
 # ---------------------------------------------------------------- model weights
 #
 # Converted checkpoints, several GB each. `scripts/bootstrap.sh` regenerates them from

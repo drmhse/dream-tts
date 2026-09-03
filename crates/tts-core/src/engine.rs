@@ -41,6 +41,10 @@ pub struct Capabilities {
     pub streaming: bool,
     /// Weight formats `EngineConfig::quant` accepts, most faithful first.
     pub quantization: &'static [&'static str],
+    /// `Some` when the engine only speaks a closed set, lowercase English names.
+    /// `None` means unrestricted, not unknown. A closed list is why an engine must not
+    /// become the default silently — see `tts_engines::default_caveat`.
+    pub languages: Option<&'static [&'static str]>,
     /// False when the engine is registered but cannot synthesize yet. `reason` says
     /// why. Registering an unfinished engine is deliberate: a client can discover it
     /// exists and code against the identifier before it lands.
@@ -87,6 +91,59 @@ impl Default for Gaps {
     }
 }
 
+/// What an engine tells a caller while it works.
+///
+/// Engines report *segments*, not tokens or frames: it is the one unit every engine has,
+/// it is what the caller's text was split into, and it does not require a client to know
+/// anything about the architecture. Each stage counts from zero, so a three-stage engine
+/// reports three passes rather than one merged fiction — which is honest about where the
+/// time goes and matches the stage breakdown printed at the end.
+#[derive(Clone, Copy, Debug)]
+pub enum ProgressEvent {
+    /// Emitted once, after segmentation and before any compute.
+    Planned { segments: usize },
+    Advanced {
+        /// The stage name, the same string that appears in [`Stats::breakdown`].
+        stage: &'static str,
+        done: usize,
+        total: usize,
+    },
+}
+
+/// A progress sink. `Arc` rather than a borrow so [`SynthesisRequest`] needs no lifetime;
+/// `Send + Sync` because the service hands requests to a worker.
+pub type Progress = std::sync::Arc<dyn Fn(ProgressEvent) + Send + Sync>;
+
+/// Asked between segments; `true` stops the render.
+///
+/// Synthesis is minutes long for a chapter and hours for a book, so "stop" has to mean
+/// something sooner than "when it finishes". Checked at segment boundaries because that is
+/// where an engine's state is consistent — mid-segment there is a partly generated waveform
+/// that is not audio yet.
+pub type Interrupt = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// The error an interrupted render returns.
+///
+/// A distinct marker rather than a message, so a caller can tell "the user stopped this"
+/// from "this failed" — one is a job to resume and the other is a job to report.
+#[derive(Debug)]
+pub struct Interrupted {
+    /// Segments completed before stopping, for a caller that wants to say how far it got.
+    pub segments: usize,
+}
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "synthesis interrupted after {} segment(s)",
+            self.segments
+        )
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
 pub struct SynthesisRequest {
     pub text: String,
     pub voice: Option<Voice>,
@@ -97,6 +154,10 @@ pub struct SynthesisRequest {
     pub max_chars: usize,
     pub max_new_tokens: usize,
     pub gaps: Gaps,
+    /// Called as the engine works. `None` is the quiet path and costs nothing.
+    pub progress: Option<Progress>,
+    /// Asked between segments. `None` means never interrupted.
+    pub interrupt: Option<Interrupt>,
 }
 
 impl SynthesisRequest {
@@ -108,12 +169,50 @@ impl SynthesisRequest {
             max_chars: 220,
             max_new_tokens: 512,
             gaps: Gaps::default(),
+            progress: None,
+            interrupt: None,
         }
     }
 
     pub fn with_voice(mut self, voice: Voice) -> Self {
         self.voice = Some(voice);
         self
+    }
+
+    pub fn with_progress(mut self, progress: Progress) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    pub fn with_interrupt(mut self, interrupt: Interrupt) -> Self {
+        self.interrupt = Some(interrupt);
+        self
+    }
+
+    /// Whether a caller has asked to stop. Engines call this at segment boundaries.
+    pub fn interrupted(&self) -> bool {
+        self.interrupt.as_ref().is_some_and(|f| f())
+    }
+
+    /// `Err(Interrupted)` when a caller has asked to stop, for `?` in a segment loop.
+    pub fn check_interrupt(&self, segments: usize) -> Result<()> {
+        if self.interrupted() {
+            return Err(Interrupted { segments }.into());
+        }
+        Ok(())
+    }
+
+    /// Report progress if anyone is listening. Engines call this; the `Option` check keeps
+    /// an uninstrumented render free of any cost beyond a null test.
+    pub fn notify(&self, event: ProgressEvent) {
+        if let Some(f) = &self.progress {
+            f(event);
+        }
+    }
+
+    /// Convenience for the common `Advanced` shape.
+    pub fn advanced(&self, stage: &'static str, done: usize, total: usize) {
+        self.notify(ProgressEvent::Advanced { stage, done, total });
     }
 }
 

@@ -13,12 +13,17 @@
 //!     println!("{:<10} {}", caps.id, if caps.available { "ready" } else { "unavailable" });
 //! }
 //!
-//! let id = "cosyvoice";
+//! let id = tts_engines::default_id();
 //! let config = EngineConfig::new(tts_engines::default_root(id));
 //! let engine = tts_engines::load(id, &config)?;
 //!
+//! // A caller that did not choose an engine is told what it got, and why that matters.
+//! if let Some(caveat) = tts_engines::default_caveat() {
+//!     eprintln!("note: {caveat}");
+//! }
+//!
 //! // Voice assets load on the host; the engine pulls them onto its own device.
-//! let voice = Voice::load("voices/cosy-default-cosyvoice")?;
+//! let voice = Voice::load(tts_engines::default_voice(id))?;
 //! let request = SynthesisRequest::new("Hello from Rust.").with_voice(voice);
 //!
 //! // `validate` rejects a mismatched asset up front rather than at the first tensor.
@@ -45,14 +50,20 @@ use tts_core::{Capabilities, Engine, EngineConfig};
 /// Every engine known to this build, in preference order.
 ///
 /// Order is preference, and [`default_id`] takes the first *available* entry — so an
-/// unfinished engine may sit anywhere without becoming the default. `qwen3tts` is last
-/// for a reason that will outlast its port: it supports ten languages and the list is
-/// closed, so it cannot be the fallback for a caller that did not choose it.
+/// unfinished engine may sit anywhere without becoming the default.
+///
+/// `qwen3tts` leads because it is the fastest by 2x on book-length text and the only
+/// engine whose setup needs nothing but `curl`. It also speaks ten languages and the
+/// list is closed, which used to be handled by keeping it *last* — a guard made of list
+/// position, invisible to any caller. That fact now lives in
+/// [`Capabilities::languages`] and is reported by [`default_caveat`], so a caller that
+/// did not choose an engine is told what it got instead of being quietly given a
+/// different one.
 pub fn catalogue() -> Vec<Capabilities> {
     vec![
+        qwen3tts::capabilities(),
         audio8::engine::capabilities(),
         cosyvoice::capabilities(),
-        qwen3tts::capabilities(),
     ]
 }
 
@@ -80,6 +91,33 @@ pub fn load(id: &str, config: &EngineConfig) -> Result<Box<dyn Engine>> {
     }
 }
 
+/// What a caller that did not name an engine must be told: the default engine restricts
+/// language, and only that caller knows what text it is about to send.
+///
+/// Deliberately not a rejection. Identifying a language from arbitrary text is a guess,
+/// and a guess that refuses valid English would be worse than the warning. Callers emit
+/// this only when the engine was defaulted, never when it was named.
+pub fn default_caveat() -> Option<String> {
+    let id = default_id();
+    let languages = catalogue().into_iter().find(|c| c.id == id)?.languages?;
+    Some(format!(
+        "engine `{id}` was selected by default and speaks only {}. Text in any other language has no faithful path through it — pass `--engine` to choose another.",
+        languages.join(", ")
+    ))
+}
+
+/// The voice asset shipped for `id`. Conventions rather than configuration, like
+/// [`default_root`] — kept here so the CLI, the service and `scripts/bootstrap.sh` do
+/// not each carry their own copy of the mapping.
+pub fn default_voice(id: &str) -> &'static str {
+    match id {
+        audio8::engine::ID => "voices/cosy-default",
+        cosyvoice::ID => "voices/cosy-default-cosyvoice",
+        qwen3tts::ID => "voices/cosy-default-qwen3tts",
+        _ => "",
+    }
+}
+
 /// Default model root per engine, relative to the repo. Conventions rather than
 /// configuration, overridable through [`EngineConfig::overrides`].
 pub fn default_root(id: &str) -> &'static str {
@@ -88,5 +126,37 @@ pub fn default_root(id: &str) -> &'static str {
         cosyvoice::ID => "references/cosyvoice/weights",
         qwen3tts::ID => "references/qwen3tts/weights",
         _ => ".",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_is_qwen3tts() {
+        assert_eq!(default_id(), qwen3tts::ID);
+    }
+
+    /// Every id must resolve to a shipped voice and a model root. A new engine that
+    /// forgets either one fails here rather than at a caller's first request.
+    #[test]
+    fn every_id_has_conventions() {
+        for id in ids() {
+            assert!(!default_voice(id).is_empty(), "{id} has no default voice");
+            assert_ne!(default_root(id), ".", "{id} has no default model root");
+        }
+    }
+
+    /// The guard that replaced `qwen3tts`-is-last. If the default ever stops being a
+    /// closed-list engine this returns `None` legitimately — but while it is one, a
+    /// caller must be able to find that out.
+    #[test]
+    fn closed_list_default_is_reported() {
+        let caps = catalogue();
+        let default = caps.iter().find(|c| c.id == default_id()).unwrap();
+        assert_eq!(default.languages.is_some(), default_caveat().is_some());
+        let caveat = default_caveat().expect("qwen3tts speaks a closed list");
+        assert!(caveat.contains("english") && caveat.contains(default_id()));
     }
 }

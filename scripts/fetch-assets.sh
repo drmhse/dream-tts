@@ -25,7 +25,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-REPO="${TTS_ASSETS_REPO:-drmhse/tts-rs-assets}"
+# Still `tts-rs-assets`: this is a live Hugging Face dataset, not branding. Renaming the
+# project does not rename someone else's URL, and a dataset rename there does not redirect
+# the way a GitHub repo rename does — so this stays until the dataset itself moves, and
+# `DREAM_TTS_ASSETS_REPO` overrides it in the meantime.
+REPO="${DREAM_TTS_ASSETS_REPO:-drmhse/tts-rs-assets}"
 BASE="https://huggingface.co/datasets/$REPO/resolve/main"
 FORCE="${1:-}"
 

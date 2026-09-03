@@ -1,0 +1,71 @@
+# What a `v*` tag produces: one prebuilt archive for Apple silicon.
+#
+# Only arm64 macOS is shipped. Default features are Metal, and the `--no-default-features`
+# CPU path is a portability guarantee rather than a deployment target — audio8 measures RTF
+# 2.151 there against 0.554 on Metal. Publishing a CPU build would invite people to use it.
+#
+# The archive is a working checkout minus the sources: the binaries, the voice assets, the
+# scripts, and the docs. `scripts/bootstrap.sh` then needs nothing but curl, which is the
+# whole point — see install.sh.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  # For rehearsing the packaging without cutting a tag. Uploads nothing.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Built on Sonoma, so without this the binary would silently require it. Ventura is the
+  # oldest release that Apple silicon and candle's Metal path both still work on.
+  MACOSX_DEPLOYMENT_TARGET: '13.0'
+
+jobs:
+  archive:
+    name: aarch64-apple-darwin
+    # Pinned, not `macos-latest`: a runner bump to a newer SDK is a silent way to raise the
+    # minimum OS of everything shipped here.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the version, and check the tag agrees
+        id: v
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ -n "$version" ] || { echo "no workspace version in Cargo.toml"; exit 1; }
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "name=dream-tts-v$version-aarch64-apple-darwin" >>"$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match workspace version $version."
+            echo "bootstrap.sh resolves the release from the checkout's own version, so a"
+            echo "mismatch here ships an archive nothing can find. Bump Cargo.toml or retag."
+            exit 1
+          fi
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Every step of the packaging, including the proof that the archive runs with no
+      # toolchain, lives in the script so CI can rehearse it on a push rather than a tag
+      # first discovering that it is broken.
+      - name: Package
+        run: ./scripts/package.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.v.outputs.name }}
+          path: dist/*.tar.gz
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file .github/release-notes.md \
+            dist/*.tar.gz dist/SHA256SUMS

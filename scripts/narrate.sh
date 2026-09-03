@@ -2,7 +2,7 @@
 #
 # Narrate one or more markdown chapters over HTTP.
 #
-#   scripts/narrate.sh --engine cosyvoice --out narration chapter-*.md
+#   scripts/narrate.sh --out narration chapter-*.md          # qwen3tts, the default
 #
 # Design notes, each of them the result of getting it wrong first:
 #
@@ -11,8 +11,12 @@
 #   for a twelve-part book is twelve model loads for no reason.
 #
 # * **One engine resident at a time.** A single render peaks well above what a 16 GB machine
-#   can spare alongside a second engine, so this refuses to start when another `tts` process
-#   holds the GPU. Matching on `target/release/tts` and not on the cargo wrapper matters:
+#   can spare alongside a second engine, so this refuses to start when another `dream-tts`
+#   process holds the GPU. The `pgrep` here is now belt to the advisory `flock` the binaries
+#   take themselves (`tts_core::lock`), which covers processes this script never started;
+#   it stays because it produces a better message before a 3 s model load than after one.
+#   Matching on the binary's own path — `target/release/dream-tts` when built here,
+#   `bin/dream-tts` when unpacked from a release — and not on the cargo wrapper matters:
 #   `pkill -f "tts-cli…"` kills the wrapper and orphans the worker, which is exactly how two
 #   engines ended up resident and drove the machine into swap.
 #
@@ -29,11 +33,11 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-ENGINE=cosyvoice
+ENGINE=qwen3tts
 QUANT=""
 OUT=narration
 PORT="${NARRATE_PORT:-3099}"
-KEY="${TTS_API_KEY:-narrate-local-key}"
+KEY="${DREAM_TTS_API_KEY:-narrate-local-key}"
 MAX_CHARS="${NARRATE_MAX_CHARS:-80000}"
 # Opus at 32 kbps mono is transparent for narration and about a quarter the size of the
 # 128 kbps MP3s this replaces. Opus resamples to 48 kHz internally; that is normal and not
@@ -70,13 +74,18 @@ esac
 command -v ffmpeg >/dev/null || die "ffmpeg not found (needed for Opus encoding)"
 mkdir -p "$OUT"
 
-if pgrep -f "target/release/tts(-serve)? " >/dev/null 2>&1; then
-  pgrep -fl "target/release/tts(-serve)? " >&2
+# As a path, not `./dream-tts-serve`: this is backgrounded and killed by pid, and the shim's
+# `exec cargo run` would leave the service running as cargo's child.
+SERVE_BIN="$(scripts/run-bin.sh --which dream-tts-serve)" \
+  || die "no dream-tts-serve — install Rust, or ./scripts/bootstrap.sh --prebuilt"
+
+if pgrep -f "(target/release|bin)/dream-tts(-serve)? " >/dev/null 2>&1; then
+  pgrep -fl "(target/release|bin)/dream-tts(-serve)? " >&2
   die "another tts process holds the GPU; stop it first"
 fi
 
 say "Starting $ENGINE on :$PORT (loads once, serves every chapter)"
-TTS_API_KEY="$KEY" ./target/release/tts-serve \
+DREAM_TTS_API_KEY="$KEY" "$SERVE_BIN" \
   --port "$PORT" --engine "$ENGINE" --voice "$VOICE" --max-chars "$MAX_CHARS" \
   ${QUANT:+--quant "$QUANT"} \
   >"$OUT/.server.log" 2>&1 &

@@ -15,14 +15,19 @@
 //! conversion is a function of the clip alone, so it happens once, offline, in Python,
 //! and the result ships as a small asset. Neither encoder is in the Rust binary.
 
+pub mod config;
 pub mod engine;
+pub mod lock;
 pub mod rng;
+pub mod system;
 pub mod text;
 pub mod voice;
 pub mod wav;
 
+pub use config::{Config, Settings};
 pub use engine::{
-    Audio, Capabilities, Cloning, Engine, EngineConfig, Gaps, Sampling, Stats, Synthesis,
-    SynthesisRequest,
+    Audio, Capabilities, Cloning, Engine, EngineConfig, Gaps, Interrupt, Interrupted, Progress,
+    ProgressEvent, Sampling, Stats, Synthesis, SynthesisRequest,
 };
+pub use lock::GpuLock;
 pub use voice::Voice;

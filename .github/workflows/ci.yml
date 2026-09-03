@@ -44,11 +44,51 @@ jobs:
       - run: cargo clippy --release --no-default-features --all-targets -- -D warnings
       - run: cargo test --release --no-default-features
 
+  # The release archive, on every push. The release workflow runs only on a tag, so without
+  # this a packaging mistake would first be discovered as a broken release.
+  package:
+    name: release archive
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: ./scripts/package.sh
+
+  # `crates/tts-narrate` is a port of `scripts/md-to-narration.py`; this is the evidence it
+  # still agrees with it. Cheap enough to run on every push.
+  narration:
+    name: narration port matches its reference
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: ./scripts/check-narrate.sh
+
   scripts:
     name: shell scripts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: for f in scripts/*.sh; do bash -n "$f"; done
+      - run: for f in scripts/*.sh tts tts-serve; do bash -n "$f"; done
+      # install.sh is piped to `sh`, so it is checked as sh and not as bash.
+      - run: sh -n install.sh
       - name: shellcheck
-        run: shellcheck scripts/*.sh || true   # advisory: style, not correctness
+        run: shellcheck scripts/*.sh install.sh tts tts-serve || true   # advisory: style, not correctness
+
+  # The tag/version agreement that scripts/fetch-prebuilt.sh depends on: it resolves the
+  # release from the checkout's own version, so a workspace whose crates disagree would
+  # ship an archive nothing can find.
+  version:
+    name: one version across the workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          versions=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(" ".join(sorted({p["version"] for p in json.load(sys.stdin)["packages"]})))')
+          echo "crate versions: $versions"
+          [ "$(echo "$versions" | wc -w)" -eq 1 ] \
+            || { echo "crates disagree; use version.workspace = true"; exit 1; }
+          declared=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "$versions" = "$declared" ] \
+            || { echo "workspace.package version $declared != crate version $versions"; exit 1; }

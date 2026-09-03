@@ -55,6 +55,7 @@ pub fn capabilities() -> Capabilities {
         cloning: Cloning::PrecomputedAsset,
         streaming: false,
         quantization: QUANT,
+        languages: None,
         available: true,
         reason: None,
     }
@@ -166,7 +167,12 @@ impl Engine for Audio8Engine {
         let mut order: Vec<usize> = (0..prompts.len()).collect();
         order.sort_by_key(|&i| prompts[i].len);
 
+        request.notify(tts_core::ProgressEvent::Planned {
+            segments: prompts.len(),
+        });
+
         let mut codes_by_index: Vec<Option<Vec<Vec<u32>>>> = vec![None; prompts.len()];
+        let mut ar_done = 0usize;
         for group in crate::ar::plan_batches(order.len(), self.max_batch) {
             let idx: Vec<usize> = group.iter().map(|&g| order[g]).collect();
             let refs: Vec<&crate::prompt::Prompt> = idx.iter().map(|&i| &prompts[i]).collect();
@@ -176,6 +182,11 @@ impl Engine for Audio8Engine {
             for (slot, codes) in idx.iter().zip(out) {
                 codes_by_index[*slot] = Some(codes);
             }
+            // A batch completes atomically, so this steps by the group size rather than
+            // pretending to interpolate inside it.
+            ar_done += idx.len();
+            request.advanced("ar", ar_done, prompts.len());
+            request.check_interrupt(ar_done)?;
         }
 
         let mut pieces: Vec<(usize, Vec<f32>)> = Vec::new();
@@ -196,6 +207,7 @@ impl Engine for Audio8Engine {
             let samples = audio.flatten_all()?.to_vec1::<f32>()?;
             stats.add("codec", t_voc.elapsed().as_secs_f64());
             pieces.push((*pi, samples));
+            request.advanced("codec", k + 1, flat.len());
         }
         stats.total_s = t0.elapsed().as_secs_f64();
         // Keep the shared RNG advancing so successive requests on one engine instance

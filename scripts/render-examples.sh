@@ -12,7 +12,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
-run() { cargo run -q -p tts-cli --release -- speak "$@"; }
+run() { scripts/run-bin.sh dream-tts speak "$@"; }
 
 say "audio8 -> examples/senior_rust.wav"
 run --engine audio8 --voice voices/cosy-default \

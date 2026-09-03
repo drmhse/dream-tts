@@ -109,6 +109,7 @@ pub fn capabilities() -> Capabilities {
         // claiming it would be a lie a client could act on. See the module docs.
         streaming: false,
         quantization: QUANT,
+        languages: Some(cfg::talker::LANGUAGES),
         available: true,
         reason: None,
     }
@@ -142,11 +143,11 @@ impl Paths {
             .map(PathBuf::as_path)
             .filter(|p| !p.exists())
             .collect();
+        // The command first: on a fresh install this is the only error anyone sees, and the
+        // fix is one line. The file list follows for the case where only some are missing.
         anyhow::ensure!(
             missing.is_empty(),
-            "engine `{ID}` is missing {} weight file(s): {}. Download \
-             Qwen/Qwen3-TTS-12Hz-1.7B-Base into references/qwen3tts/weights — see \
-             docs/reference.md#setup",
+            "engine `{ID}` has no checkpoint yet.\n               Download it:  ./scripts/bootstrap.sh qwen3tts   (~4.3 GB, resumable, curl only)\n               Missing {} file(s): {}",
             missing.len(),
             missing
                 .iter()
@@ -445,8 +446,13 @@ impl Engine for Qwen3TtsEngine {
             }
         }
 
+        request.notify(tts_core::ProgressEvent::Planned {
+            segments: prepared.len(),
+        });
+
         let mut out: Vec<Option<Decoded>> = vec![None; prepared.len()];
         let mut unspoken = 0usize;
+        let mut talker_done = 0usize;
         let t = Instant::now();
         for group in &groups {
             let mut batched = None;
@@ -499,6 +505,11 @@ impl Engine for Qwen3TtsEngine {
                     }
                 }
             }
+            // Per group, not per lane: a batched group finishes together, and the talker is
+            // 0.673 of this engine's 0.846 RTF, so this is the number worth showing.
+            talker_done += group.len();
+            request.advanced("talker", talker_done, prepared.len());
+            request.check_interrupt(talker_done)?;
         }
 
         let mut spans: Vec<(usize, Vec<Vec<u32>>)> = Vec::new();
@@ -549,6 +560,8 @@ impl Engine for Qwen3TtsEngine {
         let joined = self.codec.decode(&all_frames)?;
         self.device.synchronize()?;
         stats.add("codec", t.elapsed().as_secs_f64());
+        // One call for the whole utterance, so there is nothing to count through.
+        request.advanced("codec", spans.len(), spans.len());
 
         let mut pieces: Vec<(usize, Vec<f32>)> = Vec::with_capacity(spans.len());
         let mut at = 0usize;

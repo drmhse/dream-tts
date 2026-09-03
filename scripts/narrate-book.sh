@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 #
-# Narrate a book: markdown in, WebM/Opus + alignment manifests out.
+# Narrate a book: a document or a directory of markdown in, WebM/Opus + alignment
+# manifests out.
 #
+#   scripts/narrate-book.sh --document book.epub --out narration
 #   scripts/narrate-book.sh --book /path/to/content/books/<slug> --out narration
+#
+# `--document` takes an EPUB, DOCX, ODT, HTML, PDF or markdown file and imports it into
+# chapter files first (`dream-tts import`), then narrates those. Everything after the import
+# is identical either way, which is why import is a stage in front of this rather than a
+# branch inside it.
 #
 # Discovers chapters in either layout this site uses:
 #
@@ -14,8 +21,8 @@
 # the site's `chapter-NNN` convention regardless of the source filename's slug.
 #
 # Per chapter, in one pass:
-#   1. markdown  -> narration text + page-word map   (md-to-narration.py)
-#   2. text      -> WAV master                        (tts-serve, one server for the book)
+#   1. markdown  -> narration text + page-word map   (dream-tts narrate)
+#   2. text      -> WAV master                        (dream-tts-serve, one server for the book)
 #   3. WAV       -> WebM/Opus 48k for delivery        (ffmpeg; WAV kept as master)
 #   4. WebM+text -> alignment manifest                (align-narration.py)
 #
@@ -34,12 +41,13 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 BOOK=""
+DOCUMENT=""
 OUT=narration
-ENGINE=cosyvoice
+ENGINE=qwen3tts
 QUANT=""
 FILES=()
 PORT="${NARRATE_PORT:-3099}"
-KEY="${TTS_API_KEY:-narrate-local-key}"
+KEY="${DREAM_TTS_API_KEY:-narrate-local-key}"
 MAX_CHARS="${NARRATE_MAX_CHARS:-80000}"
 BITRATE="${NARRATE_OPUS_BITRATE:-48k}"
 AAC_BITRATE="${NARRATE_AAC_BITRATE:-40000}"
@@ -71,6 +79,7 @@ LIST=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --book) BOOK="$2"; shift 2 ;;
+    --document) DOCUMENT="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
     --engine) ENGINE="$2"; shift 2 ;;
     --bitrate) BITRATE="$2"; shift 2 ;;
@@ -91,6 +100,12 @@ say()  { printf '\n\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# The converter is the `dream-tts` binary now, not python. Resolved as a path for the same
+# reason the service is: this loop calls it hundreds of times and `cargo run` per call would
+# dominate the wall time of a short book.
+NARRATE="$(scripts/run-bin.sh --which dream-tts)" \
+  || die "no dream-tts — install Rust, or ./scripts/bootstrap.sh --prebuilt"
+
 # Output name for a source file: `chapter-NNN` for anything numbered, otherwise the stem.
 # Numbering comes from the filename, which both layouts agree on.
 out_name() {
@@ -101,6 +116,16 @@ out_name() {
     printf '%s' "$base"
   fi
 }
+
+# `--document` becomes a `--book` directory, so there is exactly one discovery path below.
+if [ -n "$DOCUMENT" ]; then
+  [ -f "$DOCUMENT" ] || die "--document $DOCUMENT is not a file"
+  [ -z "$BOOK" ] || die "pass --document or --book, not both"
+  BOOK="$OUT/source"
+  say "Importing $(basename "$DOCUMENT") into $BOOK"
+  mkdir -p "$BOOK"
+  "$NARRATE" import "$DOCUMENT" --out "$BOOK" || die "import failed"
+fi
 
 if [ -n "$BOOK" ]; then
   [ -d "$BOOK" ] || die "--book $BOOK is not a directory"
@@ -141,8 +166,20 @@ esac
 # lane where q8_0 batches 1.1x. A chapter is hundreds of segments, so it always batches — RTF
 # 0.31 against 0.66. The trade is single-sentence latency, which a book does not have.
 # docs/reference.md#performance has the numbers.
-command -v ffmpeg >/dev/null || die "ffmpeg not found"
-[ -x ./target/release/tts-serve ] || die "build first: cargo build --release"
+# Named up front rather than discovered mid-book. `dream-tts` itself needs nothing beyond
+# the binary; this script adds an encoder, and alignment adds an interpreter.
+command -v ffmpeg >/dev/null || die \
+  "ffmpeg not found. It encodes the delivery audio, and it is the one thing this script
+   needs that dream-tts does not ship:  brew install ffmpeg
+   To get WAV masters with no encode and no ffmpeg, use dream-tts directly:
+       dream-tts import <document> --out prep/
+       dream-tts speak --text-file prep/chapter-001.md --out chapter-001.wav"
+# Resolved once, as a path: this backgrounds the service and kills it by pid on exit,
+# which `exec cargo run` would break. Builds it if there is a toolchain, uses the
+# prebuilt from a release archive if there is not.
+SERVE_BIN="$(scripts/run-bin.sh --which dream-tts-serve)" \
+  || die "no dream-tts-serve — install Rust, or ./scripts/bootstrap.sh --prebuilt"
+[ -x "$SERVE_BIN" ] || die "no dream-tts-serve at $SERVE_BIN"
 mkdir -p "$OUT"
 
 # Autodetect an interpreter with faster-whisper if one was not given.
@@ -163,8 +200,8 @@ fi
 
 # Two engines resident will not fit; match the binary, not the cargo wrapper. Killing the
 # cargo invocation once orphaned the real process to PID 1 and left two engines on the GPU.
-if pgrep -f "target/release/tts(-serve)? " >/dev/null 2>&1; then
-  pgrep -fl "target/release/tts(-serve)? " >&2
+if pgrep -f "(target/release|bin)/dream-tts(-serve)? " >/dev/null 2>&1; then
+  pgrep -fl "(target/release|bin)/dream-tts(-serve)? " >&2
   die "another tts process holds the GPU"
 fi
 
@@ -180,7 +217,7 @@ done
 SERVER=""
 if [ "$NEED_SERVER" = 1 ]; then
   say "Starting $ENGINE on :$PORT — loads once for all ${#FILES[@]} file(s)"
-  TTS_API_KEY="$KEY" ./target/release/tts-serve \
+  DREAM_TTS_API_KEY="$KEY" "$SERVE_BIN" \
     --port "$PORT" --engine "$ENGINE" --voice "$VOICE" --max-chars "$MAX_CHARS" \
     ${QUANT:+--quant "$QUANT"} \
     >"$OUT/.server.log" 2>&1 &
@@ -239,6 +276,9 @@ trap request_pause INT TERM
 # monitor never has to parse the log, and rewritten atomically so a reader never sees half.
 write_state() {
   [ -n "$STATE_FILE" ] || return 0
+  # Opt-in, and the only remaining python3 outside alignment. Skipped rather than fatal:
+  # a monitor's convenience must not stop a book.
+  command -v python3 >/dev/null || return 0
   python3 - "$STATE_FILE" "$@" <<'PYEOF' 2>/dev/null || true
 import json, os, sys
 path, *rest = sys.argv[1:]
@@ -289,7 +329,8 @@ for src in "${FILES[@]}"; do
   if [ "$done_words" -gt 0 ]; then
     elapsed=$(( $(date +%s) - run_start ))
     remaining=$(( total_words - done_words ))
-    secs=$(python3 -c "print(int($elapsed / max($done_words,1) * $remaining))" 2>/dev/null || echo 0)
+    secs=$(awk -v e="$elapsed" -v d="$done_words" -v r="$remaining" \
+             'BEGIN { printf "%d", e / (d > 0 ? d : 1) * r }')
     eta="  eta $(fmt_hms "$secs") for $remaining more words"
   fi
   say "[$idx/${#FILES[@]}] $base  ($(basename "$src"))$eta"
@@ -302,7 +343,7 @@ for src in "${FILES[@]}"; do
   # which is the exact failure this pipeline exists to prevent. So when a master already exists,
   # convert to a scratch file and refuse to replace the text that produced it.
   if [ -s "$wav" ] && [ -s "$txt" ]; then
-    ./scripts/md-to-narration.py "$src" -o "$txt.regen" --emit-map "$map.regen" >/dev/null 2>&1
+    "$NARRATE" narrate "$src" -o "$txt.regen" --emit-map "$map.regen" >/dev/null 2>&1
     if ! cmp -s "$txt.regen" "$txt"; then
       warn "$base: markdown now converts differently than when the audio was made; keeping the
     original text so the manifest still describes the audio. Delete $wav to re-render."
@@ -311,7 +352,7 @@ for src in "${FILES[@]}"; do
     fi
     rm -f "$txt.regen" "$map.regen"
   else
-    ./scripts/md-to-narration.py "$src" -o "$txt" --emit-map "$map" --stats 2>&1 | sed 's/^/    /'
+    "$NARRATE" narrate "$src" -o "$txt" --emit-map "$map" --stats 2>&1 | sed 's/^/    /'
   fi
   chars=$(wc -c < "$txt" | tr -d ' ')
   if [ "$chars" -gt "$MAX_CHARS" ]; then
@@ -319,12 +360,15 @@ for src in "${FILES[@]}"; do
   fi
 
   if [ ! -s "$wav" ]; then
-    body="$OUT/.$base.json"
-    python3 -c "import json,sys; b={'text': open(sys.argv[1]).read()}; s=sys.argv[3] if len(sys.argv)>3 and sys.argv[3] else None; b.update({'seed': int(s)} if s else {}); json.dump(b, open(sys.argv[2],'w'))" "$txt" "$body" "$SEED"
+    # `text/plain` and the narration file as-is. Building JSON around arbitrary prose in
+    # bash needs a quoting pass that an apostrophe defeats, so this used a `python3 -c
+    # "import json…"` per chapter — a Python dependency on the critical path of the one
+    # feature that is supposed to run with nothing but curl. The service takes the text
+    # directly instead; `X-Seed` carries what the JSON field did.
     code=$(curl -s --max-time 14400 -o "$wav.part" -D "$OUT/.$base.headers" -w '%{http_code}' \
-      -X POST "http://127.0.0.1:$PORT/tts" -H 'content-type: application/json' \
-      -H "X-API-Key: $KEY" --data-binary @"$body")
-    rm -f "$body"
+      -X POST "http://127.0.0.1:$PORT/tts" -H 'content-type: text/plain' \
+      ${SEED:+-H "X-Seed: $SEED"} \
+      -H "X-API-Key: $KEY" --data-binary @"$txt")
     if [ "$code" != 200 ]; then
       warn "$base: HTTP $code — $(head -c 300 "$wav.part" 2>/dev/null)"; rm -f "$wav.part"
       failed=$((failed+1)); continue
@@ -353,8 +397,11 @@ for src in "${FILES[@]}"; do
     # than its master (measured +0.095..+0.126 s across the NIV set). That is the format
     # behaving normally, not drift, so the tolerance is per-format rather than one number.
     tol=0.10; [ "$DELIVERY_EXT" = m4a ] && tol=0.25
-    python3 -c "import sys; sys.exit(0 if abs($wd-$od)<$tol else 1)" \
-      || warn "$base: wav/$DELIVERY_EXT duration drift $(python3 -c "print(f'{abs($wd-$od):.3f}')")s"
+    # Parenthesised: BSD awk reads the bare `<` in an unparenthesised ternary argument as
+    # an input redirect and dies with "syntax error".
+    drift=$(awk -v a="$wd" -v b="$od" 'BEGIN { d = a - b; printf "%.3f", (d < 0 ? -d : d) }')
+    awk -v d="$drift" -v t="$tol" 'BEGIN { exit !(d < t) }' \
+      || warn "$base: wav/$DELIVERY_EXT duration drift ${drift}s"
     mv -f "$delivery.part" "$delivery"
     printf '    %s %s\n' "$DELIVERY_EXT" "$(du -h "$delivery" | cut -f1)"
   fi
@@ -369,7 +416,9 @@ for src in "${FILES[@]}"; do
     if [ ! -s "$man" ]; then
       warn "$base: alignment produced no manifest"; failed=$((failed+1)); continue
     fi
-    if ! python3 -c "import json,sys; sys.exit(0 if json.load(open('$man'))['quality']['valid'] else 1)"; then
+    # `$ALIGN_PYTHON`, not a bare python3: alignment just ran under that interpreter, so it
+    # is the one known to exist here.
+    if ! "$ALIGN_PYTHON" -c "import json,sys; sys.exit(0 if json.load(open('$man'))['quality']['valid'] else 1)"; then
       flagged+=("$base")
     fi
   fi

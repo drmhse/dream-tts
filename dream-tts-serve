@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+#
+# The HTTP service command, wherever it was invoked from.
+#
+# Resolves its own symlinks so a link on PATH works — `ln -s "$PWD/dream-tts-serve" ~/.local/bin/dream-tts-serve`
+# is the normal way to install a command-line tool, and `dirname "$0"` breaks under it.
+# macOS has no dependable `readlink -f`, so the chain is walked by hand.
+#
+# See scripts/run-bin.sh for how the binary itself is found.
+set -euo pipefail
+self="$0"
+hops=0
+while [ -L "$self" ]; do
+  hops=$((hops + 1))
+  [ "$hops" -le 40 ] || { echo "dream-tts-serve: symlink loop resolving $0" >&2; exit 1; }
+  link="$(readlink "$self")"
+  case "$link" in
+    /*) self="$link" ;;
+    *)  self="$(dirname "$self")/$link" ;;
+  esac
+done
+exec "$(cd "$(dirname "$self")" && pwd)/scripts/run-bin.sh" dream-tts-serve "$@"

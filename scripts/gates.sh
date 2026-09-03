@@ -18,47 +18,94 @@ skip() { printf '\033[33m--- skipped: %s\033[0m\n' "$*"; SKIPPED=$((SKIPPED + 1)
 fail=0
 SKIPPED=0
 
+run() { scripts/run-bin.sh "$@"; }
+
+# A checkout unpacked from a release archive has the binaries and neither a toolchain nor
+# the sources. The source tiers below cannot run there, and that is a missing input like
+# any other: skipped and reported, never silently passed. Both halves are checked, because
+# a developer machine can have cargo and still be sitting in an unpacked release.
+if command -v cargo >/dev/null && [ -f Cargo.toml ]; then HAVE_CARGO=1; else HAVE_CARGO=""; fi
+
+# Whether an engine's converted weights are present. The gates and the renders both need
+# this, and with the default bootstrap installing one engine it is the common case that
+# two of the three are legitimately absent.
+engine_ready() {
+  case "$1" in
+    qwen3tts)  [ -f references/qwen3tts/weights/model.safetensors ] ;;
+    audio8)    [ -f references/audio8/weights/codec.safetensors ] ;;
+    cosyvoice) [ -f references/cosyvoice/weights/llm.safetensors ] ;;
+    *) return 1 ;;
+  esac
+}
+
 say "Unit tests"
-if cargo test --release --quiet 2>&1 | tail -20; then
+if [ -z "$HAVE_CARGO" ]; then
+  skip "unit tests: no cargo in this checkout"
+elif cargo test --release --quiet 2>&1 | tail -20; then
   echo "tests ok"
 else
   echo "tests FAILED"; fail=1
 fi
 
-say "Narration prep tests"
-if python3 scripts/test_md_to_narration.py >/dev/null 2>&1; then
-  echo "md-to-narration ok"
+say "Narration reference tests"
+# The Python's own suite. It is the reference `tts-narrate` is checked against, so it has to
+# keep passing on its own terms — a reference that has drifted proves nothing.
+if ! command -v python3 >/dev/null; then
+  skip "md-to-narration reference: no python3"
+elif python3 scripts/test_md_to_narration.py >/dev/null 2>&1; then
+  echo "md-to-narration reference ok"
 else
   python3 scripts/test_md_to_narration.py 2>&1 | tail -20
-  echo "md-to-narration FAILED"; fail=1
+  echo "md-to-narration reference FAILED"; fail=1
 fi
 
 say "Clippy and formatting (advisory)"
-if cargo fmt --check >/dev/null 2>&1; then
-  echo "formatting clean"
+if [ -z "$HAVE_CARGO" ]; then
+  skip "lints: no cargo in this checkout"
 else
-  echo "note: \`cargo fmt\` would reformat some files"
+  if cargo fmt --check >/dev/null 2>&1; then
+    echo "formatting clean"
+  else
+    echo "note: \`cargo fmt\` would reformat some files"
+  fi
+  lints=$(cargo clippy --release --all-targets 2>&1 | grep -cE "^warning: [a-z]" || true)
+  echo "clippy: $lints lint(s)"
 fi
-lints=$(cargo clippy --release --all-targets 2>&1 | grep -cE "^warning: [a-z]" || true)
-echo "clippy: $lints lint(s)"
 
 say "CPU-only build (the portable configuration)"
-if cargo build --release --no-default-features --quiet 2>&1 | tail -5; then
+if [ -z "$HAVE_CARGO" ]; then
+  skip "CPU-only build: no cargo in this checkout"
+elif cargo build --release --no-default-features --quiet 2>&1 | tail -5; then
   echo "no-default-features builds"
 else
   echo "no-default-features FAILED"; fail=1
 fi
 
+say "Narration port matches its reference"
+# The one tier that compares two implementations rather than checking one. `tts-narrate` is
+# a port of a thousand regexes and this is the evidence it agrees with the Python; it needs
+# both a toolchain (for narrate-diff) and python3 (the reference itself).
+if [ -z "$HAVE_CARGO" ]; then
+  skip "narration port: no cargo, so narrate-diff cannot be built"
+elif ! command -v python3 >/dev/null; then
+  skip "narration port: no python3, so there is no reference to compare against"
+elif ./scripts/check-narrate.sh >/dev/null 2>&1; then
+  echo "tts-narrate matches md-to-narration.py"
+else
+  ./scripts/check-narrate.sh 2>&1 | tail -20
+  echo "narration port FAILED"; fail=1
+fi
+
 say "Audio8 fixture gate"
-if [ -f fixtures/audio8/oracle.safetensors ] && [ -f references/audio8/weights/codec.safetensors ]; then
-  cargo run -q -p audio8 --release --bin audio8-validate || fail=1
+if [ -f fixtures/audio8/oracle.safetensors ] && engine_ready audio8; then
+  run audio8-validate || fail=1
 else
   skip "fixtures/audio8/oracle.safetensors or references/audio8/weights/codec.safetensors missing"
 fi
 
 say "CosyVoice fixture gate"
-if [ -f fixtures/cosyvoice/oracle.safetensors ] && [ -d references/cosyvoice/weights ]; then
-  cargo run -q -p cosyvoice --release --bin cosyvoice-validate || fail=1
+if [ -f fixtures/cosyvoice/oracle.safetensors ] && engine_ready cosyvoice; then
+  run cosyvoice-validate || fail=1
 else
   skip "fixtures/cosyvoice/oracle.safetensors or references/cosyvoice/weights missing"
 fi
@@ -67,31 +114,43 @@ say "Qwen3-TTS gate"
 # Two tiers inside one bin: a shape audit that reads only the checkpoint header, then per-stage
 # numerics against fixtures/qwen3tts. The numerics tier reports itself as skipped when the
 # fixtures are absent. Gated on the talker checkpoint, which is what the audit reads.
-if [ -f references/qwen3tts/weights/model.safetensors ]; then
-  cargo run -q -p qwen3tts --release --bin qwen3tts-validate || fail=1
+if engine_ready qwen3tts; then
+  run qwen3tts-validate || fail=1
 else
   skip "references/qwen3tts/weights/model.safetensors missing"
 fi
 
 say "End-to-end renders"
 mkdir -p target/gate
-for spec in "audio8:voices/cosy-default" "cosyvoice:voices/cosy-default-cosyvoice" \
-           "qwen3tts:voices/cosy-default-qwen3tts"; do
+for spec in "qwen3tts:voices/cosy-default-qwen3tts" "audio8:voices/cosy-default" \
+           "cosyvoice:voices/cosy-default-cosyvoice"; do
   id="${spec%%:*}"; voice="${spec##*:}"
-  if [ -d "$voice" ]; then
-    if ! cargo run -q -p tts-cli --release -- speak \
-      --engine "$id" --voice "$voice" --text-file examples/senior.txt \
-      --out "target/gate/$id.wav"; then
-      echo "render FAILED for $id"; fail=1
-    fi
-  else
+  if ! engine_ready "$id"; then
+    skip "$id: weights not installed (./scripts/bootstrap.sh $id)"
+  elif [ ! -d "$voice" ]; then
     skip "$id: voice asset $voice missing"
+  elif ! run dream-tts speak --engine "$id" --voice "$voice" \
+      --text-file examples/senior.txt --out "target/gate/$id.wav"; then
+    echo "render FAILED for $id"; fail=1
   fi
 done
 
 say "HTTP service smoke test"
-if [ -d voices/cosy-default-cosyvoice ] && [ -d references/cosyvoice/weights ]; then
-  TTS_API_KEY=gate-smoke-key ./target/release/tts-serve --port 3099 >target/gate/serve.log 2>&1 &
+# Whichever engine is installed, in catalogue order. Pinning this to cosyvoice made the
+# tier skip on every checkout that took the default bootstrap.
+smoke_engine=""
+for id in qwen3tts audio8 cosyvoice; do
+  if engine_ready "$id"; then smoke_engine="$id"; break; fi
+done
+smoke_bin=""
+if [ -n "$smoke_engine" ]; then
+  smoke_bin=$(scripts/run-bin.sh --which dream-tts-serve) || smoke_bin=""
+fi
+if [ -n "$smoke_bin" ] && [ -x "$smoke_bin" ]; then
+  # Not `./dream-tts-serve`: the shim execs cargo, so the pid killed below would be cargo's
+  # while the service kept running as its child.
+  DREAM_TTS_API_KEY=gate-smoke-key "$smoke_bin" --engine "$smoke_engine" --port 3099 \
+      >target/gate/serve.log 2>&1 &
   serve_pid=$!
   for _ in $(seq 1 60); do
     curl -sf -o /dev/null http://127.0.0.1:3099/health && break
@@ -113,8 +172,10 @@ if [ -d voices/cosy-default-cosyvoice ] && [ -d references/cosyvoice/weights ]; 
   fi
   kill "$serve_pid" 2>/dev/null
   wait "$serve_pid" 2>/dev/null
+elif [ -z "$smoke_engine" ]; then
+  skip "http smoke: no engine weights installed"
 else
-  skip "http smoke: cosyvoice weights or voice asset missing"
+  skip "http smoke: no dream-tts-serve binary (no cargo, and bin/dream-tts-serve absent)"
 fi
 
 say "Summary"

@@ -71,6 +71,7 @@ pub fn capabilities() -> Capabilities {
         // docs/reference.md#porting-traps.
         streaming: false,
         quantization: QUANT,
+        languages: None,
         available: true,
         reason: None,
     }
@@ -293,6 +294,9 @@ impl Engine for CosyVoiceEngine {
             .flat_map(|(pi, para)| para.iter().map(move |s| (pi, s)))
             .collect();
         anyhow::ensure!(!flat.is_empty(), "no text to speak");
+        request.notify(tts_core::ProgressEvent::Planned {
+            segments: flat.len(),
+        });
 
         let mut rng = Rng::new(request.sampling.seed);
         let mut stats = Stats::default();
@@ -431,6 +435,10 @@ impl Engine for CosyVoiceEngine {
         }
         self.device.synchronize()?;
         stats.add("llm", t.elapsed().as_secs_f64());
+        // The LLM runs every segment inside one batched call with retries, so there is no
+        // honest intermediate count. Reported as a single completed step rather than a
+        // fabricated ramp.
+        request.advanced("llm", flat.len(), flat.len());
 
         let mut spans: Vec<(usize, Vec<u32>)> = Vec::new();
         for (pi, speech) in para_of.into_iter().zip(generated) {
@@ -531,6 +539,9 @@ impl Engine for CosyVoiceEngine {
 
             stats.frames += mel.dim(2)?;
             stats.segments += group.len();
+            // Flow is 65-68% of this engine, so this is the count worth watching.
+            request.advanced("flow", stats.segments, flat.len());
+            request.check_interrupt(stats.segments)?;
 
             // Cut the group's waveform back into its segments so the caller's gaps still
             // apply. The boundaries are exact rather than estimated: the flow holds each
