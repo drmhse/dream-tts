@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 320" width="620" height="320" role="img" aria-label="Cost per lane, talker trunk alone. ms per lane  ·  span 412 positions, n=5, one batch size per process  ·  log scales">
+<style>
+  text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .surface { fill: #fcfcfb; }
+  .title   { fill: #0b0b0b; font-size: 15px; font-weight: 600; }
+  .sub     { fill: #52514e; font-size: 11.5px; }
+  .axis    { fill: #898781; font-size: 11px; }
+  .value   { fill: #0b0b0b; font-size: 11.5px; font-weight: 600; }
+  .note    { fill: #52514e; font-size: 11px; }
+  .grid    { stroke: #e1e0d9; stroke-width: 1; }
+  .base    { stroke: #c3c2b7; stroke-width: 1; }
+  .ok      { fill: #2a78d6; }
+  .okline  { stroke: #2a78d6; fill: none; stroke-width: 2; }
+  .bad     { fill: #d03b3b; }
+  .badline { stroke: #d03b3b; fill: none; stroke-width: 2; }
+  .ring    { stroke: #fcfcfb; stroke-width: 2; }
+  .onbar   { fill: #fcfcfb; font-size: 11px; }
+  .ref     { stroke: #52514e; stroke-width: 1.5; stroke-dasharray: 5 4; }
+  @media (prefers-color-scheme: dark) {
+    .surface { fill: #1a1a19; }
+    .title   { fill: #ffffff; }
+    .sub, .note { fill: #c3c2b7; }
+    .grid    { stroke: #2c2c2a; }
+    .base    { stroke: #383835; }
+    .value   { fill: #ffffff; }
+    .ok      { fill: #3987e5; }
+    .okline  { stroke: #3987e5; }
+    .bad     { fill: #e66767; }
+    .badline { stroke: #e66767; }
+    .ring    { stroke: #1a1a19; }
+    .ref     { stroke: #c3c2b7; }
+  }
+</style>
+<rect class="surface" width="620" height="320" rx="6"/>
+<text class="title" x="62" y="24">Cost per lane, talker trunk alone</text>
+<text class="sub" x="62" y="41">ms per lane  ·  span 412 positions, n=5, one batch size per process  ·  log scales</text>
+<line class="grid" x1="62" y1="268.0" x2="602" y2="268.0"/>
+<text class="axis" x="54" y="272.0" text-anchor="end">1</text>
+<line class="grid" x1="62" y1="224.8" x2="602" y2="224.8"/>
+<text class="axis" x="54" y="228.8" text-anchor="end">2</text>
+<line class="grid" x1="62" y1="167.7" x2="602" y2="167.7"/>
+<text class="axis" x="54" y="171.7" text-anchor="end">5</text>
+<line class="grid" x1="62" y1="124.5" x2="602" y2="124.5"/>
+<text class="axis" x="54" y="128.5" text-anchor="end">10</text>
+<line class="grid" x1="62" y1="81.3" x2="602" y2="81.3"/>
+<text class="axis" x="54" y="85.3" text-anchor="end">20</text>
+<text class="axis" x="62.0" y="286" text-anchor="middle">8</text>
+<text class="axis" x="197.0" y="286" text-anchor="middle">16</text>
+<text class="axis" x="276.0" y="286" text-anchor="middle">24</text>
+<text class="axis" x="332.0" y="286" text-anchor="middle">32</text>
+<text class="axis" x="411.0" y="286" text-anchor="middle">48</text>
+<text class="axis" x="467.0" y="286" text-anchor="middle">64</text>
+<text class="axis" x="546.0" y="286" text-anchor="middle">96</text>
+<text class="axis" x="602.0" y="286" text-anchor="middle">128</text>
+<polyline class="okline" points="62.0,162.1 197.0,172.1 276.0,195.1 332.0,210.4 411.0,230.8 467.0,244.0"/>
+<line class="badline" stroke-dasharray="5 4" x1="467.0" y1="244.0" x2="546.0" y2="89.8"/>
+<polyline class="badline" points="546.0,89.8 602.0,66.2"/>
+<circle class="ring ok" cx="62.0" cy="162.1" r="5"/>
+<circle class="ring ok" cx="197.0" cy="172.1" r="5"/>
+<circle class="ring ok" cx="276.0" cy="195.1" r="5"/>
+<circle class="ring ok" cx="332.0" cy="210.4" r="5"/>
+<circle class="ring ok" cx="411.0" cy="230.8" r="5"/>
+<circle class="ring ok" cx="467.0" cy="244.0" r="5"/>
+<circle class="ring bad" cx="546.0" cy="89.8" r="5"/>
+<circle class="ring bad" cx="602.0" cy="66.2" r="5"/>
+<text class="value" x="62.0" y="150.1" text-anchor="start">5.47</text>
+<text class="value" x="467.0" y="262.0" text-anchor="start">1.47</text>
+<text class="value" x="602.0" y="54.2" text-anchor="end">25.50</text>
+<line class="base" x1="62" y1="268" x2="602" y2="268"/>
+<text class="axis" x="332.0" y="304" text-anchor="middle">batch (lanes)</text>
+<text class="note" x="62" y="265.0">each added lane ≈ 0.4 ms, flat from 16 to 64</text>
+<text class="note" x="546.0" y="154.3" text-anchor="middle">memory cliff</text>
+<circle class="ok" cx="474" cy="20" r="4"/>
+<text class="note" x="483" y="24">renders</text>
+<circle class="bad" cx="540" cy="20" r="4"/>
+<text class="note" x="549" y="24">swaps</text>
+</svg>

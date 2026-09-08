@@ -1,5 +1,5 @@
 @startuml qwen3tts-speedup
-title <b>qwen3tts: what buys the speed</b>\nshipped RTF 0.260 = 3.9x realtime   |   5x = RTF 0.200
+title <b>qwen3tts: what buys 5x realtime</b>\nmeasured end to end on a 4763-word article: 201 segments, 28m 31s of audio, one M4 / 16 GB, f16
 
 skinparam backgroundColor #FFFFFF
 skinparam shadowing false
@@ -19,26 +19,26 @@ skinparam noteFontSize 12
 
 rectangle "text -> segments" as SEG
 rectangle "ICL prompt\nref codes + spk" as PROMPT
-rectangle "**scheduler**" as SCHED #DDF3E0
-rectangle "**talker**\n0.187  (72%)" as TALKER #DDF3E0
-rectangle "**codec**\n0.073  (28%)" as CODEC #DDF3E0
-rectangle "24 kHz WAV\n**0.260 = 3.9x**" as WAV #D6E9F8
+rectangle "**scheduler**\n48 lanes" as SCHED #DDF3E0
+rectangle "**talker**\n0.128  (64%)" as TALKER #DDF3E0
+rectangle "**codec**\n0.071  (36%)" as CODEC #DDF3E0
+rectangle "24 kHz WAV\n**0.200 = 5.0x**" as WAV #D6E9F8
 
 SEG --> PROMPT
 PROMPT --> SCHED
-SCHED --> TALKER : "24 lanes"
+SCHED --> TALKER : "48 lanes"
 TALKER --> CODEC : "[T, 16] codes"
 CODEC --> WAV
 
 note right of SCHED #DDF3E0
   shape buckets
   length sort
-  chunk to 24
+  chunk to 48
 end note
 
 note right of TALKER #DDF3E0
   f16, not q8_0      <b>7.4x</b> vs 1.1x
-  batched decode     24 lanes
+  batched decode     48 lanes
   in-place KV        -112 MB/step
   folded tables      -126 MB/frame
   512-frame cap
@@ -50,21 +50,34 @@ note right of CODEC #DDF3E0
   fused NLC kernels
 end note
 
+note left of SCHED #FBDDDD
+  <b>cliff at 56 lanes</b>
+  RTF 0.701, 621 s sys
+  swap, not compute
+end note
+
 note left of TALKER #FDEBD0
-  <i>to reach 0.200</i>
+  <i>beyond 5x</i>
   lane refill
-  batch 32-48
 end note
 
 note left of CODEC #FDEBD0
-  <i>to reach 0.200</i>
+  <i>beyond 5x</i>
   torch-parity kernels
+  (1.7-2.2x behind torch)
 end note
 
 note bottom of WAV #FFFDF0
-  |= |= talker |= codec |= |
-  | shipped | 0.187 | 0.073 | <b>3.9x</b> |
-  | target | 0.145 | 0.055 | <b>5.0x</b> |
+  |= lanes |= talker |= codec |= RTF |= |
+  | 24 | 0.162 | 0.071 | 0.235 | 4.3x |
+  | <b>48</b> | <b>0.128</b> | 0.071 | <b>0.200-0.202</b> | <b>5.0x</b> |
+  | 56 | 0.624 | 0.076 | 0.701 | cliff |
+  | 64 | 0.574 | 0.072 | 0.647 | cliff |
+
+  Per lane, in isolation, cost was still falling at 64 (~0.4 ms per added lane from 16 up).
+  The wall is memory, not arithmetic: 48 lanes peak at 14.8 GB, 56 at 19.0 GB on a 16 GB machine.
+  Canary 59.4 ms; the 24-lane baseline re-measured 0.235 -> 0.237 after 30 min of load, and 48
+  re-measured 0.200 -> 0.202, so these are ratios within one thermal state.
   green measured, amber projected
 end note
 

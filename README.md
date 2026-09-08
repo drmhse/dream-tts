@@ -105,24 +105,46 @@ like for like, with that reference running on MPS too.
 Short-passage figures, for comparison. `examples/senior.txt`, 132 words, median of five with
 the engines interleaved: `audio8` 0.554, `cosyvoice` 0.726, `qwen3tts` 0.665.
 
-## What makes `qwen3tts` fast, and what 5× would take
+## What makes `qwen3tts` fast, and what 5× takes
 
 ![qwen3tts speedup components](docs/qwen3tts-speedup.png)
 
-Every green component above is shipped and measured; together they are what took this engine
-from RTF 0.661 to **0.260** on the chapter fixture — 3.9× realtime. Two of them carry most of
-it, and neither is a kernel: **f16 weights** (only a dense GEMM shares one weight read across
-lanes — quantized `mm_t` re-reads per row, so q8_0 amortises 1.1× against f16's 7.4×) and
-**length-sorted batching** (a group runs as long as its longest lane, and unsorted only 47-56%
-of lane-steps did useful work).
+Every green component above is measured; together they are what took this engine from RTF 0.661
+to **0.200 — 5.0× realtime** on a 4763-word article (201 segments, 28m 31s of audio, one M4 with
+16 GB). Two of them carry most of it, and neither is a kernel:
 
-**5× realtime is RTF 0.200, and this engine is not there.** The amber components are the two
-talker levers and the one codec lever that could close the remaining 1.3× — continuous lane
-refill, a wider batch once candle's Metal pool stops holding 11.1 GB, and codec kernel parity
-with torch. They are projected from measurements of *adjacent* things: no fixture stands behind
-the 0.200 column, and this README has quoted an unsupported RTF for this engine once already.
-The talker is 72% of the cost, so it is the talker levers that have to carry it; zeroing the
-codec entirely would still leave 0.187.
+- **f16 weights.** Only a dense GEMM shares one weight read across lanes; candle's quantized
+  `mm_t` re-reads per row, so q8_0 amortises 1.1× against f16's 7.4×.
+- **48 batched lanes, length-sorted.** A group runs as long as its longest lane, and unsorted
+  only 47-56% of lane-steps did useful work.
+
+**The lane count is bounded by memory, and nothing else.**
+
+![RTF by lane count](docs/qwen3tts-lanes-rtf.svg)
+
+`MAX_BATCH` ships at 24 — 0.235 on this text — because that was the last figure measured. 48
+reaches 0.200, and re-measured 0.202 after half an hour of load. 56 collapses to **0.701** with
+**621 s of system time** against 17 s at 48: that is the VM compressor, not compute, as peak
+footprint goes 14.8 GB → 19.0 GB on a 16 GB machine.
+
+There is no arithmetic saturation to find before that wall. Measured on the trunk alone, an
+added lane costs a flat ~0.4 ms all the way from 16 to 64, and per-lane cost is still falling
+where the engine has already run out of memory:
+
+![cost per lane](docs/qwen3tts-lanes-perlane.svg)
+
+So `QWEN3TTS_MAX_BATCH=48` is the 5× configuration *on a 16 GB machine*. A machine with more
+memory should sweep it again — the cliff moves, and the curve above it has not flattened.
+Regenerate both charts with `python3 scripts/plot-lanes.py`; the measurements are inline in that
+script.
+
+The two amber components are what a *sixth* multiple would need, and neither has a fixture behind
+it: refilling a lane the moment it hits `codec_eos` instead of stepping it dead to the end of its
+group, and closing the 1.7-2.2× the codec still gives away to torch.
+
+```sh
+QWEN3TTS_MAX_BATCH=48 ./dream-tts speak --quant f16 --text-file article.txt --out out.wav
+```
 
 What each component is doing, and the paths already refuted — f32 weights, batched q8_0,
 device-side sampling, an f16 codec, ONNX, CoreML — are in
