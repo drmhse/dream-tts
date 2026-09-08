@@ -69,11 +69,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: for f in scripts/*.sh tts tts-serve; do bash -n "$f"; done
+      - run: for f in scripts/*.sh dream-tts dream-tts-serve; do bash -n "$f"; done
       # install.sh is piped to `sh`, so it is checked as sh and not as bash.
       - run: sh -n install.sh
       - name: shellcheck
-        run: shellcheck scripts/*.sh install.sh tts tts-serve || true   # advisory: style, not correctness
+        run: shellcheck scripts/*.sh install.sh dream-tts dream-tts-serve || true   # advisory: style, not correctness
 
   # The tag/version agreement that scripts/fetch-prebuilt.sh depends on: it resolves the
   # release from the checkout's own version, so a workspace whose crates disagree would
