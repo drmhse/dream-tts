@@ -124,6 +124,10 @@ the 0.200 column, and this README has quoted an unsupported RTF for this engine 
 The talker is 72% of the cost, so it is the talker levers that have to carry it; zeroing the
 codec entirely would still leave 0.187.
 
+What each component is doing, and the paths already refuted — f32 weights, batched q8_0,
+device-side sampling, an f16 codec, ONNX, CoreML — are in
+[docs/reference.md](docs/reference.md#performance).
+
 Regenerate the diagram after any change to those numbers:
 
 ```sh

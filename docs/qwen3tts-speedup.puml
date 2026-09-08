@@ -1,101 +1,71 @@
 @startuml qwen3tts-speedup
-title <b>qwen3tts: the components that buy 5x realtime</b>\n1612-word chapter, 100 segments, one M4 / 16 GB. Shipped RTF 0.252-0.261; 5x is RTF 0.200
+title <b>qwen3tts: what buys the speed</b>\nshipped RTF 0.260 = 3.9x realtime   |   5x = RTF 0.200
 
 skinparam backgroundColor #FFFFFF
 skinparam shadowing false
 skinparam defaultFontName Helvetica
-skinparam defaultFontSize 12
+skinparam defaultFontSize 13
 skinparam titleFontSize 15
 skinparam roundCorner 8
-skinparam nodesep 30
-skinparam ranksep 34
-skinparam ArrowColor #444444
+skinparam nodesep 45
+skinparam ranksep 30
+skinparam ArrowColor #666666
 skinparam ArrowFontSize 11
-skinparam ArrowThickness 1.3
 skinparam rectangle {
-  BorderColor #5A6B7A
-  BackgroundColor #E8EDF2
-  FontSize 12
+  BorderColor #6B7A88
+  BackgroundColor #EDF1F5
 }
-skinparam noteFontSize 11
+skinparam noteFontSize 12
 
-rectangle "**text::segment**\n1612 words -> 100 segments, max_chars each" as SEG
-rectangle "**Talker::build_prompt**\nrole + ICL reference codes + speaker embedding" as PROMPT
-rectangle "**Batch scheduler**\nbucket by shape, sort by length, chunk to 24 lanes" as SCHED #DDF3E0
-rectangle "**Talker**  ---  RTF 0.187 of 0.260  (72%)\nQwen3 trunk 28L @ 2048, one step per 80 ms frame\n+ depth predictor 5L, 15 sequential AR steps per frame" as TALKER #DDF3E0
-rectangle "**Codec decoder**  ---  RTF 0.073 of 0.260  (28%)\nRVQ dequant -> 8L transformer -> 2x (transconv + ConvNeXt)\n-> 4 decoder blocks -> SnakeBeta -> conv" as CODEC #DDF3E0
-rectangle "**WAV 24 kHz**, 1920 samples per frame\nshipped: **RTF 0.260 = 3.9x realtime**" as WAV #D6E9F8
+rectangle "text -> segments" as SEG
+rectangle "ICL prompt\nref codes + spk" as PROMPT
+rectangle "**scheduler**" as SCHED #DDF3E0
+rectangle "**talker**\n0.187  (72%)" as TALKER #DDF3E0
+rectangle "**codec**\n0.073  (28%)" as CODEC #DDF3E0
+rectangle "24 kHz WAV\n**0.260 = 3.9x**" as WAV #D6E9F8
 
 SEG --> PROMPT
 PROMPT --> SCHED
-SCHED --> TALKER : "groups of <= 24 equal-shape lanes"
-TALKER --> CODEC : "[T, 16] codes per lane"
+SCHED --> TALKER : "24 lanes"
+TALKER --> CODEC : "[T, 16] codes"
 CODEC --> WAV
 
 note right of SCHED #DDF3E0
-  <b>Shipped, measured</b>
-  * <b>Shape bucketing</b> by (prompt_len, trailing_len). The ICL block is fixed by the
-    <i>voice</i>, so nearly every sentence buckets together -- no padding, no per-lane mask
-  * <b>Length sort, then chunk.</b> A group runs as long as its longest lane. Unsorted,
-    only 47-56% of lane-steps were useful on this chapter
+  shape buckets
+  length sort
+  chunk to 24
 end note
 
 note right of TALKER #DDF3E0
-  <b>Shipped, measured</b>
-  * <b>f16 weights, not q8_0.</b> Only a dense GEMM shares one weight read across lanes:
-    f16 amortises 7.4x, q8_0 just 1.1x. Chapter RTF 0.661 (q8_0) -> <b>0.260</b> (f16)
-  * <b>Batched decode, 24 lanes.</b> Both transformers are bandwidth-bound on weight
-    reads, so a lane costs little beyond a read the batch already pays
-  * <b>In-place KV cache + tts_nn::attn.</b> slice_set instead of slice_assign, and
-    attention reads the cache in place -- a narrow() span copied ~112 MB/step for nothing
-  * <b>Predictor precompute.</b> 15 codebook tables concatenated (2 dispatches, not 45),
-    resize folded in at load: ~126 MB/frame of weight traffic gone
-  * <b>512-frame lane cap.</b> Sizes the KV cache; a lane that hits it is rerun with the
-    full budget rather than shipped truncated
+  f16, not q8_0      <b>7.4x</b> vs 1.1x
+  batched decode     24 lanes
+  in-place KV        -112 MB/step
+  folded tables      -126 MB/frame
+  512-frame cap
 end note
 
 note right of CODEC #DDF3E0
-  <b>Shipped, measured</b>
-  * <b>One call per utterance</b> over the concatenated frames, cut afterwards. Per-segment
-    calls open with no left context and audibly change timbre
-  * <b>Chunked, 300 frames + 25 of left context.</b> Bounds memory, and lets candle's Metal
-    buffer pool recycle instead of paying every allocation cold
-  * <b>tts_nn kernels.</b> Channels-last convs (k accumulating GEMMs, no im2col matrix),
-    tap-major gather, fused SnakeBeta
+  one call per utterance
+  300 + 25 frame chunks
+  fused NLC kernels
 end note
 
 note left of TALKER #FDEBD0
-  <b>Needed for 0.200 -- projected, no fixture</b>
-  * <b>Continuous batching.</b> Refill a lane the moment
-    it hits codec_eos. Today a finished lane keeps being
-    stepped -- deliberately: repacking the cache cost
-    more than the waste does at 24 lanes
-  * <b>Wider batch, 32-48 lanes.</b> Still 3.40 ms/lane
-    and falling at 24 (12.0x amortisation). Blocked by
-    memory, not by returns: candle's Metal pool never
-    releases, 11.1 GB peak on this chapter
+  <i>to reach 0.200</i>
+  lane refill
+  batch 32-48
 end note
 
 note left of CODEC #FDEBD0
-  <b>Needed for 0.200 -- projected, no fixture</b>
-  * <b>Codec kernel parity.</b> candle is 1.70-2.23x
-    slower than torch on this codec, stable across every
-    thermal state. The fused NLC path took audio8's codec
-    0.260 -> 0.158; extending it over the transconv and
-    ConvNeXt stages is the lever here
+  <i>to reach 0.200</i>
+  torch-parity kernels
 end note
 
 note bottom of WAV #FFFDF0
-  <b>Where the last 1.1x has to come from</b>
-  |= |= talker |= codec |= total |= realtime |
-  | shipped | 0.187 | 0.073 | <b>0.260</b> | 3.9x |
-  | target | 0.145 | 0.055 | <b>0.200</b> | <b>5.0x</b> |
-
-  The talker is 72% of the cost, so the talker levers are the ones that can carry this. The codec cannot
-  do it alone: driving 0.073 to <i>zero</i> still leaves 0.187, which only reaches 5.3x if the talker holds exactly.
-
-  <b>Refuted, do not retry:</b> f32 weights (RTF <b>6.25</b> at 6.97 GB resident), batching q8_0 (1.02 against 0.79),
-  device-side sampling, an f16 codec decoder, ONNX Runtime, CoreML.
+  |= |= talker |= codec |= |
+  | shipped | 0.187 | 0.073 | <b>3.9x</b> |
+  | target | 0.145 | 0.055 | <b>5.0x</b> |
+  green measured, amber projected
 end note
 
 @enduml
