@@ -105,6 +105,31 @@ like for like, with that reference running on MPS too.
 Short-passage figures, for comparison. `examples/senior.txt`, 132 words, median of five with
 the engines interleaved: `audio8` 0.554, `cosyvoice` 0.726, `qwen3tts` 0.665.
 
+## What makes `qwen3tts` fast, and what 5× would take
+
+![qwen3tts speedup components](docs/qwen3tts-speedup.png)
+
+Every green component above is shipped and measured; together they are what took this engine
+from RTF 0.661 to **0.260** on the chapter fixture — 3.9× realtime. Two of them carry most of
+it, and neither is a kernel: **f16 weights** (only a dense GEMM shares one weight read across
+lanes — quantized `mm_t` re-reads per row, so q8_0 amortises 1.1× against f16's 7.4×) and
+**length-sorted batching** (a group runs as long as its longest lane, and unsorted only 47-56%
+of lane-steps did useful work).
+
+**5× realtime is RTF 0.200, and this engine is not there.** The amber components are the two
+talker levers and the one codec lever that could close the remaining 1.3× — continuous lane
+refill, a wider batch once candle's Metal pool stops holding 11.1 GB, and codec kernel parity
+with torch. They are projected from measurements of *adjacent* things: no fixture stands behind
+the 0.200 column, and this README has quoted an unsupported RTF for this engine once already.
+The talker is 72% of the cost, so it is the talker levers that have to carry it; zeroing the
+codec entirely would still leave 0.187.
+
+Regenerate the diagram after any change to those numbers:
+
+```sh
+plantuml -tpng docs/qwen3tts-speedup.puml
+```
+
 ## Narrate a whole book, from any document
 
 ```sh
