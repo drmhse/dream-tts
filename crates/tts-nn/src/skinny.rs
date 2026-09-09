@@ -86,6 +86,12 @@ impl CustomOp2 for Skinny {
 
 /// Whether these shapes take the kernel: `[m, k] x [k, n]`, f16, on Metal.
 pub fn eligible(m: usize, k: usize, n: usize) -> bool {
+    // A/B switch: the end-to-end effect of a 1.2x GEMM is smaller than this machine's thermal
+    // drift, so the two paths have to be measured against each other in one state.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !ON.get_or_init(|| std::env::var("TTS_NN_SKINNY_GEMM").as_deref() != Ok("0")) {
+        return false;
+    }
     m <= MAX_M && m.is_multiple_of(8) && k.is_multiple_of(32) && n.is_multiple_of(64)
 }
 
