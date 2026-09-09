@@ -107,7 +107,9 @@ impl Conv {
 /// `kernel / stride` taps reach any output — 1 for the ratio-2 upsamplers, 2 for the decoder
 /// blocks — so candle's `conv_transpose1d` is not needed. See [`tts_nn::nlc::transpose_weights`].
 struct TransConv {
-    taps: Vec<Tensor>,
+    /// Tap-major and reversed, so this runs through [`nlc::causal_conv1d`] — see
+    /// [`nlc::transpose_tap_weight`].
+    w: Tensor,
     b: Tensor,
     stride: usize,
 }
@@ -118,18 +120,22 @@ impl TransConv {
     }
 
     fn load_as(w: &Weights, prefix: &str, stride: usize, dt: DType) -> Result<Self> {
-        let taps = nlc::transpose_weights(&w.get(&format!("{prefix}.conv.weight"))?, stride)?
-            .into_iter()
-            .map(|t| Ok(t.to_dtype(dt)?))
-            .collect::<Result<Vec<_>>>()?;
+        let tapped = nlc::transpose_tap_weight(&w.get(&format!("{prefix}.conv.weight"))?, stride)?
+            .to_dtype(dt)?;
         Ok(Self {
-            taps,
-            b: w.get(&format!("{prefix}.conv.bias"))?.to_dtype(dt)?,
+            w: tapped,
+            b: nlc::transpose_bias(&w.get(&format!("{prefix}.conv.bias"))?, stride)?
+                .to_dtype(dt)?,
             stride,
         })
     }
+    /// `[b, L, C_in] -> [b, L * stride, C_out]`. The conv emits the `stride` output phases
+    /// interleaved on the channel axis, which is the layout the reshape wants — no copy.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        nlc::causal_conv_transpose1d(x, &self.taps, Some(&self.b), self.stride)
+        let (b, len, _) = x.dims3()?;
+        let y = nlc::causal_conv1d(x, &self.w, Some(&self.b), 1)?;
+        let wide = y.dim(2)?;
+        Ok(y.reshape((b, len * self.stride, wide / self.stride))?)
     }
 }
 

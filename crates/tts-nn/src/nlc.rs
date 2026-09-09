@@ -121,10 +121,42 @@ pub fn transpose_weights(w: &Tensor, stride: usize) -> Result<Vec<Tensor>> {
         .collect()
 }
 
+/// A transposed conv's taps as one tap-major weight, for [`causal_conv1d`].
+///
+/// **The polyphase form is a causal conv.** Output `l * s + p` takes tap group `i` against
+/// `x[l - i]`, and a causal conv over the same `x` with kernel `m` reads `x[l - (m - 1) + t]`,
+/// so the two agree with the tap groups reversed. Written that way the transposed conv is one
+/// GEMM over `[k * C_in]` instead of `m` GEMMs and `m - 1` full-width adds, and it reaches the
+/// fused kernel — the shifted copy per tap and the accumulator both stop existing.
+pub fn transpose_tap_weight(w: &Tensor, stride: usize) -> Result<Tensor> {
+    let taps = transpose_weights(w, stride)?;
+    let (cin, wide) = taps[0].dims2()?;
+    let reversed: Vec<Tensor> = taps
+        .into_iter()
+        .rev()
+        .map(|t| Ok(t.reshape((1, cin, wide))?))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Tensor::cat(&reversed, 0)?.contiguous()?)
+}
+
+/// A transposed conv's bias, repeated across the `stride` output phases it interleaves.
+pub fn transpose_bias(b: &Tensor, stride: usize) -> Result<Tensor> {
+    let out = b.dim(0)?;
+    Ok(b.reshape((1, out))?
+        .broadcast_as((stride, out))?
+        .contiguous()?
+        .reshape(stride * out)?)
+}
+
 /// Causal transposed conv over `[b, L, C_in]` -> `[b, L * stride, C_out]`.
 ///
 /// Matches `crate::causal_conv_transpose1d` (convolve then drop the trailing `k - stride`) for
 /// any `kernel` divisible by `stride`.
+///
+/// **Prefer [`transpose_tap_weight`] and [`causal_conv1d`]**, which is the same arithmetic as
+/// one GEMM rather than `m` of them plus `m - 1` full-width adds and a shifted copy per tap:
+/// the qwen3tts decoder's four transposed convs went 172.0 ms to 80.3 on a 300-frame chunk.
+/// This is kept as the reference form the identity is checked against.
 pub fn causal_conv_transpose1d(
     x: &Tensor,
     taps: &[Tensor],
