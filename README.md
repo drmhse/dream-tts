@@ -109,9 +109,9 @@ Short-passage figures, for comparison. `examples/senior.txt`, 132 words: `audio8
 
 ### What it needs to be this fast
 
-**16 GB.** `qwen3tts` peaks at 12.3 GB on a single short passage and 13.3 GB on a 203-segment
+**16 GB.** `qwen3tts` peaks at 12.3 GB on a single short passage and 13.0 GB on a 203-segment
 article, and almost all of that is the codec decoder's activations rather than weights — one
-300-frame chunk alone is 6.5 GB. Below 16 GB the engine says so on load and keeps going, which
+300-frame chunk alone is 5.5 GB. Below 16 GB the engine says so on load and keeps going, which
 is the honest option: it will swap, and swapping presents as the model being slow rather than
 as a mistake.
 
@@ -132,7 +132,7 @@ What does help a smaller machine is a different engine. Same passage, same measu
 `QWEN3TTS_MAX_BATCH` trades lanes for footprint if you want to stay on this engine, but it
 cannot go under the codec's own ~12 GB.
 
-## What makes `qwen3tts` fast, and what 6× takes
+## What makes `qwen3tts` fast, and where the 6.9× comes from
 
 ![qwen3tts speedup components](docs/qwen3tts-speedup.png)
 
@@ -162,27 +162,29 @@ Four of them carry most of it, and two are kernels:
 | Pixel Watch article, 4838 words | 203 | | 0.193 | **0.144** | **6.9×** |
 | `examples/chapter.txt`, 1612 words | 100 | 0.260 | 0.186 | **0.148** | **6.8×** |
 
-**Shedding pays most where segment lengths vary most**, so those are a floor rather than a best
-case: the 4763-word article has the *narrowest* spread of the three (coefficient of variation
-0.37 against 0.55-0.57) and gains the least.
+**Shedding pays most where segment lengths vary most**, so these are a floor rather than a best
+case: the article's segment lengths have the narrower spread of the two and it gains the least.
 
-**Quality was checked on the audio, not on the codes**, because token identity is the wrong
-metric for a sampled model. Against the same text, WER went 0.046 → **0.040** (218 → 189 errors
-in 4781 words), and median F0 and LTAS cosine against the clip this voice was cloned from are
-identical to four decimals — 173.9 Hz and 0.9973 before and after. `references/cosyvoice/wer.py`
-and `references/audio8/verify_voice.py` are the tools.
+**Quality is checked on the audio, not on the codes**, because token identity is the wrong metric
+for a sampled model — two of the four changes above move the logits, and a sampled model then
+takes a different path through the same text. Against the article, WER is **0.036** where the
+release before it was 0.038 (176 against 184 errors in 4838 words), and median F0 and LTAS cosine
+against the clip this voice was cloned from are **175.8 Hz and 0.9974**, unchanged to the digits
+that mean anything. `references/cosyvoice/wer.py` and `references/audio8/verify_voice.py` are the
+tools. The fused conv is stronger than that: its render is bit-identical to the one before it
+across all 42,454,560 samples.
 
 ### Memory is candle's buffer pool, not the lane count
 
-Peak footprint is now **13.1-13.7 GB**, from 14.2-14.8. The lever is not obvious, so it is worth
-stating plainly: `vmmap` attributes a chapter render to **1515 GPU allocations totalling 12.6 GB**
-against ~4.5 GB of weights, because candle's Metal pool keys buffers by size and releases none.
-Every distinct tensor shape a run touches is therefore permanent, and every memory win is a
-*shape removed* rather than bytes shaved:
+Peak footprint is now **12.5-13.0 GB**, from 14.2-14.8. The lever is not obvious, so it is worth
+stating plainly: `vmmap` attributes a render to GPU allocations far exceeding its ~4.5 GB of
+weights, because candle's Metal pool keys buffers by size and releases none. Every distinct
+tensor shape a run touches is therefore permanent, and most memory wins here are a *shape
+removed* rather than bytes shaved:
 
 - **The codec decodes a uniform span, padded on the right.** The natural loop runs two lengths —
   300 frames for the first chunk, which has no history to spend, then 325 — and one 300-frame
-  chunk is **6.50 GB** of activations, so the second length cost about that again. Extending each
+  chunk is **5.55 GB** of activations, so the second length cost about that again. Extending each
   window *rightwards* is free because the decoder is causal, and the gate confirms the audio is
   unchanged. Moving the seams instead is *not* free: `codec.long.wav_chunked` fails at rel 3.4e-1,
   because the reference's own chunked output differs from its unchunked one.
@@ -198,13 +200,20 @@ KV cache implies. So the 16 GB machine runs out because of the floor, not the la
 
 ![RTF by lane count](docs/qwen3tts-lanes-rtf.svg)
 
-56 lanes still swaps, and the reason is the *number of large groups* rather than the count: a
-100-segment document splits 56 + 44, so the KV cache is allocated twice at 4.2 + 3.3 GB where
-48 + 4 costs 3.6 + 0.3. Reusing one allocation across groups is the next fix; allocating a
-fixed-size one per group was tried and made 48 lanes swap.
+**Past 48 lanes it swaps, and that is not one allocation anyone can move.** The obvious
+suspect is that a 100-segment document splits 64 + 36, so the KV cache is allocated at two
+widths and the pool keeps both. It is not enough: four separate attempts at freeing 64 lanes
+are recorded in [what did not work](docs/reference.md#what-did-not-work), and the closest —
+slicing the codec's waveform stack, which is *exact*, since every conv below the pre-transformer
+is causal — bought 1.08 GB for 9% more time and still swapped at 64. Peak goes 12.7 to 15.8 GB
+between 48 lanes and 64, and it is spread across the run rather than sitting in one buffer. The
+codec's activations are the floor, and the only lever on those costs more than the lanes return.
 
-There is no arithmetic saturation to find before that wall. An added lane costs a flat ~0.4 ms
-from 16 to 64, and per-lane cost is still falling where the engine has already run out of memory:
+There is no arithmetic saturation to find before that wall. An added lane costs about 0.4 ms
+from 16 to 64, and per-lane cost is still falling where the engine has already run out of
+memory — 1.615 ms at 48 against 1.460 at 64, because 64 fills the 8×8 matrix tiles that 48
+leaves ragged. Only past that does the curve turn: 96 lanes costs 17.4 ms per lane and 128
+costs 31.3, which is the VM compressor rather than arithmetic.
 
 ![cost per lane](docs/qwen3tts-lanes-perlane.svg)
 
@@ -212,11 +221,11 @@ A machine with more memory should sweep `QWEN3TTS_MAX_BATCH` again — the cliff
 curve above it has not flattened. Regenerate both charts with `python3 scripts/plot-lanes.py`;
 the measurements are inline in that script.
 
-The two amber components are what a *sixth* multiple would need, and neither has a fixture behind
-it: refilling an interior lane the moment it hits `codec_eos` rather than only shedding tails, and
-closing the 1.7-2.2× the codec still gives away to torch. The codec is 40% of the total now and
-does not batch by construction, so it is the ceiling: with a free talker the floor is RTF 0.070,
-or 14×.
+The two amber components are what a *seventh* multiple would need, and neither has a fixture
+behind it: refilling an interior lane the moment it hits `codec_eos` rather than only shedding
+tails, and closing what the codec still gives away to torch. The codec is 26% of the total now,
+down from 40%, and does not batch by construction — with a free talker the floor is RTF 0.038,
+or 26×, so the ceiling has moved back to the talker.
 
 What each component is doing, and the paths already refuted — f32 weights, batched q8_0,
 device-side sampling, an f16 codec, ONNX, CoreML — are in

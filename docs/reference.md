@@ -253,8 +253,9 @@ Two fixtures, both tracked so any figure here can be reproduced:
 
 ### Short passage
 
-`examples/senior.txt`, M4 / 16 GB, `q8_0`. Median of five samples with the three engines
-interleaved in one session.
+`examples/senior.txt`, M4 / 16 GB. Median of five samples with the three engines interleaved in
+one session, taken when `qwen3tts`'s default was `q8_0`; at today's `f16` default the same
+passage reads **0.397**, still the wrong case for it.
 
 | engine | reference | this port | spread | |
 |---|---|---|---|---|
@@ -841,10 +842,10 @@ A flat words-per-second rate is the obvious model and it is wrong by a factor of
 half, in both directions.
 
 These engines have strong economies of scale. `qwen3tts` batches across segments and that
-only engages once a chapter has enough of them, so the documented figures are RTF **0.665**
-on `examples/senior.txt` (132 words) and **0.260** on `examples/chapter.txt` (1612 words) —
-0.287 s/word against 0.112 s/word for the same voice on the same machine. A rate learned
-from a short chapter and applied to a long one predicts 463 s where the truth is 181 s.
+only engages once a chapter has enough of them, so the figures are RTF **0.397** on
+`examples/senior.txt` (132 words) and **0.148** on `examples/chapter.txt` (1612 words) — a
+2.7× spread in seconds per word for the same voice on the same machine. A rate learned from a
+short chapter and applied to a long one is wrong by about that much.
 
 It goes the other way too, and that was the first bug: a book's front matter is 27 words of
 title page, almost all fixed cost, and extrapolating from it put a real run's estimate at

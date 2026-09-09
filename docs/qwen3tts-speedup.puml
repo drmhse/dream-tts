@@ -1,5 +1,5 @@
 @startuml qwen3tts-speedup
-title <b>qwen3tts: what buys 5x realtime</b>\nthree corpora, 1612-4763 words, 100-201 segments, one M4 / 16 GB, f16, default settings
+title <b>qwen3tts: what buys 6.9x realtime</b>\ntwo corpora, 1612-4838 words, 100-203 segments, one M4 / 16 GB, default settings
 
 skinparam backgroundColor #FFFFFF
 skinparam shadowing false
@@ -20,9 +20,9 @@ skinparam noteFontSize 12
 rectangle "text -> segments" as SEG
 rectangle "ICL prompt\nref codes + spk" as PROMPT
 rectangle "**scheduler**\n48 lanes, longest-first" as SCHED #DDF3E0
-rectangle "**talker**\n0.104-0.116  (60%)" as TALKER #DDF3E0
-rectangle "**codec**\n0.069-0.071  (40%)" as CODEC #DDF3E0
-rectangle "24 kHz WAV\n**0.175-0.186 = 5.4-5.7x**" as WAV #D6E9F8
+rectangle "**talker**\n0.105-0.110  (74%)" as TALKER #DDF3E0
+rectangle "**codec**\n0.038-0.042  (26%)" as CODEC #DDF3E0
+rectangle "24 kHz WAV\n**0.144-0.148 = 6.8-6.9x**" as WAV #D6E9F8
 
 SEG --> PROMPT
 PROMPT --> SCHED
@@ -37,9 +37,11 @@ note right of SCHED #DDF3E0
 end note
 
 note right of TALKER #DDF3E0
-  f16, not q8_0      <b>7.4x</b> vs 1.1x
+  f16 <b>by default</b>   7.4x vs q8_0's 1.1x
+  <b>decode-shaped GEMM</b> 1.08-1.46x vs candle
   batched decode     48 lanes, longest-first
   shed finished tail  68-70% -> 79-90% useful
+  <b>cut a babbling lane</b> one group 230 -> 154 steps
   shed in 8s         one width set, not 48
   prefill in 8s      748 MB -> 94 MB of scores
   in-place KV        -112 MB/step
@@ -49,53 +51,47 @@ end note
 note right of CODEC #DDF3E0
   one call per utterance
   300 + 25 frame chunks
-  <b>uniform span, padded right</b>
-  fused NLC kernels
+  uniform span, padded right
+  <b>taps gathered inside the GEMM</b> 1.70x
+  <b>transposed conv as one conv</b> 2.14x
 end note
 
 note left of SCHED #FBDDDD
-  <b>cliff at 56 lanes</b>
-  not the lane count: 100 segments
-  split 56 + 44, so the KV cache is
-  allocated twice (4.2 + 3.3 GB)
-  where 48 + 4 costs 3.6 + 0.3
+  <b>cliff past 48 lanes</b>
+  peak goes 12.7 -> 15.8 GB from 48
+  to 64, spread across the run rather
+  than in one buffer. Four ways of
+  freeing it are in reference.md
 end note
 
 note left of TALKER #FDEBD0
-  <i>beyond 5x</i>
+  <i>beyond 7x</i>
   refill <b>interior</b> lanes
   (a tail is shed; a lane that
   finishes mid-batch is not)
 end note
 
 note left of CODEC #FDEBD0
-  <i>beyond 5x</i>
+  <i>beyond 7x</i>
   torch-parity kernels
-  (1.7-2.2x behind torch)
 end note
 
 note bottom of WAV #FFFDF0
   |= corpus |= segs |= was (24) |= 48 lanes |= <b>shipped</b> |= |
-  | book chapter, 3227w | 150 | | 0.195 | <b>0.175</b> | <b>5.7x</b> |
-  | article, 4763w | 201 | 0.235 | 0.200 | <b>0.183</b> | <b>5.5x</b> |
-  | chapter.txt, 1612w | 100 | 0.260 | 0.218 | <b>0.186</b> | <b>5.4x</b> |
+  | Pixel Watch article, 4838w | 203 | | 0.193 | <b>0.144</b> | <b>6.9x</b> |
+  | chapter.txt, 1612w | 100 | 0.260 | 0.186 | <b>0.148</b> | <b>6.8x</b> |
 
-  peak footprint 13.1-13.7 GB, from 14.2-14.8. Quality checked on the audio, not the codes:
-  WER 0.046 -> <b>0.040</b> against the same text, median F0 and LTAS cosine identical to
-  four decimals (173.9 Hz, 0.9973) against the clip the voice was cloned from.
+  peak footprint 12.5-13.0 GB, from 14.2-14.8. Quality checked on the audio, not the codes,
+  because two of these move the logits and a sampled model then takes a different path:
+  WER <b>0.036</b> against the release before it, median F0 175.8 Hz and LTAS cosine 0.9974
+  against the clip the voice was cloned from. The fused conv is bit-identical to what it
+  replaced, across all 42,454,560 samples.
 
-  Shedding pays most where segment lengths vary most: the article's spread is the narrowest of
-  the three (cv 0.37 against 0.55-0.57) and it gains the least. So these are a floor, not a
-  best case.
+  Memory is candle's Metal pool, which keys buffers by size and releases none, so most wins
+  here are a *shape* removed rather than bytes shaved.
 
-  Memory is candle's Metal pool, which keys buffers by size and releases none: 1515 GPU
-  allocations totalling 12.6 GB mid-render against ~4.5 GB of weights. Every memory win here is
-  a *shape* removed, not bytes shaved.
-
-  Per lane, in isolation, cost was still falling at 64 (~0.4 ms per added lane from 16 up). The
-  wall is memory, not arithmetic: 48 lanes peak at 14.8 GB, 56 at 19.0 GB on a 16 GB machine.
-  Canary 59.4 ms; the 24-lane baseline re-measured 0.235 -> 0.237 after 30 min of load, and 48
-  re-measured 0.200 -> 0.202, so these are ratios within one thermal state.
+  Per lane, in isolation, cost is still falling at 64: 1.615 ms at 48 against 1.460, because
+  64 fills the 8x8 matrix tiles 48 leaves ragged. The wall is memory, not arithmetic.
   green measured, amber projected
 end note
 

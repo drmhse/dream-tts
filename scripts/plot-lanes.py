@@ -10,13 +10,14 @@ from pathlib import Path
 
 OUT = Path(__file__).resolve().parent.parent / "docs"
 
-# End to end, `ck` pixel-watch article: 4763 words, 201 segments, 28m 31s of audio.
+# End to end, `ck` pixel-watch article: 4838 words, 203 segments, 29m 22s of audio, v0.2.3.
 # (lanes, RTF, swapping)
-E2E = [(24, 0.235, False), (48, 0.200, False), (56, 0.701, True), (64, 0.647, True)]
-# Talker trunk alone, span 412 positions, n=5 interleaved. (batch, ms/lane, swapping)
+E2E = [(24, 0.181, False), (48, 0.144, False), (64, 0.692, True)]
+# Talker trunk alone, span 412 positions, n=5 interleaved, one batch size per process.
+# (batch, ms/lane, swapping)
 PER_LANE = [
-    (8, 5.466, False), (16, 4.661, False), (24, 3.222, False), (32, 2.520, False),
-    (48, 1.816, False), (64, 1.470, False), (96, 17.450, True), (128, 25.496, True),
+    (16, 4.020, False), (24, 2.808, False), (32, 2.236, False), (48, 1.615, False),
+    (56, 1.610, False), (64, 1.460, False), (96, 17.431, True), (128, 31.317, True),
 ]
 
 W, H = 620, 320
@@ -93,7 +94,7 @@ def rtf_chart():
     y = lambda v: T + PH * (1 - v / ymax)
     s = head(
         "End-to-end RTF by lane count",
-        "RTF, before finished-tail shedding  ·  4763-word article, 201 segments  ·  f16, M4 / 16 GB",
+        "4838-word article, 203 segments  ·  v0.2.3 defaults, M4 / 16 GB",
     )
     for t in (0, 0.25, 0.5, 0.75):
         s.append(f'<line class="grid" x1="{L}" y1="{y(t):.1f}" x2="{L + PW}" y2="{y(t):.1f}"/>')
