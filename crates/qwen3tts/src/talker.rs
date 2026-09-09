@@ -750,8 +750,12 @@ impl Talker {
         max_new: usize,
         s: &Sampling,
         rng: &mut Rng,
+        budgets: &[usize],
     ) -> Result<BatchOutput> {
         let b = prompt.dim(0)?;
+        if budgets.len() != b {
+            bail!("{} budgets for {b} lanes", budgets.len());
+        }
         if trailing.dim(0)? != b {
             bail!("prompt batch {b} != trailing batch {}", trailing.dim(0)?);
         }
@@ -836,6 +840,14 @@ impl Talker {
                 } else {
                     seen[lane].push(c);
                     code0.push(c);
+                }
+                // A lane past its own budget has stopped saying the text and started babbling;
+                // `report_segments` warns about exactly this after the fact. Cutting it is not a
+                // loss of good audio, and it is what a group's step count is made of: one
+                // 103-character segment ran 230 frames and held 47 other lanes open behind it.
+                if !done[lane] && seen[lane].len() >= budgets[lane] {
+                    done[lane] = true;
+                    consumed[lane] = step;
                 }
             }
             // Shed a finished tail before the predictor runs: a lane that just emitted eos does

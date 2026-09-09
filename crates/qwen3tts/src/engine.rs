@@ -92,6 +92,16 @@ fn max_batch() -> usize {
     })
 }
 
+/// How far past this voice's own frames-per-character a lane may run before it is cut.
+///
+/// Not a tolerance on natural variation — 2x the median is far outside it. It is the point past
+/// which the segment is no longer reading its text, and every step it takes after that holds
+/// the whole group open behind it.
+const SEGMENT_BUDGET_SLACK: f64 = 2.0;
+
+/// Segments that must have finished before the ratio is trusted to cap anything.
+const SEGMENT_RATIO_SAMPLE: usize = 16;
+
 /// Frames a batched lane may reach before the group is redone one segment at a time.
 ///
 /// The KV cache is sized for this, so it cannot be the request's full budget: 4096 positions
@@ -476,6 +486,11 @@ impl Engine for Qwen3TtsEngine {
             segments: prepared.len(),
         });
 
+        // Frames per character, learned from the groups already decoded. Stable within a voice,
+        // which is the same assumption `report_segments` takes a median under.
+        let mut seen_ratios: Vec<f64> = Vec::with_capacity(prepared.len());
+        let mut ratio: Option<f64> = None;
+
         let mut out: Vec<Option<Decoded>> = vec![None; prepared.len()];
         let mut unspoken = 0usize;
         let mut talker_done = 0usize;
@@ -488,9 +503,21 @@ impl Engine for Qwen3TtsEngine {
                 let trailings: Vec<Tensor> = group.iter().map(|&i| prepared[i].3.clone()).collect();
                 let prompt = Tensor::cat(&prompts, 0)?.contiguous()?;
                 let trailing = Tensor::cat(&trailings, 0)?.contiguous()?;
+                // Per-lane budget from the frames-per-character this voice has already shown,
+                // doubled. A segment past that has stopped reading its text — the same
+                // condition `report_segments` reports, caught while it is still costing steps
+                // rather than afterwards. The first group has no ratio yet and runs uncapped.
+                let budgets: Vec<usize> = group
+                    .iter()
+                    .map(|&i| match ratio {
+                        Some(r) => ((prepared[i].1 as f64 * r * SEGMENT_BUDGET_SLACK) as usize)
+                            .clamp(SEGMENT_MIN_FRAMES, cap),
+                        None => cap,
+                    })
+                    .collect();
                 let (frames, left, timing) = self
                     .talker
-                    .generate_batch(&prompt, &trailing, cap, &sampling, &mut rng)?;
+                    .generate_batch(&prompt, &trailing, cap, &sampling, &mut rng, &budgets)?;
                 if std::env::var_os("QWEN3TTS_TIMING").is_some() {
                     eprintln!(
                         "engine {ID}: batch {} — {} steps, {} lane-steps ({} without shedding), \
@@ -533,6 +560,21 @@ impl Engine for Qwen3TtsEngine {
                     }
                 }
             }
+            // Update the ratio from what this group actually produced, before the next one
+            // sizes its budgets against it.
+            for &i in group {
+                if let Some((_, chars, frames)) = &out[i] {
+                    if *chars >= SEGMENT_MIN_CHARS {
+                        seen_ratios.push(frames.len() as f64 / *chars as f64);
+                    }
+                }
+            }
+            if seen_ratios.len() >= SEGMENT_RATIO_SAMPLE {
+                let mut sorted = seen_ratios.clone();
+                sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite ratios"));
+                ratio = Some(sorted[sorted.len() / 2]);
+            }
+
             // Per group, not per lane: a batched group finishes together, and the talker is
             // 0.673 of this engine's 0.846 RTF, so this is the number worth showing.
             talker_done += group.len();
