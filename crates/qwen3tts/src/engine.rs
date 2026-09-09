@@ -63,12 +63,18 @@ type Decoded = (usize, usize, Vec<Vec<u32>>);
 
 /// Lanes per batched decode.
 ///
-/// Bounded by memory, not by diminishing returns: per-lane cost was still falling at 24 in the
-/// `qwen3tts-batch` sweep (trunk 3.40 ms/lane, 12.0x amortisation). A lane costs
-/// `positions * 114 KB` of f16 KV cache, so 24 is ~1.8 GB on top of 2.8 GB of f16 weights.
-/// Measured 6.9 GB resident on a 21-segment render; a 100-segment chapter peaked at 11.1 GB
-/// because candle's Metal buffer pool never releases, which is the real ceiling here.
-const MAX_BATCH: usize = 24;
+/// **48, and the bound is memory rather than diminishing returns.** Per-lane cost was still
+/// falling at 64 in the `qwen3tts-batch` sweep — an added lane costs a flat ~0.4 ms from 16
+/// upward — so there is no arithmetic saturation to find below the wall. What there is instead
+/// is a cliff: three corpora between 1612 and 4763 words render at RTF 0.175-0.192 at 48 lanes,
+/// and 56 collapses to 0.701 with 621 s of system time against 17 s, which is the VM compressor
+/// rather than compute.
+///
+/// A lane itself is cheap — 13 MB of peak footprint between 24 and 48 lanes, measured, against
+/// the 77 MB its f16 KV cache implies. The 16 GB machine runs out because the *floor* is
+/// ~14.5 GB, not because lanes are expensive, so raising this further wants that floor lowered
+/// first rather than a bigger number here.
+const MAX_BATCH: usize = 48;
 
 /// `MAX_BATCH`, overridable for tuning. Group size trades three things against each other: a
 /// wider batch amortises the weight read further, but costs more per step and packs lengths
@@ -431,16 +437,19 @@ impl Engine for Qwen3TtsEngine {
         // row, so the batch pays full price per lane and then wastes steps on finished lanes.
         let lanes = if self.batches { max_batch() } else { 1 };
         for mut g in shapes {
-            // **Sort by length before chunking.** A batched step costs the same whether all
-            // lanes are still producing or one is, and lanes stop at their own `codec_eos`, so a
-            // group runs as long as its *longest* member. Mixed lengths measured **47-56% of
-            // lane-steps useful** on a 100-segment chapter — half the talker's work thrown away.
-            // Grouping similar lengths together is what removes that, and character count is a
-            // good enough proxy because frames per character is stable within one voice (it is
-            // the same ratio `report_segments` takes a median of).
+            // **Sort by length before chunking, longest first.** Lanes stop at their own
+            // `codec_eos`, so a group runs as long as its longest member. Grouping similar
+            // lengths together is what bounds that, and character count is a good enough proxy
+            // because frames per character is stable within one voice (it is the same ratio
+            // `report_segments` takes a median of).
+            //
+            // **Longest-first is what makes shedding possible**: `generate_batch` can only drop
+            // a contiguous *tail* of finished lanes, since a prefix narrow shares the caches'
+            // storage. Ascending order put every early finisher at the head, where nothing can
+            // be dropped — 68% of lane-steps useful at 48 lanes, against 47-56% unsorted.
             //
             // Stable, and tie-broken by index, so a render stays reproducible under a seed.
-            g.sort_by_key(|&i| (prepared[i].1, i));
+            g.sort_by_key(|&i| (std::cmp::Reverse(prepared[i].1), i));
             for chunk in g.chunks(lanes) {
                 groups.push(chunk.to_vec());
             }
@@ -466,13 +475,15 @@ impl Engine for Qwen3TtsEngine {
                     .talker
                     .generate_batch(&prompt, &trailing, cap, &sampling, &mut rng)?;
                 if std::env::var_os("QWEN3TTS_TIMING").is_some() {
-                    let capacity = timing.steps * timing.lanes;
                     eprintln!(
-                        "engine {ID}: batch {} — {} steps, {} frames, {:.0}% of lane-steps useful",
+                        "engine {ID}: batch {} — {} steps, {} lane-steps ({} without shedding), \
+                         {} frames, {:.0}% of lane-steps useful",
                         group.len(),
                         timing.steps,
+                        timing.lane_steps,
+                        timing.steps * timing.lanes,
                         timing.frames,
-                        timing.frames as f64 / capacity.max(1) as f64 * 100.0,
+                        timing.frames as f64 / timing.lane_steps.max(1) as f64 * 100.0,
                     );
                 }
                 // A lane that filled the cap may have been cut off mid-sentence. Redo the group

@@ -37,11 +37,14 @@ pub struct Timing {
     pub depth_read_s: f64,
     pub depth_stack_s: f64,
     pub frames: usize,
-    /// Decode steps actually run. A batched step costs the same whether every lane is still
-    /// producing or only one is, so `frames / (steps * lanes)` is how much of the work was
-    /// useful — lanes finish at different frames and a finished lane keeps being computed.
+    /// Decode steps actually run.
     pub steps: usize,
+    /// Lanes the batch started with.
     pub lanes: usize,
+    /// Lane-steps actually computed, summed over the shrinking live prefix. `frames /
+    /// lane_steps` is how much of that work was useful; `steps * lanes` was the denominator
+    /// before finished tails were shed, and now overstates the work.
+    pub lane_steps: usize,
 }
 
 fn timing_on() -> bool {
@@ -54,6 +57,23 @@ fn timing_on() -> bool {
 /// position, so 5120 positions is 1.09 GB — a real cost on a 16 GB machine where the weights
 /// already want several. 1536 positions is 123 s of audio at 12.5 Hz, well past one segment.
 const CAPACITY: usize = 1536;
+
+/// Lanes prefilled at once, independent of how wide the batch is.
+///
+/// Prefill attention is `b * heads * L^2`: at 48 lanes and a 156-position ICL prompt the scores
+/// alone are 748 MB, and softmax doubles it. candle's Metal pool never releases, so each distinct
+/// group width leaves that behind for the life of the process — a chapter render held 12.6 GB
+/// across 1515 GPU allocations. Windowing makes prefill one shape at an eighth the size, and it
+/// is free: one pass per group against ~150 decode steps, and the arithmetic is identical since
+/// lanes never read each other's cache.
+const PREFILL_LANES: usize = 8;
+
+/// Batch widths are rounded up to a multiple of this when shedding.
+///
+/// Same reason: narrowing 48 -> 47 -> 46 makes a new width, hence a new set of buffer sizes, on
+/// every step — measured at 0.31 GB of peak footprint. A quantum keeps at most `QUANTUM - 1`
+/// dead lanes and draws widths from a set of `b / QUANTUM` instead of `b`.
+const SHED_QUANTUM: usize = 8;
 
 pub struct Sampling {
     pub temperature: f32,
@@ -743,7 +763,22 @@ impl Talker {
         let mut timing = Timing::default();
         let clock = timing_on();
         let t_pre = Instant::now();
-        let mut h = self.stack.forward(prompt, &mut state)?;
+        // Prefill in windows of `PREFILL_LANES` rather than all `b` at once, and keep only each
+        // window's last position: that is all the decode loop reads, and the full `[b, L, DIM]`
+        // hidden state is another buffer the pool would keep.
+        let mut lasts = Vec::with_capacity(b.div_ceil(PREFILL_LANES));
+        let mut off = 0;
+        while off < b {
+            let w = PREFILL_LANES.min(b - off);
+            let mut window = state.lane_window(off, w)?;
+            let x = prompt.narrow(0, off, w)?.contiguous()?;
+            let hw = self.stack.forward(&x, &mut window)?;
+            lasts.push(hw.narrow(1, hw.dim(1)? - 1, 1)?);
+            off += w;
+        }
+        // Every window wrote the same positions, so the parent advances once.
+        state.width = prompt.dim(1)?;
+        let mut h = Tensor::cat(&lasts, 0)?.contiguous()?;
         if clock {
             self.stack.device().synchronize()?;
         }
@@ -759,20 +794,26 @@ impl Talker {
         let mut done = vec![false; b];
         let mut consumed = vec![0usize; b];
         let mut step = 0usize;
+        // Lanes still being computed, always a prefix of the batch. Lanes arrive longest-first
+        // (the engine sorts each group that way), so finishers accumulate at the tail and the
+        // prefix shrinks monotonically. Before this existed, 68% of lane-steps were useful at
+        // 48 lanes: a third of the talker went on lanes that had already emitted eos.
+        let mut live = b;
 
         loop {
             let last = h.narrow(1, h.dim(1)? - 1, 1)?;
             let t = Instant::now();
             let rows = self
                 .head
-                .forward(&last.reshape((b, tk::DIM))?)?
+                .forward(&last.reshape((live, tk::DIM))?)?
                 .to_vec2::<f32>()?;
             timing.sample_s += t.elapsed().as_secs_f64();
+            timing.lane_steps += live;
 
-            let mut code0 = Vec::with_capacity(b);
+            let mut code0 = Vec::with_capacity(live);
             for (lane, logits) in rows.iter().enumerate() {
-                // A finished lane still needs *a* code to keep its row of the batch well
-                // formed; it is never recorded.
+                // A finished lane still inside the live prefix needs *a* code to keep its row
+                // well formed; it is never recorded.
                 if done[lane] {
                     code0.push(0);
                     continue;
@@ -797,15 +838,31 @@ impl Talker {
                     code0.push(c);
                 }
             }
-            if done.iter().all(|&d| d) {
+            // Shed a finished tail before the predictor runs: a lane that just emitted eos does
+            // not need its 15 residual codes either. Anything short of the whole tail is left
+            // alone, because an interior gap cannot be narrowed away.
+            let mut needed = live;
+            while needed > 0 && done[needed - 1] {
+                needed -= 1;
+            }
+            if needed == 0 {
                 break;
             }
+            let target = needed.div_ceil(SHED_QUANTUM) * SHED_QUANTUM;
+            let last = if target < live {
+                live = target;
+                code0.truncate(live);
+                state.narrow_to(live)?;
+                last.narrow(0, 0, live)?
+            } else {
+                last
+            };
 
-            let idx = Tensor::from_vec(code0.clone(), b, &self.device)?;
-            let code0_embed = self
-                .codec_embed
-                .index_select(&idx, 0)?
-                .reshape((b, 1, tk::DIM))?;
+            let idx = Tensor::from_vec(code0.clone(), live, &self.device)?;
+            let code0_embed =
+                self.codec_embed
+                    .index_select(&idx, 0)?
+                    .reshape((live, 1, tk::DIM))?;
 
             let t = Instant::now();
             let (rest, mut sum) =
@@ -816,7 +873,7 @@ impl Talker {
             }
             timing.predictor_s += t.elapsed().as_secs_f64();
 
-            for lane in 0..b {
+            for lane in 0..live {
                 if done[lane] {
                     continue;
                 }
@@ -835,7 +892,7 @@ impl Talker {
             } else {
                 pad.clone()
             };
-            sum = (sum + text_next)?;
+            sum = (sum + text_next.narrow(0, 0, live)?)?;
             let t = Instant::now();
             h = self.stack.forward(&sum, &mut state)?;
             if clock {

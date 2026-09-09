@@ -127,6 +127,61 @@ pub struct State {
     capacity: usize,
 }
 
+impl State {
+    /// Keep only the first `live` lanes.
+    ///
+    /// A prefix narrow is a view over the same storage, so shedding a finished *tail* costs a
+    /// view where shedding an interior lane would mean rebuilding all 28 caches. It is also
+    /// why a batch has to be ordered longest-first: that is what puts the early finishers at
+    /// the end.
+    /// A view of lanes `[off, off + width)`, sharing the parent's cache storage.
+    ///
+    /// Writes land in the parent: `slice_set` adds the view's own start offset, and a row range
+    /// of the outermost dimension keeps natural strides, so the view is contiguous and the copy
+    /// strides are the parent's. The parent's `width` is deliberately *not* advanced — every
+    /// window writes the same positions, so the caller advances it once, after the last one.
+    pub fn lane_window(&self, off: usize, width: usize) -> Result<State> {
+        if width == 0 || off + width > self.batch {
+            bail!(
+                "lane window {off}..{} outside a batch of {}",
+                off + width,
+                self.batch
+            );
+        }
+        let caches = self
+            .caches
+            .iter()
+            .map(|c| {
+                Ok(Cache {
+                    k: c.k.narrow(0, off, width)?,
+                    v: c.v.narrow(0, off, width)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(State {
+            caches,
+            width: self.width,
+            batch: width,
+            capacity: self.capacity,
+        })
+    }
+
+    pub fn narrow_to(&mut self, live: usize) -> Result<()> {
+        if live == self.batch {
+            return Ok(());
+        }
+        if live == 0 || live > self.batch {
+            bail!("cannot narrow a batch of {} to {live}", self.batch);
+        }
+        for c in self.caches.iter_mut() {
+            c.k = c.k.narrow(0, 0, live)?;
+            c.v = c.v.narrow(0, 0, live)?;
+        }
+        self.batch = live;
+        Ok(())
+    }
+}
+
 pub struct Stack {
     layers: Vec<Layer>,
     /// KV cache dtype. f16 with f16 weights: 114 KB per position per lane instead of 229, which
