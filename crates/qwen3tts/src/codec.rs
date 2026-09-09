@@ -506,22 +506,63 @@ impl Codec {
             .collect())
     }
 
+    /// Frames per decode chunk, overridable for the memory/throughput sweep.
+    ///
+    /// The peak is a *chunk*, not a document: one 300-frame chunk costs 6.50 GB of activations
+    /// where the whole codec's weights are a fraction of that, which is why footprint is flat
+    /// across document length once the first full chunk is decoded. Free to vary — the gate
+    /// checks `decode` against the *unchunked* reference (`codec.wav_chunked` reports the same
+    /// 4.12e-5 as `codec.wav`), so chunking is validated rather than pinned.
+    fn chunk_frames() -> usize {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("QWEN3TTS_CHUNK_FRAMES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(k::CHUNK_FRAMES)
+        })
+    }
+
     /// Decode in chunks with left context, discarding the context's audio.
     ///
     /// Two reasons this is the default path rather than one big `forward`: memory stays
     /// bounded, and candle's Metal device pools buffers by size, so a decoder called many
     /// times recycles where one called once pays every allocation cold.
+    ///
+    /// **Every forward is the same length, and the padding goes on the right.** The natural
+    /// loop runs two lengths — the first chunk has no history to spend, so 300 frames, and
+    /// every later one 325 — and candle's pool keeps a full set of activation buffers per
+    /// length. One 300-frame chunk is 6.50 GB of those, so the second length cost about that
+    /// again. Extending each window *rightwards* to a fixed span fixes it without touching the
+    /// audio: this decoder is causal — left-padded convs, a causal transposed conv, a masked
+    /// sliding-window transformer — so frames after the ones being kept cannot affect them.
+    /// Extending *leftwards* would not be free, and moving the seams is not either: the
+    /// reference's own chunked output differs from its unchunked output (see the two
+    /// `codec.long.wav*` gate rows), so seam positions are part of matching upstream.
+    ///
+    /// A document shorter than one span stays a single forward at its own length; padding it
+    /// out would multiply the codec's work on a one-sentence render for nothing.
     pub fn decode(&self, frames: &[Vec<u32>]) -> Result<Vec<f32>> {
-        let mut out: Vec<f32> = Vec::with_capacity(frames.len() * crate::cfg::SAMPLES_PER_FRAME);
+        let n = frames.len();
+        let chunk = Self::chunk_frames();
+        let span = chunk + k::CHUNK_LEFT_CONTEXT;
+        let mut out: Vec<f32> = Vec::with_capacity(n * crate::cfg::SAMPLES_PER_FRAME);
         let mut start = 0usize;
-        while start < frames.len() {
-            let end = (start + k::CHUNK_FRAMES).min(frames.len());
-            let ctx = k::CHUNK_LEFT_CONTEXT.min(start);
-            let wav = self.forward(&frames[start - ctx..end])?;
-            let drop = ctx * crate::cfg::SAMPLES_PER_FRAME;
-            let len = wav.dim(2)?;
-            let keep = wav.narrow(2, drop, len - drop)?;
-            out.extend(keep.flatten_all()?.to_vec1::<f32>()?);
+        while start < n {
+            let end = (start + chunk).min(n);
+            let from = start.saturating_sub(k::CHUNK_LEFT_CONTEXT);
+            let to = (from + span).min(n);
+            let mut window: Vec<Vec<u32>> = frames[from..to].to_vec();
+            if n >= span {
+                // Repeat the last frame rather than invent codes; it is discarded either way.
+                let filler = window.last().cloned().expect("non-empty window");
+                window.resize(span, filler);
+            }
+            let wav = self.forward(&window)?;
+            let drop = (start - from) * crate::cfg::SAMPLES_PER_FRAME;
+            let keep = ((end - start) * crate::cfg::SAMPLES_PER_FRAME).min(wav.dim(2)? - drop);
+            out.extend(wav.narrow(2, drop, keep)?.flatten_all()?.to_vec1::<f32>()?);
             start = end;
         }
         Ok(out)
