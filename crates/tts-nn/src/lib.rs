@@ -88,51 +88,62 @@ pub(crate) fn usable_metal() -> Option<Device> {
 
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, Module, Tensor, D};
-use std::collections::HashMap;
 
 // ---------------------------------------------------------------- weight loading
 
-/// A loaded safetensors file, with errors that name the tensor you asked for.
+/// A memory-mapped safetensors file, with errors that name the tensor you asked for.
+///
+/// **Mapped and fetched per tensor, not loaded.** `candle_core::safetensors::load` uploads every
+/// tensor in the file to the device at once, and candle's Metal pool has no way to release
+/// anything — so a 3.86 GB checkpoint stayed resident for the life of the process *beside* the
+/// f16 or quantized copies the model actually computes with. Measured: a one-sentence render
+/// peaked at 9.24 GB where the talker's f16 weights are 3.4 GB of it.
+///
+/// The cost is that fetching the same name twice reads it twice; every loader here fetches
+/// each tensor once.
 pub struct Weights {
-    tensors: HashMap<String, Tensor>,
+    file: candle_core::safetensors::MmapedSafetensors,
     device: Device,
 }
 
 impl Weights {
     pub fn load(path: &str, device: &Device) -> Result<Self> {
-        let tensors = candle_core::safetensors::load(path, device)
-            .with_context(|| format!("loading {path}"))?;
+        // Safety: the file is not mutated while mapped. Same contract candle's own
+        // `VarBuilder::from_mmaped_safetensors` takes.
+        let file = unsafe {
+            candle_core::safetensors::MmapedSafetensors::new(path)
+                .with_context(|| format!("mapping {path}"))?
+        };
         Ok(Self {
-            tensors,
+            file,
             device: device.clone(),
         })
+    }
+
+    fn fetch(&self, name: &str) -> Result<Tensor> {
+        self.file
+            .load(name, &self.device)
+            .with_context(|| format!("missing tensor {name}"))
     }
 
     /// Fetch as f32. Checkpoints here are f32 (the folded codec, CosyVoice) or bf16
     /// (Audio8's AR); the port computes in f32 unless a tensor is quantized.
     pub fn get(&self, name: &str) -> Result<Tensor> {
-        let t = self
-            .tensors
-            .get(name)
-            .with_context(|| format!("missing tensor {name}"))?;
-        Ok(t.to_dtype(DType::F32)?)
+        Ok(self.fetch(name)?.to_dtype(DType::F32)?)
     }
 
     /// Same, but keeps the on-disk dtype — used where a copy would be wasteful.
     pub fn raw(&self, name: &str) -> Result<Tensor> {
-        self.tensors
-            .get(name)
-            .cloned()
-            .with_context(|| format!("missing tensor {name}"))
+        self.fetch(name)
     }
 
     /// `get`, or `None` when absent. For genuinely optional tensors only — a typo in a
     /// required name should surface as the error `get` produces, not as a silent `None`.
     pub fn get_opt(&self, name: &str) -> Result<Option<Tensor>> {
-        match self.tensors.get(name) {
-            None => Ok(None),
-            Some(t) => Ok(Some(t.to_dtype(DType::F32)?)),
+        if !self.has(name) {
+            return Ok(None);
         }
+        Ok(Some(self.get(name)?))
     }
 
     /// A weight-normalised conv weight, with the parametrisation resolved.
@@ -152,7 +163,7 @@ impl Weights {
     }
 
     pub fn has(&self, name: &str) -> bool {
-        self.tensors.contains_key(name)
+        self.file.get(name).is_ok()
     }
 
     pub fn device(&self) -> &Device {
@@ -160,16 +171,16 @@ impl Weights {
     }
 
     pub fn len(&self) -> usize {
-        self.tensors.len()
+        self.file.tensors().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tensors.is_empty()
+        self.len() == 0
     }
 
     /// Every tensor name, sorted — for inventory checks and error messages.
-    pub fn names(&self) -> Vec<&str> {
-        let mut n: Vec<&str> = self.tensors.keys().map(|s| s.as_str()).collect();
+    pub fn names(&self) -> Vec<String> {
+        let mut n: Vec<String> = self.file.tensors().into_iter().map(|(k, _)| k).collect();
         n.sort_unstable();
         n
     }
