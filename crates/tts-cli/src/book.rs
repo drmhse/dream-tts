@@ -38,8 +38,8 @@ pub struct Book {
     /// Voice asset directory. Defaults to the engine's shipped voice.
     #[arg(long, value_name = "PATH")]
     pub voice: Option<PathBuf>,
-    /// Weight format. `f16` is what lets qwen3tts batch across segments, which is worth
-    /// about 2x on book-length text.
+    /// Weight format. Rarely worth setting: qwen3tts already defaults to `f16`, the only
+    /// format that batches across segments, which is worth 4.5x on book-length text.
     #[arg(long)]
     pub quant: Option<String>,
     #[arg(long)]

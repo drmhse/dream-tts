@@ -1,0 +1,4 @@
+interface:
+  display_name: "dream-tts"
+  short_description: "Narrate text or whole books in a cloned voice, offline"
+  default_prompt: "Use $dream-tts to narrate a document or explain the engine; check the import split before starting a book, and remember the engine batches across segments so short passages look slow."
