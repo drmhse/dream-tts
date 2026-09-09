@@ -93,7 +93,7 @@ def rtf_chart():
     y = lambda v: T + PH * (1 - v / ymax)
     s = head(
         "End-to-end RTF by lane count",
-        "RTF  ·  4763-word article, 201 segments, 28m 31s of audio  ·  f16, M4 / 16 GB  ·  lower is faster",
+        "RTF, before finished-tail shedding  ·  4763-word article, 201 segments  ·  f16, M4 / 16 GB",
     )
     for t in (0, 0.25, 0.5, 0.75):
         s.append(f'<line class="grid" x1="{L}" y1="{y(t):.1f}" x2="{L + PW}" y2="{y(t):.1f}"/>')

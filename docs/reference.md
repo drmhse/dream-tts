@@ -265,10 +265,19 @@ interleaved in one session.
 
 `examples/chapter.txt`, 100 segments. `f16` is the median of three samples.
 
-| engine | weights | RTF | talker/LLM | codec |
-|---|---|---|---|---|
-| `qwen3tts` | `q8_0` | 0.661 | 0.588 | 0.072 |
-| `qwen3tts` | **`f16`** | **0.260** (0.256–0.261) | 0.187 | 0.073 |
+| engine | weights | lanes | RTF | talker/LLM | codec |
+|---|---|---|---|---|---|
+| `qwen3tts` | `q8_0` | 24 | 0.661 | 0.588 | 0.072 |
+| `qwen3tts` | `f16` | 24 | 0.260 (0.256–0.261) | 0.187 | 0.073 |
+| `qwen3tts` | `f16` | 48 | 0.218 | 0.147 | 0.069 |
+| `qwen3tts` | **`f16`** | **48, shipped** | **0.186** | 0.116 | 0.069 |
+
+The last row is the current default and includes the talker's finished-tail shedding and the
+codec's uniform decode span; `MAX_BATCH` was 24 when the first two rows were taken. Two further
+corpora on the shipped configuration: a 3227-word book chapter at **0.175** and a 4763-word
+article at **0.183**, against 0.195 and 0.200 at 48 lanes without shedding. Peak footprint is
+13.1–13.7 GB, and `README.md` has the memory analysis — it is candle's buffer pool, not the
+lane count.
 
 **`q8_0` gains nothing from 14× more segments** — 0.665 on seven, 0.661 on a hundred. That is
 candle's quantized `mm_t` padding to a large row tile, so batch 8 costs 8× batch 1, measured

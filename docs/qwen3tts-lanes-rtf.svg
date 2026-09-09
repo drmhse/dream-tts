@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 320" width="620" height="320" role="img" aria-label="End-to-end RTF by lane count. RTF  ·  4763-word article, 201 segments, 28m 31s of audio  ·  f16, M4 / 16 GB  ·  lower is faster">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 320" width="620" height="320" role="img" aria-label="End-to-end RTF by lane count. RTF, before finished-tail shedding  ·  4763-word article, 201 segments  ·  f16, M4 / 16 GB">
 <style>
   text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
   .surface { fill: #fcfcfb; }
@@ -33,7 +33,7 @@
 </style>
 <rect class="surface" width="620" height="320" rx="6"/>
 <text class="title" x="62" y="24">End-to-end RTF by lane count</text>
-<text class="sub" x="62" y="41">RTF  ·  4763-word article, 201 segments, 28m 31s of audio  ·  f16, M4 / 16 GB  ·  lower is faster</text>
+<text class="sub" x="62" y="41">RTF, before finished-tail shedding  ·  4763-word article, 201 segments  ·  f16, M4 / 16 GB</text>
 <line class="grid" x1="62" y1="268.0" x2="602" y2="268.0"/>
 <text class="axis" x="54" y="272.0" text-anchor="end">0.00</text>
 <line class="grid" x1="62" y1="196.0" x2="602" y2="196.0"/>

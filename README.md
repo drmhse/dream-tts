@@ -84,10 +84,11 @@ running. GitHub cannot embed audio in markdown, so the
 |---|---|---|---|---|
 | `audio8` | 0.527-0.536 | 5m 47s | 11:34 / 10:59 | you want 44.1 kHz, the highest-fidelity output here |
 | `cosyvoice` | 0.703-0.718 | 8m 15s | 12:48 / 11:44 | you want the widest language coverage |
-| `qwen3tts` | **0.252-0.261** | **2m 40s** | 11:36 / 10:34 | the default. Best quality here, and the only one that makes book-length text practical |
+| `qwen3tts` | **0.186** | **2m 10s** | 11:35 / 10:34 | the default. Best quality here, and the only one that makes book-length text practical |
 
 **That bottom row is the point of the project.** A chapter becomes 11 minutes of speech in
-under 3 minutes, on a laptop. A 16-hour book costs about 4 hours of compute rather than 12.
+2m 10s, on a laptop — 5.4x faster than realtime. A 16-hour book costs about 3 hours of compute
+rather than 12.
 
 Compare the wall-time column, not just RTF. The three do not produce the same duration from
 the same text. `cosyvoice` speaks slowest, 12:48 against `audio8`'s 11:34. RTF divides by audio
@@ -109,42 +110,78 @@ the engines interleaved: `audio8` 0.554, `cosyvoice` 0.726, `qwen3tts` 0.665.
 
 ![qwen3tts speedup components](docs/qwen3tts-speedup.png)
 
-Every green component above is measured; together they are what took this engine from RTF 0.661
-to **0.200 — 5.0× realtime** on a 4763-word article (201 segments, 28m 31s of audio, one M4 with
-16 GB). Two of them carry most of it, and neither is a kernel:
+Every green component above is measured; together they take this engine to **RTF 0.175-0.186 —
+5.4× to 5.7× realtime** on its default settings, across three corpora between 1612 and 4763
+words. Two of them carry most of it, and neither is a kernel:
 
 - **f16 weights.** Only a dense GEMM shares one weight read across lanes; candle's quantized
   `mm_t` re-reads per row, so q8_0 amortises 1.1× against f16's 7.4×.
-- **48 batched lanes, length-sorted.** A group runs as long as its longest lane, and unsorted
-  only 47-56% of lane-steps did useful work.
+- **48 batched lanes, sorted longest-first, shedding each finished tail.** A group runs as long
+  as its longest lane, so ordering decides how much of the batch is real work: 68-70% of
+  lane-steps were useful before, 79-90% now. Only a contiguous *tail* can be dropped — a prefix
+  narrow shares the caches' storage — which is why the sort order is what makes it work.
 
-**The lane count is bounded by memory, and nothing else.**
+| corpus | segments | was (24 lanes) | 48 lanes | shipped | |
+|---|---|---|---|---|---|
+| book chapter, 3227 words | 150 | | 0.195 | **0.175** | **5.7×** |
+| article, 4763 words | 201 | 0.235 | 0.200 | **0.183** | **5.5×** |
+| `examples/chapter.txt`, 1612 words | 100 | 0.260 | 0.218 | **0.186** | **5.4×** |
+
+**Shedding pays most where segment lengths vary most**, so those are a floor rather than a best
+case: the 4763-word article has the *narrowest* spread of the three (coefficient of variation
+0.37 against 0.55-0.57) and gains the least.
+
+**Quality was checked on the audio, not on the codes**, because token identity is the wrong
+metric for a sampled model. Against the same text, WER went 0.046 → **0.040** (218 → 189 errors
+in 4781 words), and median F0 and LTAS cosine against the clip this voice was cloned from are
+identical to four decimals — 173.9 Hz and 0.9973 before and after. `references/cosyvoice/wer.py`
+and `references/audio8/verify_voice.py` are the tools.
+
+### Memory is candle's buffer pool, not the lane count
+
+Peak footprint is now **13.1-13.7 GB**, from 14.2-14.8. The lever is not obvious, so it is worth
+stating plainly: `vmmap` attributes a chapter render to **1515 GPU allocations totalling 12.6 GB**
+against ~4.5 GB of weights, because candle's Metal pool keys buffers by size and releases none.
+Every distinct tensor shape a run touches is therefore permanent, and every memory win is a
+*shape removed* rather than bytes shaved:
+
+- **The codec decodes a uniform span, padded on the right.** The natural loop runs two lengths —
+  300 frames for the first chunk, which has no history to spend, then 325 — and one 300-frame
+  chunk is **6.50 GB** of activations, so the second length cost about that again. Extending each
+  window *rightwards* is free because the decoder is causal, and the gate confirms the audio is
+  unchanged. Moving the seams instead is *not* free: `codec.long.wav_chunked` fails at rel 3.4e-1,
+  because the reference's own chunked output differs from its unchunked one.
+- **Weights are mmapped and fetched per tensor.** `safetensors::load` was uploading the whole
+  3.86 GB checkpoint to the GPU beside the f16 copies. A one-sentence render's floor went 9.24 →
+  8.09 GB and a chapter's RSS 7.79 → 4.32 GB, at no cost in throughput.
+- **Prefill runs in 8-lane windows and shed widths are multiples of 8.** Prefill attention is
+  `b × heads × L²` — 748 MB of scores at 48 lanes — and narrowing 48 → 47 → 46 minted a new width,
+  hence new buffer sizes, every step.
+
+A lane itself is cheap: **13 MB** of peak footprint between 24 and 48 lanes, against the 77 MB its
+KV cache implies. So the 16 GB machine runs out because of the floor, not the lanes.
 
 ![RTF by lane count](docs/qwen3tts-lanes-rtf.svg)
 
-`MAX_BATCH` ships at 24 — 0.235 on this text — because that was the last figure measured. 48
-reaches 0.200, and re-measured 0.202 after half an hour of load. 56 collapses to **0.701** with
-**621 s of system time** against 17 s at 48: that is the VM compressor, not compute, as peak
-footprint goes 14.8 GB → 19.0 GB on a 16 GB machine.
+56 lanes still swaps, and the reason is the *number of large groups* rather than the count: a
+100-segment document splits 56 + 44, so the KV cache is allocated twice at 4.2 + 3.3 GB where
+48 + 4 costs 3.6 + 0.3. Reusing one allocation across groups is the next fix; allocating a
+fixed-size one per group was tried and made 48 lanes swap.
 
-There is no arithmetic saturation to find before that wall. Measured on the trunk alone, an
-added lane costs a flat ~0.4 ms all the way from 16 to 64, and per-lane cost is still falling
-where the engine has already run out of memory:
+There is no arithmetic saturation to find before that wall. An added lane costs a flat ~0.4 ms
+from 16 to 64, and per-lane cost is still falling where the engine has already run out of memory:
 
 ![cost per lane](docs/qwen3tts-lanes-perlane.svg)
 
-So `QWEN3TTS_MAX_BATCH=48` is the 5× configuration *on a 16 GB machine*. A machine with more
-memory should sweep it again — the cliff moves, and the curve above it has not flattened.
-Regenerate both charts with `python3 scripts/plot-lanes.py`; the measurements are inline in that
-script.
+A machine with more memory should sweep `QWEN3TTS_MAX_BATCH` again — the cliff moves, and the
+curve above it has not flattened. Regenerate both charts with `python3 scripts/plot-lanes.py`;
+the measurements are inline in that script.
 
 The two amber components are what a *sixth* multiple would need, and neither has a fixture behind
-it: refilling a lane the moment it hits `codec_eos` instead of stepping it dead to the end of its
-group, and closing the 1.7-2.2× the codec still gives away to torch.
-
-```sh
-QWEN3TTS_MAX_BATCH=48 ./dream-tts speak --quant f16 --text-file article.txt --out out.wav
-```
+it: refilling an interior lane the moment it hits `codec_eos` rather than only shedding tails, and
+closing the 1.7-2.2× the codec still gives away to torch. The codec is 40% of the total now and
+does not batch by construction, so it is the ceiling: with a free talker the floor is RTF 0.070,
+or 14×.
 
 What each component is doing, and the paths already refuted — f32 weights, batched q8_0,
 device-side sampling, an f16 codec, ONNX, CoreML — are in
@@ -182,7 +219,7 @@ software has to be. Three things follow, and they are why there is a client and 
 
 **The estimate is fitted, not averaged.** These engines have strong economies of scale —
 `qwen3tts` batches across segments, which only engages once a chapter has enough of them, so
-the same voice runs at RTF 0.665 on a 132-word passage and 0.260 on a 1612-word chapter. A
+the same voice runs at RTF 0.665 on a 132-word passage and 0.186 on a 1612-word chapter. A
 flat words-per-second rate is therefore wrong by 2.6x, in whichever direction the sample
 happens to lean: on a real book, extrapolating from its 27-word title page predicted **2h
 09m against an actual hour**. So the model is `fixed + marginal × words`, fitted over the
@@ -222,7 +259,7 @@ before it starts rather than an hour in, and `--no-align` drops the only other o
 dependency. The `dream-tts` commands themselves need nothing but the binary.
 
 Resumable per *stage*: a section with a WAV master is never re-synthesised. Deterministic
-under a seed. A 16-hour document costs about **4 hours** of synthesis at `qwen3tts`'s 0.260,
+under a seed. A 16-hour document costs about **3 hours** of synthesis at `qwen3tts`'s 0.186,
 against ~12 at `cosyvoice`'s 0.726. Recognition adds an hour either way.
 
 **Import is a stage in front, not a branch inside.** The pipeline takes its chapter
