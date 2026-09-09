@@ -121,7 +121,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "audio8"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -509,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "cosyvoice"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -1988,7 +1988,7 @@ dependencies = [
 
 [[package]]
 name = "qwen3tts"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -2671,7 +2671,7 @@ dependencies = [
 
 [[package]]
 name = "tts-bench"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -2680,7 +2680,7 @@ dependencies = [
 
 [[package]]
 name = "tts-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -2697,7 +2697,7 @@ dependencies = [
 
 [[package]]
 name = "tts-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -2708,7 +2708,7 @@ dependencies = [
 
 [[package]]
 name = "tts-engines"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "audio8",
@@ -2719,7 +2719,7 @@ dependencies = [
 
 [[package]]
 name = "tts-import"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "objc2",
@@ -2731,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "tts-jobs"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -2742,7 +2742,7 @@ dependencies = [
 
 [[package]]
 name = "tts-narrate"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "fancy-regex",
@@ -2752,7 +2752,7 @@ dependencies = [
 
 [[package]]
 name = "tts-nn"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -2764,7 +2764,7 @@ dependencies = [
 
 [[package]]
 name = "tts-probe"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "audio8",
@@ -2778,7 +2778,7 @@ dependencies = [
 
 [[package]]
 name = "tts-serve"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "axum",
