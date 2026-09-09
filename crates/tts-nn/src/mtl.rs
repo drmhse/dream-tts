@@ -455,6 +455,98 @@ kernel void nlc_conv_f32(
     }
 }
 
+// ---- skinny GEMM ---------------------------------------------------------------
+//
+// `[m, k] x [k, n] -> [m, n]`, f16 in, f32 accumulated and out, for the shapes an
+// autoregressive decode step actually has: `m` is the lane count, 48, where candle reaches
+// 1.1-2.35 TFLOP/s against the 3.64 it manages on a 2048-cube. Six rows of the matrix units is
+// not enough work to hide anything, so the tile is sized by `n` and `k` instead and `m` is
+// carried along for the ride.
+//
+// 64x64 per threadgroup, eight simdgroups over it, 32 deep. `k` and `n` are multiples of 32 and
+// 64 at every projection in the talker; `m` is masked, being the one dimension that shrinks as
+// lanes are shed.
+kernel void gemm_skinny_f16(
+    device const half  *a   [[buffer(0)]],
+    device const half  *b   [[buffer(1)]],
+    device float       *c   [[buffer(2)]],
+    constant uint      &m   [[buffer(3)]],
+    constant uint      &k   [[buffer(4)]],
+    constant uint      &n   [[buffer(5)]],
+    uint2 tgp [[threadgroup_position_in_grid]],
+    uint  tid [[thread_index_in_threadgroup]],
+    uint  sg  [[simdgroup_index_in_threadgroup]])
+{
+    // A 48x64 tile: `m` is the lane count, and 48 is the default, so the tile is the batch.
+    //
+    // Two shapes came before it. A 64-row tile wasted a quarter of the matrix-unit work on
+    // padding and measured 0.87-0.92x against candle; making the row count a *runtime* loop
+    // bound removed the waste and the unrolling with it, at 0.55-0.80x. The tile has to be a
+    // compile-time shape that happens to fit the batch.
+    threadgroup half as_[48 * 40];
+    threadgroup half bs_[32 * 64];
+    threadgroup float out_[48 * 64];
+
+    const uint n0 = tgp.x * 64;
+    const uint sm = (sg >> 2) * 24;
+    const uint sn = (sg & 3) * 16;
+
+    simdgroup_float8x8 acc[3][2];
+    for (uint i = 0; i < 3; ++i) {
+        for (uint j = 0; j < 2; ++j) {
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+
+    threadgroup half4 *as4 = (threadgroup half4 *)as_;
+    threadgroup half4 *bs4 = (threadgroup half4 *)bs_;
+
+    for (uint kc = 0; kc < k; kc += 32) {
+        for (uint idx = tid; idx < 48 * 8; idx += 256) {
+            const uint r = idx >> 3;
+            const uint q = idx & 7;
+            as4[r * 10 + q] =
+                (r < m) ? *(const device half4 *)(a + r * k + kc + q * 4) : half4(0.0h);
+        }
+        for (uint idx = tid; idx < 32 * 16; idx += 256) {
+            const uint r = idx >> 4;
+            const uint q = idx & 15;
+            bs4[r * 16 + q] = *(const device half4 *)(b + (kc + r) * n + n0 + q * 4);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < 32; kk += 8) {
+            simdgroup_half8x8 av[3], bv[2];
+            for (uint i = 0; i < 3; ++i) {
+                simdgroup_load(av[i], as_ + (sm + i * 8) * 40 + kk, 40);
+            }
+            for (uint j = 0; j < 2; ++j) {
+                simdgroup_load(bv[j], bs_ + kk * 64 + sn + j * 8, 64);
+            }
+            for (uint i = 0; i < 3; ++i) {
+                for (uint j = 0; j < 2; ++j) {
+                    simdgroup_multiply_accumulate(acc[i][j], av[i], bv[j], acc[i][j]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = 0; i < 3; ++i) {
+        for (uint j = 0; j < 2; ++j) {
+            simdgroup_store(acc[i][j], out_ + (sm + i * 8) * 64 + sn + j * 8, 64);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = tid; idx < 48 * 64; idx += 256) {
+        const uint r = idx >> 6;
+        if (r >= m) { continue; }
+        c[r * n + n0 + (idx & 63)] = out_[idx];
+    }
+}
+
 // ---- swiglu tail ---------------------------------------------------------------
 //
 // out = silu(g) * u, elementwise. candle spends two dispatches and two full round trips on

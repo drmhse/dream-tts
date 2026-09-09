@@ -31,6 +31,7 @@ pub mod im2col;
 pub(crate) mod mtl;
 pub mod nlc;
 mod nlcconv;
+pub mod skinny;
 
 use anyhow::{Context, Result};
 
@@ -50,6 +51,20 @@ use anyhow::{Context, Result};
 /// This does **not** weaken the tests. A device that runs the probe and then returns wrong
 /// numbers still fails, because the comparison against the CPU implementation is unchanged.
 /// The only thing skipped is a machine with no working GPU.
+/// Held for the duration of any test that dispatches a custom Metal kernel.
+///
+/// **The custom-op path is not thread-safe.** `device.command_encoder()` hands back candle's
+/// current encoder, so two threads encoding at once interleave into it, and what comes out is
+/// not wrong by a rounding — a GEMM checked against candle read rel 1.9e4 and a SnakeBeta
+/// checked against its composed form read 2.6, both passing on their own. The engines drive
+/// one dispatch at a time and `gpu_lock` keeps it that way, so this is the test runner's
+/// problem rather than a defect in the ops; the guard is the smallest thing that says so.
+#[cfg(all(test, feature = "metal"))]
+pub(crate) fn gpu_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(all(test, feature = "metal"))]
 pub(crate) fn usable_metal() -> Option<Device> {
     use std::sync::OnceLock;
@@ -331,7 +346,24 @@ impl Proj {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         Ok(match self {
             Proj::Dense(w_t) => matmul_2d(x, w_t)?,
-            Proj::Half(w_t) => matmul_2d(&x.to_dtype(DType::F16)?, w_t)?.to_dtype(x.dtype())?,
+            // The decode step's own shape goes through `skinny`, which accumulates in f32 and
+            // needs no cast back: 1.08-1.46x candle's GEMM across the talker's seven
+            // projections. Prefill's `m` is in the hundreds and falls through.
+            Proj::Half(w_t) => {
+                let h = x.to_dtype(DType::F16)?;
+                let dims = h.dims();
+                let k = dims[dims.len() - 1];
+                let rows: usize = dims[..dims.len() - 1].iter().product();
+                let n = w_t.dim(1)?;
+                if skinny::eligible(rows, k, n) && h.device().is_metal() {
+                    let y = skinny::matmul(&h.contiguous()?.reshape((rows, k))?, w_t)?;
+                    let mut shape = dims[..dims.len() - 1].to_vec();
+                    shape.push(n);
+                    y.reshape(shape)?
+                } else {
+                    matmul_2d(&h, w_t)?.to_dtype(x.dtype())?
+                }
+            }
             Proj::Quant(q) => q.forward(x)?,
         })
     }

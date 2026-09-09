@@ -66,6 +66,53 @@ fn main() -> Result<()> {
             bytes / per * 1e3,
         );
     }
+    // The custom kernel against candle's, at the same shapes, checked before it is timed.
+    println!("\n  skinny kernel vs candle (m = 48)");
+    for &(label, m, k, n) in shapes {
+        if !tts_nn::skinny::eligible(m, k, n) {
+            continue;
+        }
+        let a = Tensor::randn(0f32, 1.0, (m, k), &dev)?.to_dtype(DType::F16)?;
+        let b = Tensor::randn(0f32, 0.02, (k, n), &dev)?.to_dtype(DType::F16)?;
+        let want = a.matmul(&b)?.to_dtype(DType::F32)?;
+        let got = tts_nn::skinny::matmul(&a, &b)?;
+        let (abs, rel) = tts_nn::abs_and_rel(&got, &want)?;
+
+        let mut f_ours = || -> candle_core::Result<()> {
+            for _ in 0..ITERS {
+                let _ = tts_nn::skinny::matmul(&a, &b)?;
+            }
+            Ok(())
+        };
+        let mut f_candle = || -> candle_core::Result<()> {
+            for _ in 0..ITERS {
+                let _ = a.matmul(&b)?;
+            }
+            Ok(())
+        };
+        let stats = h.ab(
+            label,
+            &mut [
+                (
+                    "skinny",
+                    &mut f_ours as &mut dyn FnMut() -> candle_core::Result<()>,
+                ),
+                ("candle", &mut f_candle),
+            ],
+        )?;
+        let gflop = 2.0 * (m as f64) * (k as f64) * (n as f64) / 1e9;
+        let (ours, theirs) = (
+            stats[0].median / ITERS as f64,
+            stats[1].median / ITERS as f64,
+        );
+        println!(
+            "  {label}  skinny {:>5.2} TFLOP/s   candle {:>5.2}   {:>5.2}x   max|d| {abs:.1e} rel {rel:.1e}",
+            gflop / ours,
+            gflop / theirs,
+            theirs / ours,
+        );
+    }
+
     // A decode step is a dependency chain, not a queue of independent ops. `dispatch`
     // measures the issue cost with 4000 independent ops in flight; this measures what one
     // op costs when the next one cannot start until it lands.

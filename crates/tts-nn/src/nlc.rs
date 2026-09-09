@@ -233,6 +233,8 @@ mod tests {
         #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
         let mut devices = vec![Device::Cpu];
         #[cfg(feature = "metal")]
+        #[cfg(feature = "metal")]
+        let _gpu = crate::gpu_guard();
         if let Some(d) = crate::usable_metal() {
             devices.push(d);
         }
