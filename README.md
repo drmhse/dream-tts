@@ -507,7 +507,8 @@ tier. The port found three real bugs in itself this way that no hand-written cas
 
 ## Documentation
 
-Everything else is one file: **[docs/reference.md](docs/reference.md)**.
+Everything else is one file: **[docs/reference.md](docs/reference.md)**. Agents get
+[`AGENTS.md`](AGENTS.md) and the [`dream-tts` skill](.agents/skills/dream-tts/SKILL.md).
 
 | | |
 |---|---|
@@ -520,7 +521,7 @@ Everything else is one file: **[docs/reference.md](docs/reference.md)**.
 | [Settings and storage](docs/reference.md#settings-and-storage) | `dream-tts.json`, `data_dir`, the GPU lock, uninstalling |
 | [Documents and narration](docs/reference.md#documents-and-narration) | the import stage, PDFKit, and how the port is verified |
 | [Runs, and watching them](docs/reference.md#runs-and-watching-them) | why there is a server, job identity, pause, streaming |
-| [What did not work](docs/reference.md#what-did-not-work) | ONNX, CoreML, a custom q8_0 GEMM, and four others |
+| [What did not work](docs/reference.md#what-did-not-work) | eleven refuted paths, each with the measurement that refuted it |
 
 ## Layout
 

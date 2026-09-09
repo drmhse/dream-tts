@@ -8,7 +8,8 @@ description: Set up and drive dream-tts, the offline text-to-speech engine at ~/
 Offline TTS in Rust with Metal kernels. Three engines behind one CLI; `qwen3tts` is the default
 and the one to use unless something specific rules it out.
 
-Repository: `~/Desktop/projects/AI/tts/tts-rs`. `README.md` is the canonical guide and
+Repository: `~/Desktop/projects/AI/tts/tts-rs`. Read `AGENTS.md` in the repo root first; it
+carries the rules that hold regardless of the task. `README.md` is the canonical guide and
 `docs/reference.md` is the deep one — read the relevant section before making claims about
 numbers, because both carry measurements that this skill only summarises.
 
