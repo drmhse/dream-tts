@@ -330,6 +330,131 @@ kernel void snake_beta_nlc_f16(
     dst[i] = (half)(x + brecip[c] * s * s);
 }
 
+// ---- channels-last causal conv -------------------------------------------------
+//
+// y[l, co] = bias[co] + sum_t sum_ci x[l + t*dil - pad, ci] * w[t*cin + ci, co]
+//
+// The conv-as-GEMM routes both lose to *building* the matrix, not to multiplying it:
+// `convgemm` measured 85.8 ms to assemble the `[672, 131072]` im2col against 8.2 ms for the
+// GEMM that consumes it. So the tap gather belongs inside the GEMM, where the tile it needs
+// is already in threadgroup memory and never crosses device memory at all.
+//
+// One 32x32 output tile per threadgroup, reduced 32 deep. `cin` is a multiple of 32 at every
+// stage of the codec, so a reduction chunk never straddles two taps and the tap index is one
+// division per chunk rather than one per element — the same trap `im2col_tap_major` documents.
+kernel void nlc_conv_f32(
+    device const float *x     [[buffer(0)]],
+    device const float *w     [[buffer(1)]],
+    device const float *bias  [[buffer(2)]],
+    device float       *y     [[buffer(3)]],
+    constant uint      &len   [[buffer(4)]],
+    constant uint      &cin   [[buffer(5)]],
+    constant uint      &cout  [[buffer(6)]],
+    constant uint      &k     [[buffer(7)]],
+    constant uint      &dil   [[buffer(8)]],
+    constant uint      &has_b [[buffer(9)]],
+    uint2 tgp [[threadgroup_position_in_grid]],
+    uint  tid [[thread_index_in_threadgroup]],
+    uint  sg  [[simdgroup_index_in_threadgroup]])
+{
+    // 64 positions x 32 output channels per threadgroup, on the matrix units.
+    //
+    // **The channel tile is the grid's fast axis.** A threadgroup re-reads its slice of `x`
+    // once per channel tile, so the gather's device traffic is `L * k * cin * (cout / 32)` —
+    // tens of GB per chunk. Widening the tile to 96 to divide that by three needs 22 KB of
+    // threadgroup memory and measured **2313 ms** against 1098, because one resident
+    // threadgroup per core hides no latency. Issuing the channel tiles for one position range
+    // back to back instead leaves them to the cache, and costs nothing.
+    //
+    // Two register-tiled versions came first and both lost to the `cat`-then-MPS route they
+    // replace: 2x2 per thread measured 1283 ms against 1204 on a 300-frame chunk, 4x4 measured
+    // 1168. The multiply has to run on the same hardware MPS uses.
+    threadgroup float as_[64 * 40];
+    threadgroup float bs_[32 * 32];
+
+    const uint n0 = tgp.x * 32;
+    const uint l0 = tgp.y * 64;
+    const int pad = int((k - 1) * dil);
+    const uint depth = k * cin;
+
+    // Four simdgroups: two down the positions, two across the channels, so each owns
+    // 32 positions x 16 channels — 4x2 accumulators of 8x8.
+    const uint sm = (sg >> 1) * 32;
+    const uint sn = (sg & 1) * 16;
+
+    simdgroup_float8x8 acc[4][2];
+    for (uint i = 0; i < 4; ++i) {
+        for (uint j = 0; j < 2; ++j) {
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+
+    for (uint kc = 0; kc < depth; kc += 32) {
+        const uint t = kc / cin;
+        const uint ci0 = kc - t * cin;
+        const int shift = int(t * dil) - pad;
+
+        // `kk` on the fast axis so both the device read and the threadgroup write coalesce.
+        // Rows are padded to 40 rather than 32 to keep `simdgroup_load`'s strided reads off a
+        // single bank.
+        // Four channels at a time. `cin` and `cout` are multiples of 32 and `kc` of 32, so
+        // every one of these addresses is 16-byte aligned, and the loop that fills a 32-deep
+        // tile drops from 24 iterations to 6.
+        threadgroup float4 *as4 = (threadgroup float4 *)as_;
+        threadgroup float4 *bs4 = (threadgroup float4 *)bs_;
+        for (uint idx = tid; idx < 64 * 8; idx += 128) {
+            const uint m = idx >> 3;
+            const uint q = idx & 7;
+            const int s = int(l0 + m) + shift;
+            as4[m * 10 + q] = (s >= 0 && s < int(len))
+                ? *(const device float4 *)(x + uint(s) * cin + ci0 + q * 4)
+                : float4(0.0f);
+        }
+        for (uint idx = tid; idx < 32 * 8; idx += 128) {
+            const uint kk = idx >> 3;
+            bs4[kk * 8 + (idx & 7)] =
+                *(const device float4 *)(w + (kc + kk) * cout + n0 + (idx & 7) * 4);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < 32; kk += 8) {
+            simdgroup_float8x8 a[4], b[2];
+            for (uint i = 0; i < 4; ++i) {
+                simdgroup_load(a[i], as_ + (sm + i * 8) * 40 + kk, 40);
+            }
+            for (uint j = 0; j < 2; ++j) {
+                simdgroup_load(b[j], bs_ + kk * 32 + sn + j * 8, 32);
+            }
+            for (uint i = 0; i < 4; ++i) {
+                for (uint j = 0; j < 2; ++j) {
+                    simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Out through `as_`: `simdgroup_store` wants a fixed row stride, and the trailing tile has
+    // to be masked against `len` before it reaches the output.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = 0; i < 4; ++i) {
+        for (uint j = 0; j < 2; ++j) {
+            simdgroup_store(acc[i][j], as_ + (sm + i * 8) * 40 + sn + j * 8, 40);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = tid; idx < 64 * 8; idx += 128) {
+        const uint m = idx >> 3;
+        const uint q = idx & 7;
+        const uint l = l0 + m;
+        if (l >= len) { continue; }
+        float4 v = ((threadgroup float4 *)as_)[m * 10 + q];
+        if (has_b) { v += *(const device float4 *)(bias + n0 + q * 4); }
+        *(device float4 *)(y + l * cout + n0 + q * 4) = v;
+    }
+}
+
 // ---- swiglu tail ---------------------------------------------------------------
 //
 // out = silu(g) * u, elementwise. candle spends two dispatches and two full round trips on

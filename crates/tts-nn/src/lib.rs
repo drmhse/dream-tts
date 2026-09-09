@@ -30,6 +30,7 @@ pub mod fused;
 pub mod im2col;
 pub(crate) mod mtl;
 pub mod nlc;
+mod nlcconv;
 
 use anyhow::{Context, Result};
 

@@ -1,17 +1,15 @@
 //! Convolutions in channels-last `[b, L, C]` layout.
 //!
 //! The channel-major path materialises an im2col matrix `k` times the input to turn a conv into
-//! one GEMM. Channels-last needs no matrix at all: with `x` as `[L, C]`, tap `t` of a causal conv
-//! is the *contiguous* slice `x_pad[t*d .. t*d + L]`, so the conv is `k` accumulating GEMMs of
-//! `[L, C_in] x [C_in, C_out]` over a tensor that is only read, never expanded.
+//! one GEMM. Channels-last needs no matrix: with `x` as `[L, C]`, tap `t` of a causal conv is the
+//! *contiguous* slice `x_pad[t*d .. t*d + L]`, so `M` becomes `L` — hundreds of thousands —
+//! instead of `C_out`, which is as low as 96 in the qwen3tts decoder that this exists for.
 //!
-//! Two things follow, and both matter for the qwen3tts codec's decoder, which is ~92% of its
-//! cost at 96-768 channels over up to 576 k samples:
-//!
-//! - **Traffic.** im2col writes and re-reads `k * L * C_in`; this reads `L * C_in` `k` times and
-//!   writes nothing extra. Measured ~20 GB of im2col traffic per chunk in that decoder.
-//! - **GEMM shape.** `M` becomes `L` (hundreds of thousands) instead of `C_out` (as low as 96).
-//!   A short `M` is the wrong direction for MPS's tiling.
+//! It still concatenated the taps into one `[L, k*C_in]` operand, and that concatenation was the
+//! cost: at 96 channels over 131072 samples the assembly measured 85.8 ms against 8.2 for the
+//! GEMM consuming it. [`crate::nlcconv`] now does the gather inside the multiply, and long
+//! signals go there — 1.70x on a 300-frame codec chunk. The route below remains for the shapes
+//! that kernel declines.
 //!
 //! Elementwise work is layout-agnostic, and LayerNorm over channels becomes a last-axis
 //! reduction — so the decoder needs no transposes once it is in this layout.
@@ -46,6 +44,26 @@ pub fn causal_conv1d(
     let (b, len, cin) = x.dims3()?;
     let (k, wk_in, out) = w.dims3()?;
     anyhow::ensure!(wk_in == cin, "conv input width {cin} != weight {wk_in}");
+
+    // The fused kernel gathers the taps inside its GEMM, so no padded copy and no tap
+    // matrix ever reach device memory. See `crate::nlcconv`.
+    if let Some(bi) = bias {
+        if crate::nlcconv::eligible(b, cin, out, len, x) {
+            let op = crate::nlcconv::NlcConv {
+                len,
+                cin,
+                cout: out,
+                k,
+                dilation,
+                has_bias: true,
+            };
+            return Ok(x.contiguous()?.apply_op3_no_bwd(
+                &w.reshape((k * cin, out))?.contiguous()?,
+                &bi.flatten_all()?.contiguous()?,
+                &op,
+            )?);
+        }
+    }
 
     // One pad, reused by every tap, rather than one shifted copy per tap.
     let pad = (k - 1) * dilation;
@@ -242,6 +260,37 @@ mod tests {
                 assert!(
                     rel < 1e-5,
                     "transpose {dev:?} stride {stride} m{mult}: {abs:.2e} {rel:.2e}"
+                );
+            }
+
+            // The fused kernel's own shapes: `cin` and `cout` multiples of 32 over a signal past
+            // its length gate, and a different accumulation order, so the plain route above
+            // never reaches it.
+            // takes a different accumulation order, so the plain route above never reaches it.
+            // `len` is deliberately not a multiple of the 64-position tile.
+            for (cin, cout, len, k, dil) in [
+                (96, 96, 4200, 7, 9),
+                (32, 96, 4096, 7, 1),
+                (128, 192, 5000, 7, 3),
+                (64, 96, 4097, 1, 1),
+            ] {
+                let x = Tensor::randn(0f32, 1., (1, cin, len), &dev)?;
+                let w = Tensor::randn(0f32, 0.1, (cout, cin, k), &dev)?;
+                let bias = Tensor::randn(0f32, 0.1, cout, &dev)?;
+
+                let want = crate::causal_conv1d(&x, &w, Some(&bias), dil)?;
+                let got = causal_conv1d(
+                    &x.transpose(1, 2)?.contiguous()?,
+                    &tap_weight(&w)?,
+                    Some(&bias),
+                    dil,
+                )?
+                .transpose(1, 2)?
+                .contiguous()?;
+                let (abs, rel) = crate::abs_and_rel(&want, &got)?;
+                assert!(
+                    rel < 1e-5,
+                    "fused conv {dev:?} {cin}->{cout} k{k} d{dil} len{len}: {abs:.2e} {rel:.2e}"
                 );
             }
 
