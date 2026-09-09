@@ -3,6 +3,7 @@
 
   "engine": "qwen3tts",
   "voice": "voices/cosy-default-qwen3tts",
+  "//quant": "f16 is already the default for qwen3tts, and is the only format that batches. q8_0 saves 0.58 GB and costs 62% of the speed; see the README.",
   "quant": "f16",
 
   "//data_dir": "Where checkpoints and fixtures live. Relative to this file's directory; absolute to put 13 GB on another disk. Default: alongside the install.",

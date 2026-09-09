@@ -84,48 +84,77 @@ running. GitHub cannot embed audio in markdown, so the
 |---|---|---|---|---|
 | `audio8` | 0.527-0.536 | 5m 47s | 11:34 / 10:59 | you want 44.1 kHz, the highest-fidelity output here |
 | `cosyvoice` | 0.703-0.718 | 8m 15s | 12:48 / 11:44 | you want the widest language coverage |
-| `qwen3tts` | **0.186** | **2m 10s** | 11:35 / 10:34 | the default. Best quality here, and the only one that makes book-length text practical |
+| `qwen3tts` | **0.158** | **1m 50s** | 11:35 / 10:34 | the default. Best quality here, and the only one that makes book-length text practical |
 
 **That bottom row is the point of the project.** A chapter becomes 11 minutes of speech in
-2m 10s, on a laptop — 5.4x faster than realtime. A 16-hour book costs about 3 hours of compute
-rather than 12.
+1m 50s, on a laptop — 6.3x faster than realtime. A 16-hour book costs about 2.5 hours of
+compute rather than 12.
 
 Compare the wall-time column, not just RTF. The three do not produce the same duration from
 the same text. `cosyvoice` speaks slowest, 12:48 against `audio8`'s 11:34. RTF divides by audio
 produced, so a slower-speaking engine flatters its own RTF.
 
 ```sh
-./dream-tts speak --quant f16 --text-file examples/chapter.txt --out chapter.wav
+./dream-tts speak --text-file examples/chapter.txt --out chapter.wav
 ```
 
-`qwen3tts` gets there by batching across sections. That needs `--quant f16` and it needs
-length: on a 7-segment passage it is the *slowest* of the three at 0.665. The other two do not
-batch meaningfully and are steady at any length. `audio8` is **2.36× its PyTorch reference**
-like for like, with that reference running on MPS too.
+No flags: `qwen3tts` at f16 and 48 lanes is what you get by asking for nothing. It gets there
+by batching across sections, so it wants length — on a 7-segment passage it is 0.397, against
+0.158 on the chapter. The other two do not batch meaningfully and are steady at any length.
+`audio8` is **2.36× its PyTorch reference** like for like, with that reference running on MPS
+too.
 
-Short-passage figures, for comparison. `examples/senior.txt`, 132 words, median of five with
-the engines interleaved: `audio8` 0.554, `cosyvoice` 0.726, `qwen3tts` 0.665.
+Short-passage figures, for comparison. `examples/senior.txt`, 132 words: `audio8` 0.544,
+`cosyvoice` 0.716, `qwen3tts` 0.397.
 
-## What makes `qwen3tts` fast, and what 5× takes
+### What it needs to be this fast
+
+**16 GB.** `qwen3tts` peaks at 12.3 GB on a single short passage and 13.3 GB on a 203-segment
+article, and almost all of that is the codec decoder's activations rather than weights — one
+300-frame chunk alone is 6.5 GB. Below 16 GB the engine says so on load and keeps going, which
+is the honest option: it will swap, and swapping presents as the model being slow rather than
+as a mistake.
+
+**`--quant q8_0` is not the fix for a smaller machine**, though it looks like one. It halves the
+weight read, which matters only where nothing batches, and it does not touch the floor: on that
+132-word passage it peaks at 11.72 GB against f16's 12.30 — 0.58 GB — while costing 62% of the
+speed (RTF 0.642 against 0.397). On a chapter the gap is 4.5×. Reach for it to fit a single
+short render into a machine that misses by half a gigabyte, and for nothing else.
+
+What does help a smaller machine is a different engine. Same passage, same measurement:
+
+| engine | peak footprint | RTF |
+|---|---|---|
+| `cosyvoice` | **5.0 GB** | 0.716 |
+| `audio8` | 9.7 GB | 0.544 |
+| `qwen3tts` | 12.3 GB | 0.397 |
+
+`QWEN3TTS_MAX_BATCH` trades lanes for footprint if you want to stay on this engine, but it
+cannot go under the codec's own ~12 GB.
+
+## What makes `qwen3tts` fast, and what 6× takes
 
 ![qwen3tts speedup components](docs/qwen3tts-speedup.png)
 
-Every green component above is measured; together they take this engine to **RTF 0.175-0.186 —
-5.4× to 5.7× realtime** on its default settings, across three corpora between 1612 and 4763
-words. Two of them carry most of it, and neither is a kernel:
+Every green component above is measured; together they take this engine to **RTF 0.158-0.164 —
+6.1× to 6.3× realtime** on its default settings, across corpora between 1612 and 4838 words.
+Three of them carry most of it, and only one is a kernel:
 
-- **f16 weights.** Only a dense GEMM shares one weight read across lanes; candle's quantized
-  `mm_t` re-reads per row, so q8_0 amortises 1.1× against f16's 7.4×.
+- **f16 weights, and they are the default.** Only a dense GEMM shares one weight read across
+  lanes; candle's quantized `mm_t` re-reads per row, so q8_0 amortises 1.1× against f16's 7.4×.
+- **The codec's convolutions gather their taps inside the GEMM.** Both conv-as-GEMM routes were
+  losing to *assembling* the operand rather than multiplying it — 85.8 ms to build the im2col
+  against 8.2 ms for the GEMM consuming it — so the tap index moved into the kernel, where the
+  tile is already in threadgroup memory. 1.70× on a codec chunk, and bit-identical output.
 - **48 batched lanes, sorted longest-first, shedding each finished tail.** A group runs as long
   as its longest lane, so ordering decides how much of the batch is real work: 68-70% of
   lane-steps were useful before, 79-90% now. Only a contiguous *tail* can be dropped — a prefix
   narrow shares the caches' storage — which is why the sort order is what makes it work.
 
-| corpus | segments | was (24 lanes) | 48 lanes | shipped | |
+| corpus | segments | was (24 lanes) | 48 lanes | fused conv | |
 |---|---|---|---|---|---|
-| book chapter, 3227 words | 150 | | 0.195 | **0.175** | **5.7×** |
-| article, 4763 words | 201 | 0.235 | 0.200 | **0.183** | **5.5×** |
-| `examples/chapter.txt`, 1612 words | 100 | 0.260 | 0.218 | **0.186** | **5.4×** |
+| Pixel Watch article, 4838 words | 203 | | 0.193 | **0.164** | **6.1×** |
+| `examples/chapter.txt`, 1612 words | 100 | 0.260 | 0.186 | **0.158** | **6.3×** |
 
 **Shedding pays most where segment lengths vary most**, so those are a floor rather than a best
 case: the 4763-word article has the *narrowest* spread of the three (coefficient of variation
@@ -219,8 +248,8 @@ software has to be. Three things follow, and they are why there is a client and 
 
 **The estimate is fitted, not averaged.** These engines have strong economies of scale —
 `qwen3tts` batches across segments, which only engages once a chapter has enough of them, so
-the same voice runs at RTF 0.665 on a 132-word passage and 0.186 on a 1612-word chapter. A
-flat words-per-second rate is therefore wrong by 2.6x, in whichever direction the sample
+the same voice runs at RTF 0.397 on a 132-word passage and 0.158 on a 1612-word chapter. A
+flat words-per-second rate is therefore wrong by 2.5x, in whichever direction the sample
 happens to lean: on a real book, extrapolating from its 27-word title page predicted **2h
 09m against an actual hour**. So the model is `fixed + marginal × words`, fitted over the
 chapters that have finished and applied to each remaining chapter individually — a long one
@@ -259,8 +288,8 @@ before it starts rather than an hour in, and `--no-align` drops the only other o
 dependency. The `dream-tts` commands themselves need nothing but the binary.
 
 Resumable per *stage*: a section with a WAV master is never re-synthesised. Deterministic
-under a seed. A 16-hour document costs about **3 hours** of synthesis at `qwen3tts`'s 0.186,
-against ~12 at `cosyvoice`'s 0.726. Recognition adds an hour either way.
+under a seed. A 16-hour document costs about **2.5 hours** of synthesis at `qwen3tts`'s 0.158,
+against ~12 at `cosyvoice`'s 0.716. Recognition adds an hour either way.
 
 **Import is a stage in front, not a branch inside.** The pipeline takes its chapter
 structure from the filesystem — `chapter-NNN.md`, one per file — so `dream-tts import` turns

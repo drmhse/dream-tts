@@ -43,20 +43,22 @@ const SEGMENT_MIN_VARIETY: f64 = 0.35;
 /// Weight formats that load, default first. Quantization covers the talker's and predictor's
 /// projections, not the codec decoder, which runs over whole chunks.
 ///
-/// **Which one to ask for depends entirely on whether segments batch**, because both
-/// transformers are bandwidth-bound on weight reads:
-///
-/// - **`q8_0` (default)** reads the fewest bytes, so it wins when nothing batches. One sentence:
-///   RTF 0.79 against f16's 1.53.
-/// - **`f16`** is the one for long text. Only a *dense* GEMM shares one weight read across a
-///   batch of lanes — candle's quantized `mm_t` re-reads per row, batching 1.1x against f16's
-///   7.4x. A chapter: RTF 0.31 against 0.66. Also halves the KV cache, which is what caps
-///   `MAX_BATCH`.
+/// - **`f16` (default)** is the only format that batches. Just a *dense* GEMM shares one weight
+///   read across lanes — candle's quantized `mm_t` re-reads per row — so 48 lanes are available
+///   here and nowhere else: a 4838-word article renders at RTF 0.164 against q8_0's 0.738.
+/// - **`q8_0`** reads half the bytes and therefore wins only where nothing batches, which is a
+///   single short passage: 132 words at RTF 0.642 against f16's 0.397. It is **not the small
+///   machine's answer** — on that passage it peaks at 11.72 GB against f16's 12.30, so it buys
+///   0.58 GB for 62% of the speed. The floor is the codec's activations, not the weights.
 /// - **`f32`** is for fixture work. 6.3 GB of projections thrashes a 16 GB machine — measured
 ///   1994 ms/frame against q8_0's 52, memory pressure rather than arithmetic.
 ///
 /// `docs/reference.md#performance` has the measurements.
-const QUANT: &[&str] = &["q8_0", "f16", "f32", "q5_0", "q4_1", "q4_0"];
+const QUANT: &[&str] = &["f16", "q8_0", "f32", "q5_0", "q4_1", "q4_0"];
+
+/// What this engine needs before it starts swapping, from `/usr/bin/time -l` peak footprint:
+/// 12.3 GB for one short passage and 13.3 GB for a 203-segment article at 48 lanes.
+const WANTS_MEMORY: u64 = 16 << 30;
 
 /// One segment's decoded frames, with the paragraph index and character count it came from.
 type Decoded = (usize, usize, Vec<Vec<u32>>);
@@ -168,8 +170,8 @@ impl Paths {
 fn parse_quant(name: Option<&str>) -> Result<Weight> {
     Ok(match name {
         Some("f32") => Weight::F32,
-        Some("f16") => Weight::F16,
-        None | Some("q8_0") => Weight::Quant(GgmlDType::Q8_0),
+        None | Some("f16") => Weight::F16,
+        Some("q8_0") => Weight::Quant(GgmlDType::Q8_0),
         Some("q5_0") => Weight::Quant(GgmlDType::Q5_0),
         Some("q4_1") => Weight::Quant(GgmlDType::Q4_1),
         Some("q4_0") => Weight::Quant(GgmlDType::Q4_0),
@@ -305,6 +307,21 @@ impl Qwen3TtsEngine {
             })
             .transpose()?
             .flatten();
+
+        if let Some(total) = tts_core::system::total_memory() {
+            if total < WANTS_MEMORY {
+                eprintln!(
+                    "note: engine `{ID}` peaks at 12.3-13.3 GB and this machine has {}. It will \
+                     swap, which reads as the model being slow rather than as a mistake. \
+                     `--engine cosyvoice` peaks at 5.0 GB (RTF 0.716 against this engine's 0.397 \
+                     on the same short passage); `--engine audio8` at 9.7 GB. Lowering \
+                     QWEN3TTS_MAX_BATCH below {} trades speed for footprint but cannot go under \
+                     the codec's own ~12 GB.",
+                    tts_core::system::human_bytes(total),
+                    max_batch(),
+                );
+            }
+        }
 
         Ok(Self {
             talker: Talker::load(&s(&paths.talker)?, quant, &device)?,
@@ -702,22 +719,29 @@ mod tests {
         assert!(NO_VOICE.contains(ID));
     }
 
-    /// q8_0 is this engine's default, unlike the other two — f32 is 38x slower here.
+    /// f16 is this engine's default because it is the only one that batches, and batching is
+    /// worth 4.5x where q8_0's narrower weight read is worth 0.58 GB.
     #[test]
-    fn defaults_to_q8_0() {
-        assert_eq!(QUANT[0], "q8_0");
-        assert_eq!(parse_quant(None).unwrap(), Weight::Quant(GgmlDType::Q8_0));
+    fn defaults_to_f16() {
+        assert_eq!(QUANT[0], "f16");
+        assert_eq!(parse_quant(None).unwrap(), Weight::F16);
+        assert_eq!(
+            parse_quant(Some("q8_0")).unwrap(),
+            Weight::Quant(GgmlDType::Q8_0)
+        );
         assert_eq!(parse_quant(Some("f32")).unwrap(), Weight::F32);
         assert_eq!(parse_quant(Some("f16")).unwrap(), Weight::F16);
         assert!(parse_quant(Some("nonsense")).is_err());
     }
 
-    /// Only the dense formats batch, and the default deliberately does not. Getting this
-    /// backwards costs 30% — a batched q8_0 render measured RTF 1.02 against 0.79 unbatched.
+    /// Only the dense formats batch, which is why the default is one of them. Batching a
+    /// quantized weight is worse than not: RTF 1.02 against 0.79 unbatched, because candle's
+    /// `mm_t` re-reads the weights per row and the batch pays full price per lane.
     #[test]
     fn only_dense_weights_batch() {
-        assert!(!parse_quant(None).unwrap().batches());
+        assert!(parse_quant(None).unwrap().batches());
         assert!(parse_quant(Some("f16")).unwrap().batches());
         assert!(parse_quant(Some("f32")).unwrap().batches());
+        assert!(!parse_quant(Some("q8_0")).unwrap().batches());
     }
 }

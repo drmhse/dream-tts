@@ -132,8 +132,9 @@ done
 
 There is no `tokenizer.json` in this checkpoint, unlike CosyVoice's — the BPE is built from
 `vocab.json` plus `merges.txt` at load. Ten languages only (en, de, es, zh, ja, fr, ko, ru, it,
-pt), and `q8_0` is its default because the checkpoint is bf16 and f32 measured 38× slower on a
-16 GB machine.
+pt). `f16` is its default because it is the only format that batches, and batching is what
+this engine is for; `f32` measured 38× slower on a 16 GB machine and `q8_0` gives up 4.5× on a
+chapter to save 0.58 GB.
 
 ### 3. Regenerating the fixtures
 
@@ -270,13 +271,15 @@ interleaved in one session.
 | `qwen3tts` | `q8_0` | 24 | 0.661 | 0.588 | 0.072 |
 | `qwen3tts` | `f16` | 24 | 0.260 (0.256–0.261) | 0.187 | 0.073 |
 | `qwen3tts` | `f16` | 48 | 0.218 | 0.147 | 0.069 |
-| `qwen3tts` | **`f16`** | **48, shipped** | **0.186** | 0.116 | 0.069 |
+| `qwen3tts` | `f16` | 48 | 0.186 | 0.116 | 0.069 |
+| `qwen3tts` | **`f16`** | **48, shipped** | **0.158** | 0.117 | **0.040** |
 
-The last row is the current default and includes the talker's finished-tail shedding and the
-codec's uniform decode span; `MAX_BATCH` was 24 when the first two rows were taken. Two further
-corpora on the shipped configuration: a 3227-word book chapter at **0.175** and a 4763-word
-article at **0.183**, against 0.195 and 0.200 at 48 lanes without shedding. Peak footprint is
-13.1–13.7 GB, and `README.md` has the memory analysis — it is candle's buffer pool, not the
+The last row is the current default — `f16` is what `--quant` resolves to with nothing passed —
+and adds the fused channels-last conv on top of the talker's finished-tail shedding and the
+codec's uniform decode span; `MAX_BATCH` was 24 when the first two rows were taken. The whole
+gain in that last step is the codec (0.069 → 0.040) and the render is bit-identical. On a
+4838-word article the same configuration measures **0.164** against 0.193. Peak footprint is
+12.7–13.3 GB, and `README.md` has the memory analysis — it is candle's buffer pool, not the
 lane count.
 
 **`q8_0` gains nothing from 14× more segments** — 0.665 on seven, 0.661 on a hundred. That is
@@ -896,7 +899,9 @@ rather than let the server run a chapter ahead into memory.
 | **ONNX Runtime** | op coverage gaps, and no path that beat candle on Metal |
 | **CoreML** | 19–26 s compilations, and coverage holes on the ops that mattered |
 | **A custom q8_0 GEMM** | amortised up to 5.2× where candle's does 1.0×, validated against candle at real widths for m = 1..8 — but no configuration beat MPS f16 in absolute terms |
-| **f32 weights for `qwen3tts`** | 7.45× per lane in isolation but RTF **6.25** in a real render at 6.97 GB resident. This is the wall that made `q8_0` the default |
+| **f32 weights for `qwen3tts`** | 7.45× per lane in isolation but RTF **6.25** in a real render at 6.97 GB resident |
+| **An int8 KV cache** | groups of 32 with inline scales: RTF 0.164 → 0.158 and **no memory saved at all** (13.32 → 13.36 GB peak), because the peak is the codec's activations. Fails the gate at `step1.hidden` — 4.52e-1 for K alone against a 5.0e-3 tolerance, since a key error moves a score before the softmax |
+| **One KV state for the whole render** | reused across groups instead of allocated per group: **17.10 GB peak against 13.33** at no change in RTF. A cache sized for the widest group is pinned while the codec runs, where per-group caches are buffers the pool hands on |
 | **Device-side sampling** | moved less than the transfer it saved |
 | **f16 codec decoder** | quality loss without a speed win |
 | **Padded decode attention** | superseded by fused decode attention |
