@@ -19,7 +19,7 @@ members = [
 [workspace.package]
 # One version for the whole workspace, so a `v*` tag names exactly one artifact set and a
 # prebuilt binary can be matched against the source it was built from.
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.82"
