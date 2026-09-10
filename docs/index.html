@@ -71,6 +71,8 @@
   footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--line);
            color: var(--muted); font-size: .875rem; }
   .caveat { color: var(--muted); font-size: .9rem; }
+  h3 { font-size: .95rem; margin: 2rem 0 .5rem; letter-spacing: -.01em; }
+  h3 .tag { font-weight: 400; }
   .figure { margin: 1.25rem 0 .4rem; }
   .figure img { display: block; width: 100%; height: auto; border-radius: 8px; }
   .figure.light { background: #fcfcfb; padding: .75rem; border: 1px solid var(--line); }
@@ -216,6 +218,53 @@ dream-tts jobs &lt;id&gt; --control pause --now         # stop within seconds</c
     dates and tables, each one arrived at by listening to a failure.
   </p>
 
+  <h2>Every command, once</h2>
+  <p class="caveat">
+    The whole CLI is eight verbs. Anything that reads a document
+    (<code>speak --text-file</code> included) takes EPUB, DOCX, ODT, HTML, Markdown, PDF or
+    plain text; a <code>.txt</code> file is spoken literally, and <code>--raw</code> forces
+    that for anything.
+  </p>
+<pre><code># speak
+dream-tts speak --text "Hello from a fresh install." --out hello.wav
+dream-tts speak --text-file chapter.md --out chapter.wav
+dream-tts speak --text-file book.epub --engine cosyvoice \
+    --voice voices/my-voice --seed 7 --out book.wav
+dream-tts speak --text-file narration.txt --raw --greedy --out exact.wav
+
+# narrate a document, and watch or steer the run
+dream-tts import book.epub --out prep/ --dry-run   # the split, before hours of synthesis
+dream-tts import book.epub --out prep/
+dream-tts book book.epub --out narration           # Ctrl-C is safe; it keeps running
+dream-tts book book.epub --out narration --detach  # submit and exit
+dream-tts book book.epub --out narration           # the same command resumes it
+dream-tts jobs                                     # every run on this machine
+dream-tts jobs &lt;id&gt;                                # attach to one and watch it
+dream-tts jobs &lt;id&gt; --control pause                # stop after the chapter in flight
+dream-tts jobs &lt;id&gt; --control pause --now          # stop within seconds, lose that chapter
+dream-tts jobs &lt;id&gt; --control resume
+dream-tts jobs &lt;id&gt; --control cancel
+
+# markdown to the text an engine should speak, without synthesising
+dream-tts narrate chapter.md --stats
+dream-tts narrate prep/*.md --out-dir text/ --maps
+
+# what is installed, what is configured, what is on disk
+dream-tts engines
+dream-tts voice voices/cosy-default-qwen3tts
+dream-tts config
+dream-tts storage
+./scripts/uninstall.sh                             # reports; deletes nothing unnamed</code></pre>
+  <p class="caveat">
+    A voice is a directory, and building one takes a ten-second clip and its exact
+    transcript. It is the one step that wants Python, and it runs once per voice — the
+    runtime loads the exported conditioning and never carries a speaker encoder.
+  </p>
+<pre><code>references/qwen3tts/.venv/bin/python references/qwen3tts/export_voice.py \
+    --model references/qwen3tts/weights --audio clip.wav \
+    --text "the exact words spoken in the clip" \
+    --name my-voice --out voices/my-voice</code></pre>
+
   <h2>Or run it as an HTTP API</h2>
   <p class="caveat">
     <code>dream-tts-serve</code> loads one engine once and answers requests from it — no
@@ -224,13 +273,89 @@ dream-tts jobs &lt;id&gt; --control pause --now         # stop within seconds</c
     so an existing client switches by pointing at a different port.
   </p>
 
-<pre><code>DREAM_TTS_API_KEY=secret ./dream-tts-serve --port 3003
+<pre><code>DREAM_TTS_API_KEY=secret ./dream-tts-serve --port 3003</code></pre>
+  <p class="caveat">
+    A missing key is a misconfiguration rather than a licence to run open, so the write
+    routes answer <strong>503</strong> until one is set. It travels as
+    <code>X-API-Key</code> or <code>Authorization: Bearer</code>; the read routes
+    (<code>/health</code>, <code>/v1/capabilities</code>, <code>GET /v1/jobs</code>) need
+    neither.
+  </p>
 
-curl -X POST localhost:3003/tts -H "X-API-Key: secret" \
+  <h3>Synthesize <span class="tag">POST /tts</span></h3>
+<pre><code>curl -X POST localhost:3003/tts -H 'X-API-Key: secret' \
      -H 'content-type: application/json' \
      -d '{"text":"Hello from Rust.","voice":"voices/cosy-default-male","seed":7}' \
-     -o out.wav -D headers.txt</code></pre>
+     -o out.wav -D headers.txt
 
+# prose straight from a file, no JSON to quote and no python3 on the path
+curl -X POST localhost:3003/tts -H 'X-API-Key: secret' \
+     -H 'content-type: text/plain' -H 'X-Voice: voices/my-voice' -H 'X-Seed: 7' \
+     --data-binary @chapter.txt -o chapter.wav</code></pre>
+  <p class="caveat">
+    <code>voice</code> and <code>seed</code> are per request: the first picks a voice asset
+    without restarting, the second makes a render reproducible. The <code>text/plain</code>
+    form exists because quoting arbitrary prose into JSON from bash is a bug waiting for an
+    apostrophe — <code>X-Voice</code> and <code>X-Seed</code> carry what the JSON fields
+    would have.
+  </p>
+
+  <h3>Stream while it renders <span class="tag">POST /tts/stream</span></h3>
+<pre><code>curl -N -X POST localhost:3003/tts/stream -H 'X-API-Key: secret' \
+     -H 'content-type: application/json' -d '{"text":"Hello from Rust."}' \
+   | ffplay -autoexit -nodisp -f s16le -ar 24000 -ac 1 -i -</code></pre>
+  <p class="caveat">
+    Raw PCM as each segment lands, so first audio arrives after one segment rather than
+    after the whole render — <strong>2.7s against 5.5s</strong> on the same text. Sample
+    rate is the engine's own; <code>/v1/capabilities</code> names it in
+    <code>sampleRate</code> (24&nbsp;kHz for the default, 44.1 for <code>audio8</code>). It is <em>slower overall</em> on purpose: one
+    segment at a time gives up the cross-segment batching worth 2.7× on book-length text,
+    which is the right trade for a listener and the wrong one for a book.
+  </p>
+
+  <h3>Ask what it is <span class="tag">GET /v1/capabilities, /health, /</span></h3>
+<pre><code>curl -s localhost:3003/health
+curl -s localhost:3003/v1/capabilities | jq '{engine, sampleRate, languages, modes}'
+curl -s 'localhost:3003/?format=json' | jq          # live engine, voice, settings file
+open http://localhost:3003/                          # the same thing as a page</code></pre>
+  <p class="caveat">
+    <code>/health</code> answers only once the model is resident, so a reply means ready.
+    <code>GET /</code> negotiates on <code>Accept</code> — JSON to a client, a
+    self-contained page to a browser, with no CDN and no asset routes, because a local
+    service that needs the network to explain itself is broken in exactly the situation
+    someone is most likely to be reading it.
+  </p>
+
+  <h3>Narration runs <span class="tag">/v1/jobs</span></h3>
+<pre><code># submit: narration text files in reading order, which `dream-tts book` writes to text/
+curl -X POST localhost:3003/v1/jobs -H 'X-API-Key: secret' \
+     -H 'content-type: application/json' -d '{
+       "source": "book.epub",
+       "texts": ["narration/text/chapter-001.txt", "narration/text/chapter-002.txt"],
+       "out_dir": "narration",
+       "voice": "voices/my-voice",
+       "seed": 7
+     }'
+
+curl -s localhost:3003/v1/jobs | jq '{active, jobs: [.jobs[] | {id, state, source}]}'
+curl -s localhost:3003/v1/jobs/&lt;id&gt; | jq '.chapters[] | {name, state, seconds}'
+curl -N localhost:3003/v1/jobs/&lt;id&gt;/events         # per-segment progress, as SSE
+
+curl -X POST localhost:3003/v1/jobs/&lt;id&gt;/pause     -H 'X-API-Key: secret'
+curl -X POST localhost:3003/v1/jobs/&lt;id&gt;/pause-now -H 'X-API-Key: secret'
+curl -X POST localhost:3003/v1/jobs/&lt;id&gt;/resume    -H 'X-API-Key: secret'
+curl -X POST localhost:3003/v1/jobs/&lt;id&gt;/cancel    -H 'X-API-Key: secret'</code></pre>
+  <p class="caveat">
+    Submitting the same document again <em>is</em> the resume: the id is a hash of the text
+    and the settings, so the second submission finds the first run and adopts its finished
+    chapters. The stream opens with the current state, so a watcher that attaches late is
+    not blank until the next segment finishes. Every control answers with what it will
+    actually do — <code>pause</code> keeps the chapter in flight, <code>pause-now</code>
+    discards it and says so, and pausing something that cannot be paused is a
+    <strong>409</strong> rather than a silent no-op.
+  </p>
+
+  <h3>The routes, in one table</h3>
   <div class="scroll">
   <table>
     <thead><tr><th>route</th><th></th></tr></thead>

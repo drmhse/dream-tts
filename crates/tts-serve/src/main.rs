@@ -21,7 +21,8 @@
 //! less to say.
 //!
 //! Two things are **not implemented** and say so with `501` rather than pretending:
-//! the durable job queue (`/v1/tts-jobs`) and forced alignment (`/v1/alignment-jobs`).
+//! the Python service's job routes (`/v1/tts-jobs`, superseded here by `/v1/jobs`) and
+//! forced alignment (`/v1/alignment-jobs`).
 //! Alignment in particular runs a separate whisper environment in the Python service; it
 //! is a subprocess call from here, not a port. `GET /` lists what is live.
 //!
@@ -641,8 +642,8 @@ This page is what a browser gets; every other client gets JSON from the same URL
       <td><code>pause</code>, <code>pause-now</code>, <code>resume</code>,
           <code>cancel</code>, <code>cancel-now</code>.</td></tr>
   <tr><td class="m">*</td><td class="m">/v1/tts-jobs, /v1/alignment-jobs</td>
-      <td class="no">501. The durable job queue and forced alignment live only in the
-          Python service.</td></tr>
+      <td class="no">501. Superseded by <code>/v1/jobs</code>; forced alignment lives
+          only in the Python service.</td></tr>
 </table>
 
 <h2>synthesize</h2>
@@ -761,9 +762,13 @@ fn root_json(app: &Arc<App>) -> Json<serde_json::Value> {
         "sample_rate": app.sample_rate,
         "max_chars": app.max_chars,
         "uptime_seconds": app.started.elapsed().as_secs(),
-        "endpoints": ["/health", "/v1/capabilities", "POST /tts", "POST /tts/stream"],
+        "endpoints": [
+            "/health", "/v1/capabilities", "POST /tts", "POST /tts/stream",
+            "GET /v1/jobs", "POST /v1/jobs", "GET /v1/jobs/{id}",
+            "GET /v1/jobs/{id}/events", "POST /v1/jobs/{id}/{action}",
+        ],
         "not_implemented": {
-            "POST /v1/tts-jobs": "durable job queue",
+            "POST /v1/tts-jobs": "the Python service's job shape; this one serves /v1/jobs",
             "POST /v1/alignment-jobs": "forced alignment (needs a whisper environment)",
             "GET /v1/artifacts/{job_id}/{filename}": "job artifacts",
         },
@@ -807,7 +812,7 @@ async fn get_capabilities(State(app): State<Arc<App>>) -> Json<serde_json::Value
         "audio": {"container": "wav", "encoding": "pcm_s16le", "channels": 1},
         "streaming": caps.streaming,
         "cloning": format!("{:?}", caps.cloning),
-        "jobs": {"durable": false, "reason": "not implemented in the Rust service"},
+        "jobs": {"durable": true, "route": "/v1/jobs"},
         "alignment": {"available": false, "reason": "needs a separate whisper environment"},
         // No supervisor, no recycle budget, no reload: there is no MPSGraph cache to
         // reclaim, so the model stays resident for the process lifetime.
@@ -819,9 +824,9 @@ async fn not_implemented(Path(rest): Path<String>) -> ApiError {
     bad(
         StatusCode::NOT_IMPLEMENTED,
         format!(
-            "/v1/{rest} is not implemented by tts-serve. The durable job queue, forced \
-             alignment and artifact retrieval live only in the Python service. GET / lists \
-             what this one serves."
+            "/v1/{rest} is not implemented by tts-serve. Narration runs are served at \
+             /v1/jobs, not the Python service's route; forced alignment and artifact \
+             retrieval live only there. GET / lists what this one serves."
         ),
     )
 }
