@@ -370,7 +370,10 @@ override the negotiation.
 |---|---|
 | `POST /tts` | WAV body, PCM s16le mono. JSON, or `text/plain` with the text as the body |
 | `POST /tts/stream` | same, incremental rather than buffered: raw PCM as each segment lands |
-| `GET /v1/capabilities` | engines, sample rates, and the weight formats each supports |
+| `GET /v1/capabilities` | engines, sample rates, languages, and the weight formats each supports |
+| `GET /v1/jobs` | narration runs. `POST` submits one; the same document resubmitted resumes it |
+| `GET /v1/jobs/<id>/events` | server-sent events: per-segment progress and every state change |
+| `POST /v1/jobs/<id>/<action>` | `pause`, `pause-now`, `resume`, `cancel`, `cancel-now` |
 | `GET /health` | liveness |
 | `GET /` | routes, live and unimplemented. JSON to a client, **an HTML page to a browser** |
 

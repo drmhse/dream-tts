@@ -71,6 +71,10 @@
   footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--line);
            color: var(--muted); font-size: .875rem; }
   .caveat { color: var(--muted); font-size: .9rem; }
+  .figure { margin: 1.25rem 0 .4rem; }
+  .figure img { display: block; width: 100%; height: auto; border-radius: 8px; }
+  .figure.light { background: #fcfcfb; padding: .75rem; border: 1px solid var(--line); }
+  .cap { color: var(--muted); font-size: .85rem; margin: .4rem 0 0; }
 </style>
 </head>
 <body>
@@ -80,6 +84,7 @@
   <p class="lede">
     Local text-to-speech in Rust. Three voice-cloning speech models ported from PyTorch,
     validated stage by stage against fp32 activations dumped from their references.
+    A 1612-word chapter becomes eleven minutes of speech in 1m 44s, on a laptop.
     One process, no Python at runtime.
   </p>
   <p class="caveat">
@@ -99,7 +104,7 @@
   <div class="engine">
     <header>
       <h3>qwen3tts</h3>
-      <span class="tag">Qwen3-TTS-12Hz-1.7B-Base · 2.10 B · 24 kHz · <code>--quant f16</code></span>
+      <span class="tag">Qwen3-TTS-12Hz-1.7B-Base · 2.10 B · 24 kHz · the default</span>
     </header>
     <div class="voices">
       <label>female</label>
@@ -112,9 +117,17 @@
       </audio>
     </div>
     <div class="stats">
-      <span>female <b>0.261</b> · 3m 2s → 11:36</span>
-      <span>male <b>0.252</b> · 2m 40s → 10:34</span>
+      <span>today <b>0.148</b> · 1m 44s → 11:44</span>
+      <span>these two files <b>0.261</b> and <b>0.252</b></span>
     </div>
+    <p class="caveat">
+      The files above were rendered at an earlier revision, before the Metal kernels
+      described below; the engine and its settings are otherwise the same. A fresh render
+      of the same chapter now costs <strong>1m 44s</strong> rather than three minutes, and
+      word error rate against the reference text moved from 0.038 to 0.036 across it.
+      A sampled model takes a different path through the same text each render, which is
+      why the durations do not match to the second either.
+    </p>
   </div>
 
   <div class="engine">
@@ -160,16 +173,16 @@
   </div>
 
   <p class="headline">
-    A chapter becomes <strong>11 minutes of speech in 3 minutes</strong>, on a laptop.
-    A 16-hour book is about four hours of compute rather than twelve.
+    A chapter becomes <strong>11 minutes of speech in 1m 44s</strong>, on a laptop —
+    6.8× faster than realtime. A 16-hour book is about
+    <strong>2.4 hours</strong> of compute rather than 11.5.
   </p>
 
   <h2>Try it</h2>
 <pre><code>curl -fsSL https://raw.githubusercontent.com/drmhse/dream-tts/main/install.sh | sh
 cd dream-tts &amp;&amp; ./scripts/bootstrap.sh
 
-./dream-tts speak --quant f16 \
-    --text-file examples/chapter.txt --out chapter.wav</code></pre>
+./dream-tts speak --text-file examples/chapter.txt --out chapter.wav</code></pre>
   <p class="caveat">
     <strong><code>curl</code> is the only prerequisite</strong> — no Rust toolchain and no
     Python. The default engine, <code>qwen3tts</code>, has no conversion step, and a tagged
@@ -180,12 +193,35 @@ cd dream-tts &amp;&amp; ./scripts/bootstrap.sh
     prints the ids and what each costs.
   </p>
 
+  <h2>Narrate a whole book</h2>
+<pre><code>dream-tts import book.epub --out prep/ --dry-run  # see the split first
+dream-tts book book.epub --out narration          # kick off; Ctrl-C is safe
+dream-tts jobs                                    # what is running, anywhere
+dream-tts jobs &lt;id&gt; --control pause --now         # stop within seconds</code></pre>
+  <p class="caveat">
+    A thousand-page reference book is hours of synthesis, and that length changes what the
+    software has to be. A run has to survive interruption, so the state does not live in the
+    process doing the work: <code>dream-tts book</code> submits to <code>dream-tts-serve</code>,
+    which owns the engine and the queue. A run has to be discoverable by a process that did not
+    start it, so job records are files — <code>dream-tts jobs</code> answers with no server up,
+    which is exactly the moment someone is about to start a second run on top of the first.
+    <strong>Resume is the same command</strong>: a job's id is a hash of the text and the
+    settings, so re-running adopts the chapters that finished.
+  </p>
+  <p class="caveat">
+    Chapters come from the document itself — the EPUB spine, the DOCX outline levels, the
+    heading levels in HTML or Markdown, the outline a PDF declares. Markdown is rewritten
+    before it is spoken, because a <code>***</code> that reaches the voice is read aloud as
+    “asterisk, asterisk, asterisk”; about forty rules cover code, LaTeX, units, currency,
+    dates and tables, each one arrived at by listening to a failure.
+  </p>
+
   <h2>Or run it as an HTTP API</h2>
   <p class="caveat">
-    <code>tts-serve</code> loads one engine once and answers requests from it — no per-request
-    model load, which is where the 3&ndash;4&nbsp;second start beats a Python service&rsquo;s
-    15&ndash;17. It is wire-compatible with the FastAPI service it replaces, so an existing
-    client switches by pointing at a different port.
+    <code>dream-tts-serve</code> loads one engine once and answers requests from it — no
+    per-request model load, which is where the 3.0&nbsp;second start beats a Python
+    service&rsquo;s 15&ndash;17. It is wire-compatible with the FastAPI service it replaces,
+    so an existing client switches by pointing at a different port.
   </p>
 
 <pre><code>DREAM_TTS_API_KEY=secret ./dream-tts-serve --port 3003
@@ -200,10 +236,13 @@ curl -X POST localhost:3003/tts -H "X-API-Key: secret" \
     <thead><tr><th>route</th><th></th></tr></thead>
     <tbody>
       <tr><td class="mono">POST /tts</td><td>WAV body, PCM s16le mono</td></tr>
-      <tr><td class="mono">POST /tts/stream</td><td>same, buffered rather than incremental</td></tr>
-      <tr><td class="mono">GET /v1/capabilities</td><td>engines, sample rates, weight formats each supports</td></tr>
-      <tr><td class="mono">GET /health</td><td>liveness</td></tr>
-      <tr><td class="mono">GET /</td><td>lists live routes <em>and</em> the unimplemented ones</td></tr>
+      <tr><td class="mono">POST /tts/stream</td><td>incremental: raw PCM as each segment lands, so first audio arrives after one segment</td></tr>
+      <tr><td class="mono">GET /v1/capabilities</td><td>engines, sample rates, languages, weight formats each supports</td></tr>
+      <tr><td class="mono">GET /v1/jobs</td><td>narration runs. <code>POST</code> submits one; the same document resubmitted resumes it</td></tr>
+      <tr><td class="mono">GET /v1/jobs/&lt;id&gt;/events</td><td>server-sent events: per-segment progress and every state change</td></tr>
+      <tr><td class="mono">POST /v1/jobs/&lt;id&gt;/&lt;action&gt;</td><td><code>pause</code>, <code>pause-now</code>, <code>resume</code>, <code>cancel</code>, <code>cancel-now</code></td></tr>
+      <tr><td class="mono">GET /health</td><td>liveness. Answers only once the model is resident, so a reply means ready</td></tr>
+      <tr><td class="mono">GET /</td><td>this service&rsquo;s own page in a browser, JSON to a client — and it lists every run live</td></tr>
     </tbody>
   </table>
   </div>
@@ -217,10 +256,12 @@ curl -X POST localhost:3003/tts -H "X-API-Key: secret" \
   </p>
   <p class="caveat">
     What it refuses is as deliberate as what it serves. <code>speed</code> other than 1.0,
-    <code>mode=instruct</code>, <code>mode=cross_lingual</code> and the durable job queue all
-    answer <strong>501 with an explanation</strong> rather than quietly returning something
-    else — returning speed-1.0 audio to a client that asked for 1.5 would report the request
-    as honoured when it was not. Synthesis is serialised behind a semaphore, because two
+    <code>mode=instruct</code> and <code>mode=cross_lingual</code> answer
+    <strong>501 with an explanation</strong> rather than quietly returning something else —
+    returning speed-1.0 audio to a client that asked for 1.5 would report the request as
+    honoured when it was not. So do the Python service&rsquo;s
+    <code>/v1/tts-jobs</code> and <code>/v1/alignment-jobs</code>, which this one replaces
+    with <code>/v1/jobs</code> rather than emulates. Synthesis is serialised behind a semaphore, because two
     requests interleaving on one Metal queue make both slower and neither faster.
   </p>
 
@@ -231,17 +272,56 @@ curl -X POST localhost:3003/tts -H "X-API-Key: secret" \
       <tr><th>engine</th><th>RTF (both voices)</th><th>wall, fastest</th><th>batches</th><th>reach for it when</th></tr>
     </thead>
     <tbody>
-      <tr><td class="mono">qwen3tts</td><td class="num">0.252–0.261</td><td class="num">2m 40s</td><td>yes, at f16</td><td>you are narrating something long</td></tr>
+      <tr><td class="mono">qwen3tts</td><td class="num">0.148</td><td class="num">1m 44s</td><td>yes, 48 lanes</td><td>the default. Best quality here, and the only one that makes a book practical</td></tr>
       <tr><td class="mono">cosyvoice</td><td class="num">0.703–0.718</td><td class="num">8m 15s</td><td>no</td><td>you want the widest language coverage</td></tr>
-      <tr><td class="mono">audio8</td><td class="num">0.527–0.536</td><td class="num">5m 47s</td><td>no</td><td>you want 44.1 kHz output</td></tr>
+      <tr><td class="mono">audio8</td><td class="num">0.527–0.536</td><td class="num">5m 47s</td><td>no</td><td>you want 44.1 kHz, the highest-fidelity output here</td></tr>
     </tbody>
   </table>
   </div>
   <p class="caveat">
     Compare wall time, not just RTF: the three do not produce the same duration from the same
-    text — <code>cosyvoice</code> speaks slowest — and RTF divides by audio produced, which
-    flatters a slower-speaking engine. <code>qwen3tts</code> wins here only because it batches
-    across sections; on a short passage it is the slowest of the three, at 0.665.
+    text — <code>cosyvoice</code> speaks slowest, 12:48 against <code>audio8</code>&rsquo;s
+    11:34 — and RTF divides by audio produced, which flatters a slower-speaking engine.
+    <code>qwen3tts</code> wins by this much only because it batches across sections, so it
+    wants length: on a 132-word passage it is 0.397, against 0.544 for <code>audio8</code>
+    and 0.716 for <code>cosyvoice</code>. Never benchmark it on a paragraph.
+  </p>
+  <p class="caveat">
+    Memory is the other axis, and it runs the other way. On that short passage
+    <code>cosyvoice</code> peaks at 5.0&nbsp;GB and <code>audio8</code> at 9.7, against
+    <code>qwen3tts</code>&rsquo;s 12.3 — almost all of it the codec decoder&rsquo;s
+    activations rather than weights. <strong>16&nbsp;GB is what the default engine wants.</strong>
+    A smaller machine is better served by a different engine than by a smaller weight format.
+  </p>
+
+  <h2>What makes it fast</h2>
+  <div class="figure light">
+    <img src="qwen3tts-speedup.png" alt="Speedup components for the qwen3tts engine, measured and open">
+  </div>
+  <p class="cap">
+    Every green component is measured. Together they take the engine to RTF 0.144–0.148 —
+    6.8× to 6.9× realtime — across corpora between 1612 and 4838 words.
+  </p>
+  <p class="caveat">
+    Four of them carry most of it, and two are Metal kernels written here. <strong>f16
+    weights</strong>, because only a dense GEMM shares one weight read across lanes.
+    <strong>The codec&rsquo;s convolutions gather their taps inside the GEMM</strong> — both
+    conv-as-GEMM routes were losing to <em>assembling</em> the operand rather than multiplying
+    it, 85.8&nbsp;ms to build the im2col against 8.2 for the GEMM consuming it — which is 1.70×
+    on a codec chunk, and bit-identical output. <strong>A GEMM shaped like a decode step</strong>,
+    since candle reaches 3.64&nbsp;TFLOP/s on a 2048-cube but 1.07–2.34 at m&nbsp;=&nbsp;48. And
+    <strong>48 batched lanes, sorted longest-first, shedding each finished tail</strong>: a group
+    runs as long as its longest lane, so ordering decides how much of the batch is real work —
+    68–70% of lane-steps were useful before, 79–90% now.
+  </p>
+  <div class="figure">
+    <img src="qwen3tts-lanes-rtf.svg" alt="End-to-end RTF by lane count; past 48 lanes the machine swaps">
+  </div>
+  <p class="cap">
+    Past 48 lanes it swaps, and that is a floor rather than a saturation: a lane costs 13&nbsp;MB
+    of peak footprint, while the codec&rsquo;s activations cost gigabytes. The
+    <a href="https://github.com/drmhse/dream-tts#memory-is-candles-buffer-pool-not-the-lane-count">memory
+    analysis</a> is in the README — it is candle&rsquo;s buffer pool, not the lane count.
   </p>
 
   <h2>What it is validated against</h2>
@@ -256,7 +336,7 @@ curl -X POST localhost:3003/tts -H "X-API-Key: secret" \
     <code>ras_sampling</code> draws from torch’s generator, so a sampled sequence is not
     reproducible across implementations. Quality is checked separately by word error rate.
     Known limitations, including an undiagnosed regression in two convolution stages, are in
-    the <a href="https://github.com/drmhse/dream-tts#honest-limitations">README</a>.
+    the <a href="https://github.com/drmhse/dream-tts#limitations">README</a>.
   </p>
 
   <footer>
