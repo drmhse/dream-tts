@@ -881,11 +881,12 @@ it alongside anything already in flight and lets the user choose.
 `POST /tts/stream` used to be buffered, and said so in an `x-streaming: buffered` header. It
 is now genuinely incremental: raw PCM per segment, chunked, first audio after one segment
 instead of after all of them. Measured on the same text, **2.7s to first audio against 5.5s
-buffered**; at `qwen3tts`'s RTF of 0.67 the stream outpaces playback, so a live listener
-never runs dry once it has started.
+buffered**. Even unbatched the engine stays well under realtime — 0.397 on the short-passage
+fixture — so the stream outpaces playback and a live listener never runs dry once it has
+started.
 
 It is **slower overall, deliberately.** `Engine::synthesize` batches across segments and that
-is worth 2x on book-length text; one segment at a time gives it up. What a realtime caller
+is worth 2.7× on book-length text; one segment at a time gives it up. What a realtime caller
 needs is not throughput but a short time to first audio, and those are different quantities —
 which is why the job runner does not use this path. A listener waiting on a live response
 cares about the first second; a book cares about the last hour.

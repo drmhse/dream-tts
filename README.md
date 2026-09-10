@@ -1,7 +1,7 @@
 # dream-tts
 
 Narrate anything in a cloned voice, on your own Mac, offline. A 1612-word chapter becomes
-11 minutes of speech in 2m 40s. One binary, no service, no API key.
+11 minutes of speech in 1m 44s. One binary, no service, no API key.
 
 ### ▶ [Hear it first: one chapter, three engines, two cloned voices](https://drmhse.github.io/dream-tts/)
 
@@ -23,9 +23,9 @@ cd dream-tts && ./scripts/bootstrap.sh       # the model. ~4.3 GB, resumable, ve
 **`curl` is the only prerequisite.** No Rust toolchain, no Python. That holds because the
 default engine, `qwen3tts`, has no conversion step — its checkpoint is a plain download —
 and because a `v*` tag publishes prebuilt arm64 binaries. It is also the best quality of the
-three and more than twice as fast on book-length text, so the cheapest path is also the one
-you want. The [demo](https://drmhse.github.io/dream-tts/) is there so you can disagree before
-you download anything.
+three and more than three times as fast on book-length text, so the cheapest path is also
+the one you want. The [demo](https://drmhse.github.io/dream-tts/) is there so you can
+disagree before you download anything.
 
 From a git clone instead, with a toolchain, it is one command:
 
@@ -87,8 +87,8 @@ running. GitHub cannot embed audio in markdown, so the
 | `qwen3tts` | **0.148** | **1m 44s** | 11:44 / 10:34 | the default. Best quality here, and the only one that makes book-length text practical |
 
 **That bottom row is the point of the project.** A chapter becomes 11 minutes of speech in
-1m 44s, on a laptop — 6.8x faster than realtime. A 16-hour book costs about 2.5 hours of
-compute rather than 12.
+1m 44s, on a laptop — 6.8× faster than realtime. A 16-hour book costs about 2.4 hours of
+compute rather than 11.5.
 
 Compare the wall-time column, not just RTF. The three do not produce the same duration from
 the same text. `cosyvoice` speaks slowest, 12:48 against `audio8`'s 11:34. RTF divides by audio
@@ -117,8 +117,8 @@ as a mistake.
 
 **`--quant q8_0` is not the fix for a smaller machine**, though it looks like one. It halves the
 weight read, which matters only where nothing batches, and it does not touch the floor: on that
-132-word passage it peaks at 11.72 GB against f16's 12.30 — 0.58 GB — while costing 62% of the
-speed (RTF 0.642 against 0.397). On a chapter the gap is 4.5×. Reach for it to fit a single
+132-word passage it peaks at 11.72 GB against f16's 12.30 — 0.58 GB — while running at 62% of
+f16's speed (RTF 0.642 against 0.397). On a chapter the gap is 4.5×. Reach for it to fit a single
 short render into a machine that misses by half a gigabyte, and for nothing else.
 
 What does help a smaller machine is a different engine. Same passage, same measurement:
@@ -263,8 +263,8 @@ software has to be. Three things follow, and they are why there is a client and 
 
 **The estimate is fitted, not averaged.** These engines have strong economies of scale —
 `qwen3tts` batches across segments, which only engages once a chapter has enough of them, so
-the same voice runs at RTF 0.397 on a 132-word passage and 0.158 on a 1612-word chapter. A
-flat words-per-second rate is therefore wrong by 2.5x, in whichever direction the sample
+the same voice runs at RTF 0.397 on a 132-word passage and 0.148 on a 1612-word chapter. A
+flat words-per-second rate is therefore wrong by 2.7×, in whichever direction the sample
 happens to lean: on a real book, extrapolating from its 27-word title page predicted **2h
 09m against an actual hour**. So the model is `fixed + marginal × words`, fitted over the
 chapters that have finished and applied to each remaining chapter individually — a long one
@@ -303,8 +303,8 @@ before it starts rather than an hour in, and `--no-align` drops the only other o
 dependency. The `dream-tts` commands themselves need nothing but the binary.
 
 Resumable per *stage*: a section with a WAV master is never re-synthesised. Deterministic
-under a seed. A 16-hour document costs about **2.5 hours** of synthesis at `qwen3tts`'s 0.158,
-against ~12 at `cosyvoice`'s 0.716. Recognition adds an hour either way.
+under a seed. A 16-hour document costs about **2.4 hours** of synthesis at `qwen3tts`'s 0.148,
+against ~11.5 at `cosyvoice`'s 0.716. Recognition adds an hour either way.
 
 **Import is a stage in front, not a branch inside.** The pipeline takes its chapter
 structure from the filesystem — `chapter-NNN.md`, one per file — so `dream-tts import` turns
@@ -352,11 +352,12 @@ cannot drift apart.
 
 **`POST /tts/stream` is incremental.** Raw PCM as each segment lands, chunked, so first
 audio arrives after one segment rather than after the whole render — measured at **2.7s to
-first audio against 5.5s buffered** on the same text. At `qwen3tts`'s RTF of 0.67 the stream
-outpaces playback, so a listener never runs dry after that first segment. It is *slower
-overall* on purpose: one segment at a time gives up the cross-segment batching worth 2x on
-book-length text, which is the right trade for a live listener and the wrong one for a book —
-so the job runner does not use this path.
+first audio against 5.5s buffered** on the same text. Even unbatched `qwen3tts` stays well
+under realtime — 0.397 on the short-passage fixture — so the stream outpaces playback and a
+listener never runs dry after that first segment. It is *slower overall* on purpose: one
+segment at a time gives up the cross-segment batching worth 2.7× on book-length text, which
+is the right trade for a live listener and the wrong one for a book — so the job runner does
+not use this path.
 
 **Open it in a browser.** `GET /` answers JSON to a client and a self-contained HTML page
 to a browser, chosen by `Accept` — the routes, the request body, the response headers, the
@@ -368,7 +369,7 @@ override the negotiation.
 | route | |
 |---|---|
 | `POST /tts` | WAV body, PCM s16le mono. JSON, or `text/plain` with the text as the body |
-| `POST /tts/stream` | same, buffered rather than incremental |
+| `POST /tts/stream` | same, incremental rather than buffered: raw PCM as each segment lands |
 | `GET /v1/capabilities` | engines, sample rates, and the weight formats each supports |
 | `GET /health` | liveness |
 | `GET /` | routes, live and unimplemented. JSON to a client, **an HTML page to a browser** |
