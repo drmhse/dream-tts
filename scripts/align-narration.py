@@ -129,6 +129,10 @@ MAX_WORDS_PER_SECOND = 12.0
 MAX_INTERPOLATED_RUN = 15         # consecutive unmeasured words before it is a real hole
 MIN_CUE_PAUSE_AGREEMENT = 0.50    # cue cuts landing at a detected silence
 
+# Recognition returning far fewer words than the script holds was cut off, however healthy the
+# rest of the statistics look. Both observed cases were the batched pipeline on short audio.
+MIN_HEARD_SHARE = 0.60
+
 
 # Recognition and the book spell the same sound differently, and every such difference used to
 # count as an unmeasured word. Aggregating the manifests showed ~100 words per book lost this
@@ -153,6 +157,45 @@ BRITISH = {
     "modelling": "modeling", "travelled": "traveled", "cancelled": "canceled",
     "fulfil": "fulfill", "theatre": "theater",
 }
+
+
+# The book spells numbers out and recognition writes digits, and `NUMBER_WORDS` can only
+# fold one word at a time — so "one hundred seventeen" becomes `1 hundred 17` and can never
+# match the `117` whisper heard. Every chapter announcement above ninety-nine therefore
+# carries a guaranteed mismatch, which on a short chapter is fatal twice over: it is the only
+# place a run can start, so the longest match falls below MIN_ANCHOR_BLOCK and *nothing*
+# anchors; and it leaves ~5 words permanently unmeasured, which on a 34-word chapter caps the
+# measured share at 85% against a 95% gate — unreachable however good the recognition is.
+#
+# Folding whole number phrases fixes both, and pays off in the text as well: "nine hundred
+# thirty years" now matches the "930" recognition reports.
+NUMBER_UNITS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+    "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "seventy": 70, "eighty": 80, "ninety": 90,
+}
+NUMBER_SCALES = {"hundred": 100, "thousand": 1000}
+NUMBER_PHRASE_WORDS = set(NUMBER_UNITS) | set(NUMBER_SCALES)
+
+
+def evaluate_number_phrase(words: list[str]) -> int | None:
+    """`["one", "hundred", "seventeen"] -> 117`. None if the run is not a single number."""
+    total = current = 0
+    seen = False
+    for w in words:
+        if w in NUMBER_UNITS:
+            current += NUMBER_UNITS[w]
+        elif w == "hundred":
+            current = (current or 1) * 100
+        elif w == "thousand":
+            total += (current or 1) * 1000
+            current = 0
+        else:
+            return None
+        seen = True
+    return total + current if seen else None
 
 
 def raw_normalize(word: str) -> str:
@@ -247,7 +290,7 @@ class Recognised:
     end: float
 
 
-def recognise(audio: Path, model_name: str, batch_size: int
+def recognise(audio: Path, model_name: str, batch_size: int, beam_size: int = 1
               ) -> tuple[list[Recognised], float]:
     """Transcribe with faster-whisper. Returns words and elapsed seconds.
 
@@ -273,12 +316,12 @@ def recognise(audio: Path, model_name: str, batch_size: int
     t0 = time.time()
     if batch_size and batch_size > 1:
         segments, _ = BatchedInferencePipeline(model=model).transcribe(
-            str(audio), language="en", beam_size=1, batch_size=batch_size,
+            str(audio), language="en", beam_size=beam_size, batch_size=batch_size,
             word_timestamps=True,
         )
     else:
         segments, _ = model.transcribe(
-            str(audio), language="en", beam_size=1, word_timestamps=True
+            str(audio), language="en", beam_size=beam_size, word_timestamps=True
         )
     words: list[Recognised] = []
     for segment in segments:
@@ -321,7 +364,45 @@ def canonical_words(text: str) -> list[Canonical]:
     ]
 
 
-def attach_times(canon: list[Canonical], heard: list[Recognised]) -> int:
+def matching_view(canon: list[Canonical], text: str) -> tuple[list[str], list[list[int]]]:
+    """Token sequence to match against recognition, plus the canonical words behind each.
+
+    Only difference from the canonical words themselves: a run of number words that reads as
+    one number becomes one token. Merging is refused across a sentence boundary, so
+    "...was thirty. Two men..." cannot become `32` — the words are adjacent in the word
+    stream, and only the characters between them say otherwise.
+    """
+    tokens: list[str] = []
+    groups: list[list[int]] = []
+    i = 0
+    while i < len(canon):
+        if raw_normalize(canon[i].text) in NUMBER_PHRASE_WORDS:
+            j = i
+            while j + 1 < len(canon):
+                nxt = canon[j + 1]
+                if raw_normalize(nxt.text) not in NUMBER_PHRASE_WORDS:
+                    break
+                between = text[canon[j].char_end:nxt.char_start]
+                if re.fullmatch(r"[\s]*(and[\s]*)?", between, re.IGNORECASE) is None:
+                    break            # punctuation between them: different numbers
+                j += 1
+            if j > i:
+                value = evaluate_number_phrase(
+                    [raw_normalize(canon[k].text) for k in range(i, j + 1)]
+                )
+                if value is not None:
+                    tokens.append(str(value))
+                    groups.append(list(range(i, j + 1)))
+                    i = j + 1
+                    continue
+        tokens.append(canon[i].normalized)
+        groups.append([i])
+        i += 1
+    return tokens, groups
+
+
+def attach_times(canon: list[Canonical], heard: list[Recognised],
+                 view: tuple[list[str], list[list[int]]] | None = None) -> int:
     """Match the two word sequences and copy recognised times onto canonical words.
 
     `SequenceMatcher` handles the three things recognition does to a script — substitution,
@@ -336,19 +417,29 @@ def attach_times(canon: list[Canonical], heard: list[Recognised]) -> int:
     Only runs of at least `MIN_ANCHOR_BLOCK` words are trusted; see that constant for the
     failure a shorter run caused.
     """
+    tokens, groups = view if view else ([c.normalized for c in canon],
+                                        [[i] for i in range(len(canon))])
     matcher = difflib.SequenceMatcher(
-        None, [c.normalized for c in canon], [h.normalized for h in heard], autojunk=False
+        None, tokens, [h.normalized for h in heard], autojunk=False
     )
     measured = 0
     for ci, hi, size in matcher.get_matching_blocks():
         if size < MIN_ANCHOR_BLOCK:
             continue
         for k in range(size):
-            word = canon[ci + k]
-            word.start, word.end = heard[hi + k].start, heard[hi + k].end
-            word.measured = True
-            word.support = size
-            measured += 1
+            recognised = heard[hi + k]
+            members = groups[ci + k]
+            # One recognised word can stand for several canonical ones ("117" for "one
+            # hundred seventeen"). Split its span evenly rather than stacking identical
+            # times, so cue cutting still sees words in order.
+            step = (recognised.end - recognised.start) / len(members)
+            for slot, index in enumerate(members):
+                word = canon[index]
+                word.start = recognised.start + slot * step
+                word.end = word.start + step
+                word.measured = True
+                word.support = size
+                measured += 1
     return measured
 
 
@@ -532,6 +623,8 @@ def main() -> int:
     ap.add_argument("--title", default="")
     ap.add_argument("--asr-model", default="small.en")
     ap.add_argument("--batch-size", type=int, default=16)
+    # The retry exists to be correct, not fast, so it does not inherit the fast path's beam.
+    ap.add_argument("--retry-beam-size", type=int, default=5)
     args = ap.parse_args()
 
     text = args.text.read_text()
@@ -557,7 +650,7 @@ def main() -> int:
         a retry must start from a fresh list rather than a partly-timed one.
         """
         canon = canonical_words(text)
-        measured = attach_times(canon, heard)
+        measured = attach_times(canon, heard, matching_view(canon, text))
         dropped = drop_implausible_anchors(canon)
         measured -= dropped
         holes = fill_holes(canon)
@@ -604,28 +697,77 @@ def main() -> int:
             "longest_hole": longest_hole, "cue_lengths": cue_lengths, "issues": issues,
         }
 
-    heard, asr_seconds = recognise(args.audio, args.asr_model, args.batch_size)
-    result = align(heard)
-    # Batching buys 20x realtime but sometimes misplaces a segment, which reaches the aligner
-    # as a false anchor and opens a hole in a correct recording. Recognise again unbatched
-    # before believing the failure. See `recognise`.
-    if result["issues"] and args.batch_size and args.batch_size > 1:
-        print(f"  gates failed on the batched pass ({'; '.join(result['issues'])}); "
-              f"re-recognising unbatched", file=sys.stderr)
-        retry_heard, retry_seconds = recognise(args.audio, args.asr_model, 1)
-        retry = align(retry_heard)
-        # Prefer the pass with fewer failures, then the one whose worst hole is smaller. A
-        # bigger measured share is not on its own better: a false anchor *raises* it while
-        # putting words in the wrong place.
-        better = (len(retry["issues"]), retry["longest_hole"]) < \
-                 (len(result["issues"]), result["longest_hole"])
-        asr_seconds += retry_seconds
-        if better:
-            print("  unbatched pass is better; using it", file=sys.stderr)
-            result = retry
-        else:
-            print("  unbatched pass is no better; keeping the batched one", file=sys.stderr)
+    def try_align(heard: list[Recognised]) -> dict | None:
+        """A pass that matched nothing is a value, not an exit.
 
+        `fill_holes` raises when no canonical word got a measured time, and that raise used to
+        escape `align` at both call sites. On the first pass it aborted the run before any
+        fallback could be attempted — on Psalm 117 the fallback would have succeeded outright.
+        On the retry it discarded a usable result, which is how Psalm 129 ended up with no
+        manifest at all despite the batched pass having measured a third of it.
+        """
+        try:
+            return align(heard)
+        except SystemExit as exc:
+            print(f"  {exc}", file=sys.stderr)
+            return None
+
+    expected_words = len(canonical_words(text))
+
+    def truncated(heard: list[Recognised]) -> bool:
+        """Recognition far shorter than the script was cut off, whatever the gates say.
+
+        The batched pipeline does this on short audio — 13.8 s holding 34 words came back as
+        3 — and every downstream statistic can only see the damage, never the cause.
+        """
+        return len(heard) < MIN_HEARD_SHARE * expected_words
+
+    def rank(candidate: dict | None) -> tuple:
+        """Fewer failures first, then the smaller worst hole. A bigger measured share is not
+        on its own better: a false anchor raises it while putting words in the wrong place."""
+        if candidate is None:
+            return (1 << 30, 1 << 30)
+        return (len(candidate["issues"]), candidate["longest_hole"])
+
+    # Recognition is a ladder, cheapest first, and it stops at the first pass that clears every
+    # gate. Batching buys 20x realtime but misplaces segments and truncates short audio;
+    # unbatched greedy decoding fixes that but itself terminates early on some files (Psalm 129
+    # returned 3 words of 129); a wider beam fixes those but is slower and measurably worse
+    # where greedy already worked — on Genesis 1 it cost 15 points of cue/pause agreement and
+    # stretched median cue length from 2.3 s to 3.6 s.
+    #
+    # So: no rung is universally best, and the earlier design's mistake was swapping one for
+    # another rather than trying them in order and keeping the best result.
+    ladder: list[tuple[str, int, int]] = []
+    if args.batch_size and args.batch_size > 1:
+        ladder.append((f"batched x{args.batch_size}", args.batch_size, 1))
+    ladder.append(("unbatched", 1, 1))
+    if args.retry_beam_size > 1:
+        ladder.append((f"unbatched beam {args.retry_beam_size}", 1, args.retry_beam_size))
+
+    asr_seconds = 0.0
+    result: dict | None = None
+    for index, (label, batch, beam) in enumerate(ladder):
+        heard, seconds = recognise(args.audio, args.asr_model, batch, beam_size=beam)
+        asr_seconds += seconds
+        if truncated(heard):
+            print(f"  {label}: heard {len(heard)} words of {expected_words}; truncated",
+                  file=sys.stderr)
+            candidate = None
+        else:
+            candidate = try_align(heard)
+        if rank(candidate) < rank(result):
+            result = candidate
+        if candidate is not None and not candidate["issues"]:
+            break
+        if index + 1 < len(ladder):
+            reason = "no usable alignment" if candidate is None \
+                else "; ".join(candidate["issues"])
+            print(f"  {label} failed ({reason}); trying {ladder[index + 1][0]}",
+                  file=sys.stderr)
+
+    if result is None:
+        raise SystemExit("recognition and script did not overlap at all")
     canon, measured, dropped = result["canon"], result["measured"], result["dropped"]
     clamped, cues, words = result["clamped"], result["cues"], result["words"]
     mapped, heard = result["mapped"], result["heard"]

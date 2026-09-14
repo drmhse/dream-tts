@@ -17,6 +17,7 @@
 
 pub mod config;
 pub mod engine;
+pub mod gpumon;
 pub mod lock;
 pub mod rng;
 pub mod system;
