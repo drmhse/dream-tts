@@ -1524,6 +1524,161 @@ mod tests {
         Ok(())
     }
 
+    /// Every other kernel on the three older engines' paths that calls a transcendental,
+    /// against a double-precision host reference.
+    ///
+    /// Same audit as the SnakeBeta one below, for the same reason: `lstm_gates` proved that
+    /// Metal's fast math can be wrong enough to matter, and nothing else here had been
+    /// checked against anything but candle — which would be wrong identically. `swiglu_mul`
+    /// is the one to care about: it is the SiLU in qwen3tts's talker, and the talker is
+    /// autoregressive, so it has the property that turned the LSTM's ulp into 4e-1.
+    ///
+    /// Ranges are generous on purpose. Vocoder activations reach tens, and `sin`'s range
+    /// reduction and `exp`'s overflow are exactly what a narrow sweep would miss.
+    #[test]
+    fn transcendental_kernels_are_accurate_to_double_precision() -> anyhow::Result<()> {
+        #[cfg(feature = "metal")]
+        let _gpu = crate::gpu_guard();
+        let Some(d) = crate::usable_metal() else {
+            return Ok(());
+        };
+        let (c, len) = (8usize, 4096usize);
+        let sweep = |lo: f64, hi: f64, n: usize| -> Vec<f32> {
+            (0..n).map(|i| (lo + (hi - lo) * (i % len) as f64 / (len - 1) as f64) as f32).collect()
+        };
+        let xs = sweep(-30.0, 30.0, c * len);
+        let al: Vec<f32> = (0..c).map(|j| 0.05 + 2.5 * j as f32 / (c - 1) as f32).collect();
+        let br: Vec<f32> = (0..c).map(|j| 0.5 + j as f32).collect();
+        let x = Tensor::from_vec(xs.clone(), (1, c, len), &d)?;
+        let a3 = Tensor::from_vec(al.clone(), (1, c, 1), &d)?;
+        let b3 = Tensor::from_vec(br.clone(), (1, c, 1), &d)?;
+
+        // Scaled by the operands: every one of these can cancel near zero, and dividing by
+        // the result there reports the cancellation as kernel error.
+        let mut worst: Vec<(&str, f64)> = Vec::new();
+        let mut check = |name: &'static str, got: Vec<f32>, want: &dyn Fn(usize, usize) -> (f64, f64)| {
+            let mut w = 0f64;
+            for j in 0..c {
+                for i in 0..len {
+                    let (v, scale) = want(j, i);
+                    w = w.max((got[j * len + i] as f64 - v).abs() / scale.max(1.0));
+                }
+            }
+            worst.push((name, w));
+        };
+
+        check("snake_folded", crate::fused::snake_folded(&x)?.flatten_all()?.to_vec1()?, &|j, i| {
+            let xv = xs[j * len + i] as f64;
+            (xv + xv.sin().powi(2), xv.abs())
+        });
+        check("snake (alpha)", crate::snake(&x, &a3)?.flatten_all()?.to_vec1()?, &|j, i| {
+            let u = al[j] as f64 * xs[j * len + i] as f64;
+            (u + u.sin().powi(2), u.abs())
+        });
+        check("snake_full", crate::snake_full(&x, &a3, &b3)?.flatten_all()?.to_vec1()?, &|j, i| {
+            let xv = xs[j * len + i] as f64;
+            let u = al[j] as f64 * xv;
+            (xv + br[j] as f64 * u.sin().powi(2), xv.abs().max(br[j] as f64))
+        });
+
+        // The channels-last sibling, f32 and f16, as qwen3tts's codec calls it.
+        let xn = Tensor::from_vec(xs.clone(), (1, len, c), &d)?;
+        let a1 = Tensor::from_vec(al.clone(), c, &d)?;
+        let b1 = Tensor::from_vec(br.clone(), c, &d)?;
+        let nlc = snake_beta_nlc(&xn, &a1, &b1)?.flatten_all()?.to_vec1::<f32>()?;
+        let mut w = 0f64;
+        for i in 0..len {
+            for j in 0..c {
+                let xv = xs[i * c + j] as f64;
+                let v = xv + br[j] as f64 * (al[j] as f64 * xv).sin().powi(2);
+                let scale = xv.abs().max(br[j] as f64).max(1.0);
+                w = w.max((nlc[i * c + j] as f64 - v).abs() / scale);
+            }
+        }
+        worst.push(("snake_beta_nlc", w));
+
+        // SiLU * up, the talker's FFN.
+        let gs = sweep(-30.0, 30.0, c * len);
+        let us = sweep(-4.0, 4.0, c * len);
+        let g = Tensor::from_vec(gs.clone(), (1, c * len), &d)?;
+        let u = Tensor::from_vec(us.clone(), (1, c * len), &d)?;
+        let sw = swiglu_mul(&g, &u)?.flatten_all()?.to_vec1::<f32>()?;
+        let mut w = 0f64;
+        for i in 0..c * len {
+            let (gv, uv) = (gs[i] as f64, us[i] as f64);
+            let v = gv / (1.0 + (-gv).exp()) * uv;
+            w = w.max((sw[i] as f64 - v).abs() / (gv * uv).abs().max(1.0));
+        }
+        worst.push(("swiglu_mul", w));
+
+        // 2e-6, not one: at the top of the sweep `alpha * x` is ~75, and f32 cannot hold
+        // that argument to better than a few microradians, which lands in `sin` before any
+        // kernel runs. The two that reach 1.03e-6 do so identically under `precise::sin`,
+        // and one of them — `snake_full` — is candle's composed path rather than a kernel
+        // here, which is the clincher.
+        let mut bad = Vec::new();
+        for (name, e) in &worst {
+            eprintln!("    {name:<16} {e:.3e}");
+            if *e >= 2e-6 {
+                bad.push(format!("{name} {e:.3e}"));
+            }
+        }
+        assert!(bad.is_empty(), "off double precision: {}", bad.join(", "));
+        Ok(())
+    }
+
+    /// SnakeBeta against a double-precision host reference, over the range the generator
+    /// actually drives it through.
+    ///
+    /// Checked because `lstm_gates` was caught by Metal's fast math and this kernel calls
+    /// `sin`: the checkpoint's alpha reaches 2.33, so the argument runs past +-20, far
+    /// enough for a weak range reduction to show. It does not — fast and `precise::sin`
+    /// agree to 8.4e-7 here, and swapping every `sin`, `rsqrt`, `sqrt` and `sincos` on
+    /// Kokoro's path for its `precise::` form moved no fixture number at all. So this
+    /// stands as a correctness check on the kernel, not as a guard against fast math, and
+    /// the composed-form test beside it cannot serve that purpose: it compares against
+    /// candle ops that would be wrong in exactly the same way.
+    ///
+    /// Scale the error by the operands, never by the result. `x + b*sin^2` cancels near
+    /// zero, and dividing by the result there reports the cancellation as kernel error —
+    /// 1.65e-4 of it, which is what sent this audit down a false trail to begin with.
+    #[test]
+    fn snake_beta_is_accurate_to_double_precision() -> anyhow::Result<()> {
+        #[cfg(feature = "metal")]
+        let _gpu = crate::gpu_guard();
+        let Some(d) = crate::usable_metal() else {
+            return Ok(());
+        };
+        let (c, len) = (8usize, 2048usize);
+        // x sweeps +-12, alpha spans the checkpoint's own range, so the product reaches ~28.
+        let xs: Vec<f32> = (0..c * len)
+            .map(|i| (-12.0 + 24.0 * (i % len) as f64 / (len - 1) as f64) as f32)
+            .collect();
+        let al: Vec<f32> = (0..c).map(|j| 0.03 + 2.3 * j as f32 / (c - 1) as f32).collect();
+        let br: Vec<f32> = (0..c).map(|j| 0.5 + j as f32).collect();
+        let x = Tensor::from_vec(xs.clone(), (1, c, len), &d)?;
+        let a = Tensor::from_vec(al.clone(), (1, c, 1), &d)?;
+        let b = Tensor::from_vec(br.clone(), (1, c, 1), &d)?;
+        let got = snake_beta(&x, &a, &b)?.flatten_all()?.to_vec1::<f32>()?;
+
+        let mut worst = 0f64;
+        for j in 0..c {
+            for i in 0..len {
+                let xv = xs[j * len + i] as f64;
+                let sn = (al[j] as f64 * xv).sin();
+                let want = xv + br[j] as f64 * sn * sn;
+                // Scaled by the operands, not by the result: `x + b*sin^2` cancels near
+                // zero, and dividing by the result there measures the cancellation rather
+                // than the kernel.
+                let scale = xv.abs().max(br[j] as f64).max(1.0);
+                let rel = (got[j * len + i] as f64 - want).abs() / scale;
+                worst = worst.max(rel);
+            }
+        }
+        assert!(worst < 1e-6, "worst relative error {worst:.3e}");
+        Ok(())
+    }
+
     /// Sum-of-squares against candle's two-pass variance, at the generator's own shapes.
     /// The bound is looser than the elementwise kernels': a raw second moment loses
     /// digits the composed form keeps, and this records how many.
