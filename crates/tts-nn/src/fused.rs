@@ -834,10 +834,728 @@ pub fn gate_residual(residual: &Tensor, y: &Tensor, gate: &Tensor) -> Result<Ten
     residual + y.broadcast_mul(gate)?
 }
 
+// ------------------------------------------------ AdaIN halves
+
+/// `(x - m)^2` with `m` per-channel over `[1, C, L]`.
+///
+/// The centred square the variance needs, without a broadcast: `m` is indexed
+/// by the grid's y axis. Bit-exact against the composed form.
+struct SubSqr {
+    channels: usize,
+    len: usize,
+}
+
+impl candle_core::CustomOp2 for SubSqr {
+    fn name(&self) -> &'static str {
+        "sub_sqr"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        let (x, m) = match (s1, s2) {
+            (CpuStorage::F32(x), CpuStorage::F32(m)) => (x, m),
+            _ => candle_core::bail!("sub_sqr: only f32"),
+        };
+        if !l1.is_contiguous() || !l2.is_contiguous() {
+            candle_core::bail!("sub_sqr: inputs must be contiguous");
+        }
+        let (o1, o2) = (l1.start_offset(), l2.start_offset());
+        let mut dst = vec![0f32; self.channels * self.len];
+        for c in 0..self.channels {
+            let m = m[o2 + c];
+            for l in 0..self.len {
+                let d = x[o1 + c * self.len + l] - m;
+                dst[c * self.len + l] = d * d;
+            }
+        }
+        Ok((CpuStorage::F32(dst), (1, self.channels, self.len).into()))
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &candle_core::MetalStorage,
+        l1: &Layout,
+        s2: &candle_core::MetalStorage,
+        l2: &Layout,
+    ) -> Result<(candle_core::MetalStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::{DType, MetalStorage};
+        use objc2_metal::{MTLResourceUsage, MTLSize};
+
+        for l in [l1, l2] {
+            if !l.is_contiguous() {
+                candle_core::bail!("sub_sqr: inputs must be contiguous");
+            }
+        }
+        for s in [s1, s2] {
+            if s.dtype() != DType::F32 {
+                candle_core::bail!("sub_sqr: only f32");
+            }
+        }
+        let n = self.channels * self.len;
+        let device = s1.device();
+        let p = mtl::pipeline(device, "sub_sqr_f32")?;
+        let dst = device.new_buffer(n, DType::F32, "sub_sqr")?;
+
+        let encoder = device.command_encoder()?;
+        encoder.set_label("tts_nn::sub_sqr");
+        encoder.set_compute_pipeline_state(&p);
+        for (i, (s, l)) in [(s1, l1), (s2, l2)].iter().enumerate() {
+            encoder.set_buffer(i, Some(s.buffer()), l.start_offset() * 4);
+            encoder.use_resource(s.buffer(), MTLResourceUsage::Read);
+        }
+        encoder.set_buffer(2, Some(dst.as_ref()), 0);
+        encoder.set_bytes(3, &(self.len as u32));
+        encoder.use_resource(dst.as_ref(), MTLResourceUsage::Write);
+        let w = mtl::group_width(&p, self.len);
+        encoder.dispatch_threads(
+            MTLSize {
+                width: self.len,
+                height: self.channels,
+                depth: 1,
+            },
+            MTLSize {
+                width: w,
+                height: 1,
+                depth: 1,
+            },
+        );
+        drop(encoder);
+
+        Ok((
+            MetalStorage::new(dst, device.clone(), n, DType::F32),
+            (1, self.channels, self.len).into(),
+        ))
+    }
+}
+
+/// `(x - m)^2` with `m` holding one value per channel.
+///
+/// `m` may be `[C]` or `[1, C, 1]`; the fallback is the two composed ops.
+pub fn sub_sqr(x: &Tensor, m: &Tensor) -> Result<Tensor> {
+    let (b, c, len) = x.dims3()?;
+    if b == 1 && x.device().is_metal() && m.elem_count() == c {
+        let op = SubSqr { channels: c, len };
+        return x
+            .contiguous()?
+            .apply_op2_no_bwd(&m.flatten_all()?.contiguous()?, &op);
+    }
+    Ok(x.broadcast_sub(&m.reshape((1, c, 1))?)?.sqr()?)
+}
+
+/// `out = (x - mean) * rsqrt(var + eps) * (gamma + 1) + beta`, per channel.
+///
+/// The tail of an AdaIN in one pass: normalise, scale and shift with direct
+/// per-channel indexing instead of four broadcasts and a division. `rsqrt`
+/// against the composed `div(sqrt)` differs ~1 ulp; the tests bound it.
+struct AdainApply {
+    channels: usize,
+    len: usize,
+    eps: f32,
+}
+
+impl candle_core::CustomOp2 for AdainApply {
+    fn name(&self) -> &'static str {
+        "adain_apply"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        let (x, p) = match (s1, s2) {
+            (CpuStorage::F32(x), CpuStorage::F32(p)) => (x, p),
+            _ => candle_core::bail!("adain_apply: only f32"),
+        };
+        if !l1.is_contiguous() || !l2.is_contiguous() {
+            candle_core::bail!("adain_apply: inputs must be contiguous");
+        }
+        let (o1, o2) = (l1.start_offset(), l2.start_offset());
+        let c = self.channels;
+        let mut dst = vec![0f32; c * self.len];
+        for ch in 0..c {
+            let (mean, var, gamma, beta) = (
+                p[o2 + ch],
+                p[o2 + c + ch],
+                p[o2 + 2 * c + ch],
+                p[o2 + 3 * c + ch],
+            );
+            let scale = 1.0 / (var + self.eps).sqrt() * (gamma + 1.0);
+            for l in 0..self.len {
+                dst[ch * self.len + l] = (x[o1 + ch * self.len + l] - mean) * scale + beta;
+            }
+        }
+        Ok((CpuStorage::F32(dst), (1, c, self.len).into()))
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &candle_core::MetalStorage,
+        l1: &Layout,
+        s2: &candle_core::MetalStorage,
+        l2: &Layout,
+    ) -> Result<(candle_core::MetalStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::{DType, MetalStorage};
+        use objc2_metal::{MTLResourceUsage, MTLSize};
+
+        for l in [l1, l2] {
+            if !l.is_contiguous() {
+                candle_core::bail!("adain_apply: inputs must be contiguous");
+            }
+        }
+        for s in [s1, s2] {
+            if s.dtype() != DType::F32 {
+                candle_core::bail!("adain_apply: only f32");
+            }
+        }
+        let n = self.channels * self.len;
+        let device = s1.device();
+        let p = mtl::pipeline(device, "adain_apply_f32")?;
+        let dst = device.new_buffer(n, DType::F32, "adain_apply")?;
+
+        let encoder = device.command_encoder()?;
+        encoder.set_label("tts_nn::adain_apply");
+        encoder.set_compute_pipeline_state(&p);
+        for (i, (s, l)) in [(s1, l1), (s2, l2)].iter().enumerate() {
+            encoder.set_buffer(i, Some(s.buffer()), l.start_offset() * 4);
+            encoder.use_resource(s.buffer(), MTLResourceUsage::Read);
+        }
+        encoder.set_buffer(2, Some(dst.as_ref()), 0);
+        encoder.set_bytes(3, &(self.len as u32));
+        encoder.set_bytes(4, &(self.channels as u32));
+        encoder.set_bytes(5, &self.eps);
+        encoder.use_resource(dst.as_ref(), MTLResourceUsage::Write);
+        let w = mtl::group_width(&p, self.len);
+        encoder.dispatch_threads(
+            MTLSize {
+                width: self.len,
+                height: self.channels,
+                depth: 1,
+            },
+            MTLSize {
+                width: w,
+                height: 1,
+                depth: 1,
+            },
+        );
+        drop(encoder);
+
+        Ok((
+            MetalStorage::new(dst, device.clone(), n, DType::F32),
+            (1, self.channels, self.len).into(),
+        ))
+    }
+}
+
+/// Normalise `x` per channel and apply a style scale and shift, one pass.
+///
+/// All four parameters hold one value per channel, each `[C]` or `[1, C, 1]`.
+/// The composed fallback is exactly the operations this replaces, in order.
+pub fn adain_apply(
+    x: &Tensor,
+    mean: &Tensor,
+    var: &Tensor,
+    gamma: &Tensor,
+    beta: &Tensor,
+    eps: f64,
+) -> Result<Tensor> {
+    let (b, c, len) = x.dims3()?;
+    let flat = |t: &Tensor| -> Result<Tensor> {
+        if t.elem_count() != c {
+            candle_core::bail!("adain_apply: parameter has wrong size");
+        }
+        Ok(t.flatten_all()?.contiguous()?)
+    };
+    if b == 1
+        && x.device().is_metal()
+        && [mean, var, gamma, beta].iter().all(|t| t.elem_count() == c)
+    {
+        let op = AdainApply {
+            channels: c,
+            len,
+            eps: eps as f32,
+        };
+        let packed = Tensor::stack(&[flat(mean)?, flat(var)?, flat(gamma)?, flat(beta)?], 0)?;
+        return x.contiguous()?.apply_op2_no_bwd(&packed, &op);
+    }
+    let m = |t: &Tensor| t.reshape((1, c, 1));
+    let centred = x.broadcast_sub(&m(mean)?)?;
+    let normed = centred.broadcast_div(&(m(var)? + eps)?.sqrt()?)?;
+    normed
+        .broadcast_mul(&(m(gamma)? + 1.0)?)?
+        .broadcast_add(&m(beta)?)
+}
+
+/// Per-channel mean and variance of a `[1, C, L]` signal, as `[2, C]`.
+struct Moments {
+    channels: usize,
+    len: usize,
+}
+
+impl CustomOp1 for Moments {
+    fn name(&self) -> &'static str {
+        "channel_moments"
+    }
+
+    fn cpu_fwd(&self, s: &CpuStorage, l: &Layout) -> Result<(CpuStorage, Shape)> {
+        let x = match s {
+            CpuStorage::F32(x) => x,
+            _ => candle_core::bail!("channel_moments: only f32"),
+        };
+        if !l.is_contiguous() {
+            candle_core::bail!("channel_moments: input must be contiguous");
+        }
+        let o = l.start_offset();
+        let mut dst = vec![0f32; 2 * self.channels];
+        for c in 0..self.channels {
+            let row = &x[o + c * self.len..o + (c + 1) * self.len];
+            let (mut sum, mut sq) = (0f32, 0f32);
+            for v in row {
+                sum += v;
+                sq += v * v;
+            }
+            let mean = sum / self.len as f32;
+            dst[c] = mean;
+            dst[self.channels + c] = (sq / self.len as f32 - mean * mean).max(0.0);
+        }
+        Ok((CpuStorage::F32(dst), (2, self.channels).into()))
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s: &candle_core::MetalStorage,
+        l: &Layout,
+    ) -> Result<(candle_core::MetalStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::{DType, MetalStorage};
+        use objc2_metal::{MTLResourceUsage, MTLSize};
+
+        if !l.is_contiguous() {
+            candle_core::bail!("channel_moments: input must be contiguous");
+        }
+        if s.dtype() != DType::F32 {
+            candle_core::bail!("channel_moments: only f32");
+        }
+        let device = s.device();
+        let p = mtl::pipeline(device, "channel_moments_f32")?;
+        let dst = device.new_buffer(2 * self.channels, DType::F32, "channel_moments")?;
+
+        let encoder = device.command_encoder()?;
+        encoder.set_label("tts_nn::channel_moments");
+        encoder.set_compute_pipeline_state(&p);
+        encoder.set_buffer(0, Some(s.buffer()), l.start_offset() * 4);
+        encoder.set_buffer(1, Some(dst.as_ref()), 0);
+        encoder.set_bytes(2, &(self.len as u32));
+        encoder.set_bytes(3, &(self.channels as u32));
+        encoder.use_resource(s.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(dst.as_ref(), MTLResourceUsage::Write);
+        // One threadgroup per channel: grid width equals the group width, so the
+        // dispatch stays uniform and `threadgroup_position_in_grid.y` is the channel.
+        let w = mtl::group_width(&p, self.len);
+        encoder.dispatch_threads(
+            MTLSize { width: w, height: self.channels, depth: 1 },
+            MTLSize { width: w, height: 1, depth: 1 },
+        );
+        drop(encoder);
+
+        Ok((
+            MetalStorage::new(dst, device.clone(), 2 * self.channels, DType::F32),
+            (2, self.channels).into(),
+        ))
+    }
+}
+
+/// Mean and variance per channel in one read, returned as `[2, C]`.
+///
+/// Replaces `mean_keepdim` + [`sub_sqr`] + `mean_keepdim`, which is three passes over the
+/// signal and one full-size intermediate.
+pub fn moments(x: &Tensor) -> Result<Tensor> {
+    let (b, c, len) = x.dims3()?;
+    if b != 1 {
+        candle_core::bail!("channel_moments: batch must be 1, got {b}");
+    }
+    x.contiguous()?.apply_op1_no_bwd(&Moments { channels: c, len })
+}
+
+/// [`adain_apply`] with SnakeBeta folded into its epilogue.
+struct AdainSnake {
+    channels: usize,
+    len: usize,
+    eps: f32,
+}
+
+impl candle_core::CustomOp2 for AdainSnake {
+    fn name(&self) -> &'static str {
+        "adain_snake"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        let (x, p) = match (s1, s2) {
+            (CpuStorage::F32(x), CpuStorage::F32(p)) => (x, p),
+            _ => candle_core::bail!("adain_snake: only f32"),
+        };
+        if !l1.is_contiguous() || !l2.is_contiguous() {
+            candle_core::bail!("adain_snake: inputs must be contiguous");
+        }
+        let (o1, o2, c) = (l1.start_offset(), l2.start_offset(), self.channels);
+        let mut dst = vec![0f32; c * self.len];
+        for ch in 0..c {
+            let at = |row: usize| p[o2 + row * c + ch];
+            let (mean, var, gamma, beta, alpha, brecip) =
+                (at(0), at(1), at(2), at(3), at(4), at(5));
+            let scale = 1.0 / (var + self.eps).sqrt() * (gamma + 1.0);
+            for l in 0..self.len {
+                let y = (x[o1 + ch * self.len + l] - mean) * scale + beta;
+                let sn = (alpha * y).sin();
+                dst[ch * self.len + l] = y + brecip * sn * sn;
+            }
+        }
+        Ok((CpuStorage::F32(dst), (1, c, self.len).into()))
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &candle_core::MetalStorage,
+        l1: &Layout,
+        s2: &candle_core::MetalStorage,
+        l2: &Layout,
+    ) -> Result<(candle_core::MetalStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::{DType, MetalStorage};
+        use objc2_metal::{MTLResourceUsage, MTLSize};
+
+        for l in [l1, l2] {
+            if !l.is_contiguous() {
+                candle_core::bail!("adain_snake: inputs must be contiguous");
+            }
+        }
+        for s in [s1, s2] {
+            if s.dtype() != DType::F32 {
+                candle_core::bail!("adain_snake: only f32");
+            }
+        }
+        let n = self.channels * self.len;
+        let device = s1.device();
+        let p = mtl::pipeline(device, "adain_snake_f32")?;
+        let dst = device.new_buffer(n, DType::F32, "adain_snake")?;
+
+        let encoder = device.command_encoder()?;
+        encoder.set_label("tts_nn::adain_snake");
+        encoder.set_compute_pipeline_state(&p);
+        for (i, (s, l)) in [(s1, l1), (s2, l2)].iter().enumerate() {
+            encoder.set_buffer(i, Some(s.buffer()), l.start_offset() * 4);
+            encoder.use_resource(s.buffer(), MTLResourceUsage::Read);
+        }
+        encoder.set_buffer(2, Some(dst.as_ref()), 0);
+        encoder.set_bytes(3, &(self.len as u32));
+        encoder.set_bytes(4, &(self.channels as u32));
+        encoder.set_bytes(5, &self.eps);
+        encoder.use_resource(dst.as_ref(), MTLResourceUsage::Write);
+        let w = mtl::group_width(&p, self.len);
+        encoder.dispatch_threads(
+            MTLSize { width: self.len, height: self.channels, depth: 1 },
+            MTLSize { width: w, height: 1, depth: 1 },
+        );
+        drop(encoder);
+
+        Ok((
+            MetalStorage::new(dst, device.clone(), n, DType::F32),
+            (1, self.channels, self.len).into(),
+        ))
+    }
+}
+
+/// [`adain_apply`] followed by [`snake_beta`], in one pass.
+///
+/// The generator's residual blocks never do one without the other, and separately they
+/// read and write the whole signal twice.
+#[allow(clippy::too_many_arguments)]
+pub fn adain_snake(
+    x: &Tensor,
+    mean: &Tensor,
+    var: &Tensor,
+    gamma: &Tensor,
+    beta: &Tensor,
+    alpha: &Tensor,
+    beta_recip: &Tensor,
+    eps: f64,
+) -> Result<Tensor> {
+    let (b, c, len) = x.dims3()?;
+    let parts = [mean, var, gamma, beta, alpha, beta_recip];
+    let flat = |t: &Tensor| -> Result<Tensor> {
+        if t.elem_count() != c {
+            candle_core::bail!("adain_snake: parameter has wrong size");
+        }
+        t.flatten_all()?.contiguous()
+    };
+    if b == 1 && x.device().is_metal() && parts.iter().all(|t| t.elem_count() == c) {
+        let packed = Tensor::stack(
+            &parts.iter().map(|t| flat(t)).collect::<Result<Vec<_>>>()?,
+            0,
+        )?;
+        let op = AdainSnake { channels: c, len, eps: eps as f32 };
+        return x
+            .contiguous()?
+            .apply_op2_no_bwd(&packed, &op);
+    }
+    let y = adain_apply(x, mean, var, gamma, beta, eps)?;
+    snake_beta(&y, &alpha.reshape((1, c, 1))?, &beta_recip.reshape((1, c, 1))?)
+}
+
+/// An LSTM step's gates, cell update and output, in one pass.
+struct LstmGates {
+    hidden: usize,
+}
+
+impl candle_core::CustomOp3 for LstmGates {
+    fn name(&self) -> &'static str {
+        "lstm_gates"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+        s3: &CpuStorage,
+        l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        let (g, p, c) = match (s1, s2, s3) {
+            (CpuStorage::F32(g), CpuStorage::F32(p), CpuStorage::F32(c)) => (g, p, c),
+            _ => candle_core::bail!("lstm_gates: only f32"),
+        };
+        let (o1, o2, o3, h) = (
+            l1.start_offset(),
+            l2.start_offset(),
+            l3.start_offset(),
+            self.hidden,
+        );
+        let sig = |v: f32| 1.0 / (1.0 + (-v).exp());
+        let mut dst = vec![0f32; 2 * h];
+        for j in 0..h {
+            let gate = |n: usize| g[o1 + n * h + j] + p[o2 + n * h + j];
+            let ct = sig(gate(1)) * c[o3 + j] + sig(gate(0)) * gate(2).tanh();
+            dst[h + j] = ct;
+            dst[j] = sig(gate(3)) * ct.tanh();
+        }
+        Ok((CpuStorage::F32(dst), (2, h).into()))
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &candle_core::MetalStorage,
+        l1: &Layout,
+        s2: &candle_core::MetalStorage,
+        l2: &Layout,
+        s3: &candle_core::MetalStorage,
+        l3: &Layout,
+    ) -> Result<(candle_core::MetalStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::{DType, MetalStorage};
+        use objc2_metal::{MTLResourceUsage, MTLSize};
+
+        for l in [l1, l2, l3] {
+            if !l.is_contiguous() {
+                candle_core::bail!("lstm_gates: inputs must be contiguous");
+            }
+        }
+        for s in [s1, s2, s3] {
+            if s.dtype() != DType::F32 {
+                candle_core::bail!("lstm_gates: only f32");
+            }
+        }
+        let device = s1.device();
+        let p = mtl::pipeline(device, "lstm_gates_f32")?;
+        let dst = device.new_buffer(2 * self.hidden, DType::F32, "lstm_gates")?;
+
+        let encoder = device.command_encoder()?;
+        encoder.set_label("tts_nn::lstm_gates");
+        encoder.set_compute_pipeline_state(&p);
+        for (i, (s, l)) in [(s1, l1), (s2, l2), (s3, l3)].iter().enumerate() {
+            encoder.set_buffer(i, Some(s.buffer()), l.start_offset() * 4);
+            encoder.use_resource(s.buffer(), MTLResourceUsage::Read);
+        }
+        encoder.set_buffer(3, Some(dst.as_ref()), 0);
+        encoder.set_bytes(4, &(self.hidden as u32));
+        encoder.use_resource(dst.as_ref(), MTLResourceUsage::Write);
+        let w = mtl::group_width(&p, self.hidden);
+        encoder.dispatch_threads(
+            MTLSize { width: self.hidden, height: 1, depth: 1 },
+            MTLSize { width: w, height: 1, depth: 1 },
+        );
+        drop(encoder);
+
+        Ok((
+            MetalStorage::new(dst, device.clone(), 2 * self.hidden, DType::F32),
+            (2, self.hidden).into(),
+        ))
+    }
+}
+
+/// One LSTM timestep after its two matmuls: `gates` is `h @ w_hh`, `pre` the input
+/// projection's row with both biases folded in, `c` the cell state. Returns `[2, hidden]`
+/// — the new h on row 0, the new c on row 1 — so the next step's matmul reads a row of it
+/// with no copy.
+pub fn lstm_gates(gates: &Tensor, pre: &Tensor, c: &Tensor) -> Result<Tensor> {
+    let hidden = c.elem_count();
+    if gates.elem_count() != 4 * hidden || pre.elem_count() != 4 * hidden {
+        candle_core::bail!("lstm_gates: gate vectors must be 4 x hidden");
+    }
+    gates
+        .contiguous()?
+        .apply_op3_no_bwd(&pre.contiguous()?, &c.contiguous()?, &LstmGates { hidden })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use candle_core::Device;
+
+    /// The fused step against the composed one, on every device. A `[2, hidden]` result
+    /// whose rows are read back as the next step's inputs is easy to get subtly wrong.
+    #[test]
+    fn lstm_gates_matches_composed() -> anyhow::Result<()> {
+        #[cfg(feature = "metal")]
+        let _gpu = crate::gpu_guard();
+        #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
+        let mut devices = vec![Device::Cpu];
+        if let Some(m) = crate::usable_metal() {
+            devices.push(m);
+        }
+        for d in devices {
+            for h in [3usize, 64, 256] {
+                let g = Tensor::randn(0f32, 1., (1, 4 * h), &d)?;
+                let p = Tensor::randn(0f32, 1., (1, 4 * h), &d)?;
+                let c = Tensor::randn(0f32, 1., (1, h), &d)?;
+                let z = (&g + &p)?;
+                let it = candle_nn::ops::sigmoid(&z.narrow(1, 0, h)?)?;
+                let ft = candle_nn::ops::sigmoid(&z.narrow(1, h, h)?)?;
+                let gt = z.narrow(1, 2 * h, h)?.tanh()?;
+                let ot = candle_nn::ops::sigmoid(&z.narrow(1, 3 * h, h)?)?;
+                let cw = ((ft * &c)? + (it * gt)?)?;
+                let hw = (ot * cw.tanh()?)?;
+                let got = lstm_gates(&g, &p, &c)?;
+                for (i, want) in [hw, cw].iter().enumerate() {
+                    let (abs, rel) =
+                        crate::abs_and_rel(&got.narrow(0, i, 1)?.reshape((1, h))?, want)?;
+                    assert!(rel < 1e-6, "row {i} {d:?} h={h}: abs {abs:.3e} rel {rel:.3e}");
+                }
+                // Offset inputs: every step after the first feeds narrowed rows in.
+                let stacked = Tensor::cat(&[&c, &c.affine(2.0, 1.0)?], 0)?;
+                let got = lstm_gates(&g, &p, &stacked.narrow(0, 1, 1)?)?;
+                let want = lstm_gates(&g, &p, &stacked.narrow(0, 1, 1)?.contiguous()?)?;
+                let (abs, rel) = crate::abs_and_rel(&got, &want)?;
+                assert!(rel < 1e-6, "offset {d:?} h={h}: abs {abs:.3e} rel {rel:.3e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// The step kernel against a double-precision host reference, across the whole input
+    /// range, to a couple of ulp.
+    ///
+    /// This is the one that matters, and it is deliberately not a comparison against
+    /// candle's composed form: that agrees to 1e-7 whatever the kernel does, because the
+    /// two are equally wrong. Metal compiles with fast math by default, and a recurrence
+    /// multiplies its own rounding — with the fast `exp` and `tanh` this kernel matched
+    /// composed to 1e-7 for one step, had diverged to 4e-1 after sixty, moved Kokoro's
+    /// predicted durations and more than halved the length of the audio. Every fixture row
+    /// still passed, because the fixtures are 52 timesteps and saturate the gates.
+    #[test]
+    fn lstm_gates_is_accurate_to_double_precision() -> anyhow::Result<()> {
+        #[cfg(feature = "metal")]
+        let _gpu = crate::gpu_guard();
+        let Some(d) = crate::usable_metal() else {
+            return Ok(());
+        };
+        // A sweep, not noise: the gates have to be checked where they are neither
+        // saturated nor centred, which is where a fast transcendental costs the most.
+        let h = 256usize;
+        let span = |lo: f64, hi: f64| -> Vec<f32> {
+            (0..h).map(|j| (lo + (hi - lo) * j as f64 / (h - 1) as f64) as f32).collect()
+        };
+        let mut g = Vec::new();
+        for (lo, hi) in [(-12.0, 12.0), (-6.0, 6.0), (-3.0, 3.0), (-1.0, 1.0)] {
+            g.extend(span(lo, hi));
+        }
+        let p = vec![0f32; 4 * h];
+        let c: Vec<f32> = span(-2.0, 2.0);
+        let gt = Tensor::from_vec(g.clone(), (1, 4 * h), &d)?;
+        let pt = Tensor::from_vec(p, (1, 4 * h), &d)?;
+        let ct = Tensor::from_vec(c.clone(), (1, h), &d)?;
+        let got = lstm_gates(&gt, &pt, &ct)?.flatten_all()?.to_vec1::<f32>()?;
+
+        let sig = |v: f64| 1.0 / (1.0 + (-v).exp());
+        let (mut worst, mut at) = (0f64, 0usize);
+        for j in 0..h {
+            let gate = |n: usize| g[n * h + j] as f64;
+            let cw = sig(gate(1)) * c[j] as f64 + sig(gate(0)) * gate(2).tanh();
+            let hw = sig(gate(3)) * cw.tanh();
+            for (want, have) in [(hw, got[j] as f64), (cw, got[h + j] as f64)] {
+                let rel = (have - want).abs() / want.abs().max(1e-3);
+                if rel > worst {
+                    worst = rel;
+                    at = j;
+                }
+            }
+        }
+        assert!(worst < 1e-6, "worst relative error {worst:.3e} at channel {at}");
+        Ok(())
+    }
+
+    /// Sum-of-squares against candle's two-pass variance, at the generator's own shapes.
+    /// The bound is looser than the elementwise kernels': a raw second moment loses
+    /// digits the composed form keeps, and this records how many.
+    #[test]
+    fn moments_match_composed() -> anyhow::Result<()> {
+        #[cfg(feature = "metal")]
+        let _gpu = crate::gpu_guard();
+        #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
+        let mut devices = vec![Device::Cpu];
+        if let Some(m) = crate::usable_metal() {
+            devices.push(m);
+        }
+        for d in devices {
+            for (c, len) in [(7usize, 33usize), (256, 8040), (128, 48240)] {
+                let x = Tensor::randn(0f32, 2., (1, c, len), &d)?;
+                let mean = x.mean_keepdim(2)?;
+                let var = crate::fused::sub_sqr(&x, &mean)?.mean_keepdim(2)?;
+                let got = moments(&x)?;
+                for (i, want) in [mean, var].iter().enumerate() {
+                    let (abs, rel) = crate::abs_and_rel(
+                        &got.narrow(0, i, 1)?.reshape((1, c, 1))?,
+                        want,
+                    )?;
+                    assert!(
+                        rel < 1e-4,
+                        "moments[{i}] {d:?} at {c}x{len}: abs {abs:.3e} rel {rel:.3e}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// Against the composed form the kernels replace. Fused arithmetic is not required to
     /// be bit-identical — it skips intermediate rounding through memory — so this checks a
@@ -892,6 +1610,66 @@ mod tests {
                 assert!(
                     rel < 1e-5,
                     "{d:?} at {c}x{len}: abs {abs:.3e} rel {rel:.3e}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The AdaIN halves against their composed forms, at the generator's shapes.
+    /// `adain_apply` uses `rsqrt` where the composed form divides by a root, so
+    /// the bound is 1e-6 rather than bit equality; `sub_sqr` is exact.
+    #[test]
+    fn adain_forms_agree() -> anyhow::Result<()> {
+        #[cfg(feature = "metal")]
+        let _gpu = crate::gpu_guard();
+        #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
+        let mut devices = vec![Device::Cpu];
+        if let Some(m) = crate::usable_metal() {
+            devices.push(m);
+        }
+        for d in devices {
+            for (c, len) in [(7, 33), (256, 444), (128, 4440)] {
+                let x = Tensor::randn(0f32, 2., (1, c, len), &d)?;
+                let m = Tensor::randn(0f32, 1., c, &d)?;
+                let want = x.broadcast_sub(&m.reshape((1, c, 1))?)?.sqr()?;
+                let got = sub_sqr(&x, &m)?;
+                let (abs, rel) = crate::abs_and_rel(&want, &got)?;
+                assert!(
+                    rel < 1e-6,
+                    "sub_sqr {d:?} at {c}x{len}: abs {abs:.3e} rel {rel:.3e}"
+                );
+
+                let (mean, var, gamma, beta) = (
+                    Tensor::randn(0f32, 1., c, &d)?,
+                    Tensor::randn(0f32, 1., c, &d)?.sqr()?,
+                    Tensor::randn(0f32, 0.3, c, &d)?,
+                    Tensor::randn(0f32, 1., c, &d)?,
+                );
+                let r = |t: &Tensor| t.reshape((1, c, 1));
+                let want = x
+                    .broadcast_sub(&r(&mean)?)?
+                    .broadcast_div(&(r(&var)? + 1e-5)?.sqrt()?)?
+                    .broadcast_mul(&(r(&gamma)? + 1.0)?)?
+                    .broadcast_add(&r(&beta)?)?;
+                let got = adain_apply(&x, &mean, &var, &gamma, &beta, 1e-5)?;
+                let (abs, rel) = crate::abs_and_rel(&want, &got)?;
+                assert!(
+                    rel < 1e-6,
+                    "adain_apply {d:?} at {c}x{len}: abs {abs:.3e} rel {rel:.3e}"
+                );
+
+                let (alpha, brecip) = (
+                    Tensor::randn(0f32, 1., c, &d)?.abs()?,
+                    Tensor::randn(0f32, 1., c, &d)?.abs()?,
+                );
+                let want = snake_beta(&want, &r(&alpha)?, &r(&brecip)?)?;
+                let got =
+                    adain_snake(&x, &mean, &var, &gamma, &beta, &alpha, &brecip, 1e-5)?;
+                let (abs, rel) = crate::abs_and_rel(&want, &got)?;
+                assert!(
+                    rel < 1e-5,
+                    "adain_snake {d:?} at {c}x{len}: abs {abs:.3e} rel {rel:.3e}"
                 );
             }
         }

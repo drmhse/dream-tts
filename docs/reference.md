@@ -333,6 +333,77 @@ MPS service reaches ~0.76, which this beats by 5% rather than by 6×. And model 
 1.0–1.5 s for Audio8 including quantizing 417 M params, against 15–17 s for the PyTorch
 service's reload path.
 
+### Kokoro's decoder, and what is left in it
+
+A 10 s render on an M4 (canary 60 ms, so a cool machine) went **0.075 -> 0.038 RTF**. The
+decoder was 86% of it at the start and is 78% now.
+
+| | before | after |
+|---|---|---|
+| bert / duration / prosody / encoder | 110 ms | 87 ms |
+| stage 0 (256 ch @ 8040) | 126 ms | 88 ms |
+| stage 1 (128 ch @ 48240) | 323 ms | 165 ms |
+| pre-generator, excitation, iSTFT | 96 ms | 48 ms |
+| **total render** | **755 ms** | **385 ms** |
+
+Five changes, each measured with `tts-probe`'s `kokorogen` or `mpsconv` before being wired in.
+
+**1. MPSGraph for the generator's convolutions — the big one, worth 1.29x.** See
+`tts-nn`'s `mpsconv`. candle does not use MPSGraph at all, and MPSGraph's `convolution2D`
+does not build an im2col matrix: 1.7x on the shape that dominates. The `tapconv` note below
+is what pointed at it.
+
+**2. The centred conv stopped chunking (1.18x).** `TTS_GEMM_COL_BUDGET` was 64 M elements
+and stage 1's six `k=11` convolutions needed 67.9 M — they missed by 578 columns and split
+in two, and a split costs far more than its copies suggest: 15.3 ms against 10.3 ms whole.
+
+**3. `moments` and `adain_snake` (1.07x).** An AdaIN was `mean` + `sub_sqr` + `mean` + apply
+— three passes over the signal and a full-size intermediate for what one read can compute —
+and a SnakeBeta always follows it. At `128ch @ 48240`: 1.57 ms -> 0.54 and 1.61 -> 0.78,
+36 times per render.
+
+**4. The excitation overlaps the decoder (1.07x).** It is host-side and depends on nothing
+in the decode blocks, so it runs on another thread while they keep the GPU busy. It was
+26 ms of an idle device.
+
+**5. `lstm_gates` (1.08x).** Eleven dispatches per timestep became two, over ~3000 timesteps.
+Read the trap below before touching it.
+
+**The trap: a recurrence multiplies its kernel's rounding.** Metal compiles with fast math
+on by default. With the fast `exp` and `tanh`, `lstm_gates` matched the composed form to
+1e-7 over one step and had diverged to **4e-1 after sixty** — which moved the predicted
+durations and turned a 10.05 s render into 4.17 s. Every fixture row still passed: the
+fixtures are 50 phonemes, 52 timesteps, and at that length the gates saturate and the two
+paths agree bit-for-bit. Comparing against candle's composed form does not catch it either,
+because both are equally wrong. What catches it is checking the kernel against a
+double-precision host reference across the input range, to a couple of ulp —
+`lstm_gates_is_accurate_to_double_precision`. Any future recurrent kernel needs the same.
+
+**What did not work, so it is not worth retrying.** f16 GEMM is 1.10x at these shapes.
+Batching the three MRF kernels into one wider GEMM is 0.35x — exactly 3x the work, because
+the block is diagonal and `M = 128` is already wide enough. Low-rank factorisation of the
+generator's convolutions saves nothing: rank at 99% of the energy is 95% of full rank, so
+those weights are dense. And there is no per-utterance fixed cost to amortise by batching
+sentences — RTF is flat from 1.3 s of audio upward.
+
+**Writing the convolution by hand loses to MPS, and that is what pointed at MPSGraph.**
+The gather was a third of the generator's convolution time and every byte of it was written
+only to be read straight back, so a kernel staging the input tile in threadgroup memory
+should have won. Two of them, in `tts-nn`'s `tapconv` and timed by `kokorogen`: simdgroup
+matrices reached 0.73 TFLOP/s and a classical 128x128 register tile 0.40, against MPS's
+~3.0 on the same GEMM and an M4's ~4.3 peak. Widening the K block to cut barriers made the
+first *worse* — the staging buffer costs more occupancy than the barriers cost time — and
+the register tile spills 64 accumulators per thread. M3/M4 have no matrix unit in the GPU,
+so `simdgroup_multiply_accumulate` is a scheduled ALU sequence and Apple schedules it
+better. The right conclusion was not "tune harder" but "use more of Apple's code", which is
+change 1.
+
+**What is left.** The two transposed convolutions are 31 ms and still on `upconv`;
+MPSGraph has `convolutionTranspose2D` and the machinery is now in place. The MPSGraph calls
+each cost a commit and a wait, because candle does not expose its command buffer to encode
+into — with `encodeToCommandBuffer` the syncs would go. And `bert` is 27 ms of launch-bound
+attention over 170 tokens.
+
 ### How to measure without fooling yourself
 
 An M4 under sustained GPU load drifts **~2×**. This was caught by accident: `dilation.rs`
@@ -351,6 +422,31 @@ anything taken later.
 scale. Two further ways to get it wrong, both learned here: an **unsynchronised stage timer**
 once misattributed 13% of a pipeline to the wrong stage, and a **warm A/B loop cannot see
 first-touch allocation cost**.
+
+### Live GPU telemetry
+
+Two surfaces, both unprivileged. `powermetrics` needs root; these do not.
+
+`cargo run -p tts-probe --bin gpumon` samples the accelerator node's published
+`PerformanceStatistics` at 2 Hz (`--hz`, `--count`): device/renderer/tiler
+utilization plus allocated and in-use system memory. Run it beside a render to
+see whether the GPU stays fed — 0% idle against 97-100% under a Kokoro render
+on this M4, back to idle when the process exits. The counters update about once
+a second, so this is a duty-cycle check, not a kernel profiler.
+
+`kokoro-render` (and any engine wired to `tts_nn::stats`) prints a `matmul` line
+with the render: counted dense-GEMM FLOPs and bytes over wall time. Coverage is
+the dense matmuls only — direct convs, attention scores and elementwise passes
+are not counted — so the GB/s reads low against the ~120 GB/s bus by
+construction. What it answers is whether the GEMM shapes are near this
+backend's ~2.4 TFLOP/s: Kokoro's decoder reports ~0.7 TFLOP/s over the whole
+synthesis, i.e. the GEMMs are fine and the time is in elementwise passes and
+dispatch, which is what the next optimization has to attack.
+
+There is no unprivileged system-DRAM GB/s on macOS — only residency and
+utilization are published; byte counters need `powermetrics --samplers
+bandwidth` as root. Per-kernel GB/s stays in `tts-probe` microbenchmarks, where
+the traffic is exact rather than sampled.
 
 ### Memory, and quantization quality
 

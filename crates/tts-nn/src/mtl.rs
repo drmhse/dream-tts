@@ -26,7 +26,8 @@ using namespace metal;
 // ---- im2col ------------------------------------------------------------------
 //
 // dst[(t * cin + c) * l_in + l] = src[c * l_in + l + t * dilation - pad], or 0 when the
-// tap reaches before the start of the signal.
+// tap reaches past either edge of the signal. `pad` is the left context; causal
+// callers pass (k-1)*dilation, for which the upper bound never fires.
 //
 // The indices arrive as grid coordinates, so there is not a single division in the body.
 // candle's own im2col recovers four indices from a linear thread id with three size_t
@@ -47,7 +48,8 @@ kernel void im2col_tap_major_f32(
     const uint t = gid.z;
 
     const uint s = l + t * dil;
-    dst[(t * cin + c) * l_in + l] = (s < pad) ? 0.0f : src[c * l_in + (s - pad)];
+    dst[(t * cin + c) * l_in + l] =
+        (s < pad || s >= pad + l_in) ? 0.0f : src[c * l_in + (s - pad)];
 }
 
 // ---- head transpose ------------------------------------------------------------
@@ -185,6 +187,346 @@ kernel void snake_beta_f32(
     const float x = src[i];
     const float s = sin(alpha[c] * x);
     dst[i] = x + brecip[c] * s * s;
+}
+
+// ---- adain halves --------------------------------------------------------------
+//
+// Instance norm plus style scale and shift, in two passes instead of ten. The
+// disease is the same one `snake_alpha` names: every `broadcast_*` against a
+// `[1, C, 1]` parameter runs ~5x slower than a plain op, and one AdaIN contains
+// four of them plus a division. `sub_sqr` fuses the centred square the variance
+// needs; `adain_apply` fuses normalise, scale and shift with direct per-channel
+// indexing. The two reductions stay candle's — its `mean` is already at full
+// bandwidth, and reimplementing a reduction risks its numerics for no traffic
+// saved.
+kernel void sub_sqr_f32(
+    device const float *src [[buffer(0)]],
+    device const float *m   [[buffer(1)]],
+    device float       *dst [[buffer(2)]],
+    constant uint      &len [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint l = gid.x;
+    if (l >= len) { return; }
+    const uint c = gid.y;
+
+    const float d = src[c * len + l] - m[c];
+    dst[c * len + l] = d * d;
+}
+
+// out = (x - mean) * rsqrt(var + eps) * (gamma + 1) + beta, per channel.
+// `prm` packs the four `[C]` vectors as mean, var, gamma, beta.
+kernel void adain_apply_f32(
+    device const float *src [[buffer(0)]],
+    device const float *prm [[buffer(1)]],
+    device float       *dst [[buffer(2)]],
+    constant uint      &len [[buffer(3)]],
+    constant uint      &chn [[buffer(4)]],
+    constant float     &eps [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint l = gid.x;
+    if (l >= len) { return; }
+    const uint c = gid.y;
+
+    const float mean = prm[c];
+    const float var = prm[chn + c];
+    const float gamma = prm[2u * chn + c];
+    const float beta = prm[3u * chn + c];
+    const uint i = c * len + l;
+    dst[i] = (src[i] - mean) * rsqrt(var + eps) * (gamma + 1.0f) + beta;
+}
+
+// Per-channel mean and variance in one read of the signal, written as [2, C].
+//
+// candle's `mean` is one dispatch per reduction and AdaIN needs two of them with a
+// materialised `(x-m)^2` in between: three passes over 24 MB where the data only has to
+// be read once. One threadgroup per channel, sum and sum-of-squares together.
+//
+// Squares are accumulated raw rather than by Welford. Every input here is a convolution
+// output whose mean is small against its spread, so the cancellation Welford defends
+// against does not arise; `moments_match_composed` bounds what it costs.
+kernel void channel_moments_f32(
+    device const float *src  [[buffer(0)]],
+    device float       *dst  [[buffer(1)]],
+    constant uint      &len  [[buffer(2)]],
+    constant uint      &chn  [[buffer(3)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tid3 [[thread_position_in_threadgroup]],
+    uint3 ntid3 [[threads_per_threadgroup]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  slid [[thread_index_in_simdgroup]],
+    uint  nsg  [[simdgroups_per_threadgroup]])
+{
+    threadgroup float psum[32];
+    threadgroup float psq[32];
+
+    const uint tid = tid3.x;
+    const uint ntid = ntid3.x;
+    const uint c = tgid.y;
+    device const float *row = src + (ulong)c * len;
+    float s = 0.0f;
+    float q = 0.0f;
+    for (uint i = tid; i < len; i += ntid) {
+        const float v = row[i];
+        s += v;
+        q += v * v;
+    }
+    s = simd_sum(s);
+    q = simd_sum(q);
+    if (slid == 0) { psum[sgid] = s; psq[sgid] = q; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgid != 0) { return; }
+    s = simd_sum(slid < nsg ? psum[slid] : 0.0f);
+    q = simd_sum(slid < nsg ? psq[slid] : 0.0f);
+    if (slid != 0) { return; }
+    const float m = s / (float)len;
+    dst[c] = m;
+    dst[chn + c] = max(q / (float)len - m * m, 0.0f);
+}
+
+// AdaIN's tail and SnakeBeta in one pass: the two always appear together in the
+// generator's residual blocks, and separately they read and write the signal twice.
+// `prm` packs six [C] vectors: mean, var, gamma, beta, alpha, beta_recip.
+kernel void adain_snake_f32(
+    device const float *src [[buffer(0)]],
+    device const float *prm [[buffer(1)]],
+    device float       *dst [[buffer(2)]],
+    constant uint      &len [[buffer(3)]],
+    constant uint      &chn [[buffer(4)]],
+    constant float     &eps [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint l = gid.x;
+    if (l >= len) { return; }
+    const uint c = gid.y;
+
+    const float mean = prm[c];
+    const float var = prm[chn + c];
+    const float gamma = prm[2u * chn + c];
+    const float beta = prm[3u * chn + c];
+    const float alpha = prm[4u * chn + c];
+    const float brecip = prm[5u * chn + c];
+    const uint i = c * len + l;
+    const float y = (src[i] - mean) * rsqrt(var + eps) * (gamma + 1.0f) + beta;
+    const float sn = sin(alpha * y);
+    dst[i] = y + brecip * sn * sn;
+}
+
+// ---- convolution without the im2col matrix -------------------------------------
+//
+// The gather is a third of the generator's convolution time and every byte of it is
+// written only to be read straight back: 271 MB for one `k=11, 128ch @ 48240` tap-major
+// matrix. This computes the same GEMM with the tap window read from `x` into threadgroup
+// memory instead, so the matrix never exists.
+//
+// The tile is the whole of M. That is the point: with 128 output channels one threadgroup
+// row covers them all, so the input is read once rather than once per M-tile, and the
+// weight — 720 KB at the widest — is small enough to stay in cache across the N tiles.
+//
+// A K step of 8 never straddles two taps, because `cin` is a multiple of 8 on every conv
+// routed here. So the tap index is computed once per step, not once per element, and the
+// gather is a plain strided read.
+//
+// 8 simdgroups as 4 (M) x 2 (N), each holding a 32x32 accumulator block: a 128x64 tile
+// per threadgroup.
+kernel void conv1d_tap_gemm_f32(
+    device const float *x    [[buffer(0)]],
+    device const float *w    [[buffer(1)]],
+    device const float *bias [[buffer(2)]],
+    device float       *dst  [[buffer(3)]],
+    constant uint      &len  [[buffer(4)]],
+    constant uint      &cin  [[buffer(5)]],
+    constant uint      &cout [[buffer(6)]],
+    constant uint      &kk   [[buffer(7)]],
+    constant uint      &dil  [[buffer(8)]],
+    constant uint      &pad  [[buffer(9)]],
+    constant uint      &usebias [[buffer(10)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tid3 [[thread_position_in_threadgroup]],
+    uint  sg   [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+    const uint NT = 64;
+    threadgroup float Bs[8][NT];
+    threadgroup float Tail[8][8][8];
+
+    const uint tid = tid3.x;
+    const uint K = kk * cin;
+    const uint n_tile = tgid.x * NT;
+    const uint m_base = tgid.y * 128 + (sg >> 1) * 32;
+    const uint n_base = n_tile + (sg & 1) * 32;
+
+    // The bias enters as the accumulator's starting value: a stride of 0 with the
+    // transpose flag makes every column of the fragment the same [8] slice of `bias`.
+    // The alternative is a scratch tile per simdgroup, and that much threadgroup memory
+    // costs more occupancy than the epilogue is worth.
+    simdgroup_float8x8 acc[4][4];
+    for (uint i = 0; i < 4; ++i) {
+        simdgroup_float8x8 seed = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        if (usebias) { simdgroup_load(seed, bias + m_base + i * 8, 0, ulong2(0, 0), true); }
+        for (uint j = 0; j < 4; ++j) { acc[i][j] = seed; }
+    }
+
+    for (uint k0 = 0; k0 < K; k0 += 8) {
+        const uint t = k0 / cin;
+        const uint c0 = k0 - t * cin;
+        const int shift = int(t * dil) - int(pad);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < 8 * NT; idx += 256) {
+            const uint r = idx >> 6;
+            const uint n = idx & 63;
+            const int sp = int(n_tile + n) + shift;
+            Bs[r][n] = (sp >= 0 && sp < int(len)) ? x[(c0 + r) * len + uint(sp)] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 A[4], B[4];
+        for (uint i = 0; i < 4; ++i) { simdgroup_load(A[i], w + (m_base + i * 8) * K + k0, K); }
+        for (uint j = 0; j < 4; ++j) { simdgroup_load(B[j], &Bs[0][(sg & 1) * 32 + j * 8], NT); }
+        for (uint i = 0; i < 4; ++i) {
+            for (uint j = 0; j < 4; ++j) {
+                simdgroup_multiply_accumulate(acc[i][j], A[i], B[j], acc[i][j]);
+            }
+        }
+    }
+
+    for (uint i = 0; i < 4; ++i) {
+        for (uint j = 0; j < 4; ++j) {
+            const uint n0 = n_base + j * 8;
+            if (n0 + 8 <= len) {
+                simdgroup_store(acc[i][j], dst + (m_base + i * 8) * len + n0, len);
+            } else if (n0 < len) {
+                // The last tile of a length that is not a multiple of 8, through scratch
+                // so the store stays inside the row.
+                simdgroup_store(acc[i][j], &Tail[sg][0][0], 8);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint e = lane; e < 64; e += 32) {
+                    const uint r = e >> 3;
+                    const uint col = e & 7;
+                    if (n0 + col < len) {
+                        dst[(m_base + i * 8 + r) * len + n0 + col] = Tail[sg][r][col];
+                    }
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+    }
+}
+
+// The same convolution with a register tile instead of simdgroup matrices.
+//
+// M3/M4 have no matrix unit in the GPU: `simdgroup_multiply_accumulate` is a scheduled
+// ALU sequence, and the first version of this kernel reached 0.73 TFLOP/s against MPS's
+// 3.0 on the same GEMM. This is the classical shape instead — 128x128 tile, 8x8 outputs
+// per thread, A staged transposed so each thread's eight rows are contiguous.
+kernel void conv1d_tap_reg_f32(
+    device const float *x    [[buffer(0)]],
+    device const float *w    [[buffer(1)]],
+    device const float *bias [[buffer(2)]],
+    device float       *dst  [[buffer(3)]],
+    constant uint      &len  [[buffer(4)]],
+    constant uint      &cin  [[buffer(5)]],
+    constant uint      &cout [[buffer(6)]],
+    constant uint      &kk   [[buffer(7)]],
+    constant uint      &dil  [[buffer(8)]],
+    constant uint      &pad  [[buffer(9)]],
+    constant uint      &usebias [[buffer(10)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tid3 [[thread_position_in_threadgroup]])
+{
+    const uint BM = 128, BN = 128, BK = 8;
+    threadgroup float As[BK][BM];
+    threadgroup float Bs[BK][BN];
+
+    const uint tid = tid3.x;
+    const uint K = kk * cin;
+    const uint n_tile = tgid.x * BN;
+    const uint m_tile = tgid.y * BM;
+    const uint ty = tid >> 4;          // 16 x 16 threads, 8 x 8 outputs each
+    const uint tx = tid & 15;
+    const uint m0 = m_tile + ty * 8;
+    const uint n0 = n_tile + tx * 8;
+
+    float acc[8][8];
+    for (uint i = 0; i < 8; ++i) {
+        const float b = usebias ? bias[m0 + i] : 0.0f;
+        for (uint j = 0; j < 8; ++j) { acc[i][j] = b; }
+    }
+
+    // Staging assignments, fixed for the whole loop: A by (m, k) with k fast so each
+    // group of eight lanes reads one 32-byte run of a weight row; B by (k, n) with n
+    // fast, which is the axis `x` is contiguous in.
+    const uint am = tid >> 3, ak = tid & 7;
+    const uint bk = tid >> 7, bn = tid & 127;
+
+    for (uint k0 = 0; k0 < K; k0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < 4; ++r) {
+            const uint m = am + r * 32;
+            As[ak][m] = w[(m_tile + m) * K + k0 + ak];
+        }
+        for (uint r = 0; r < 4; ++r) {
+            const uint kr = bk + r * 2;
+            const uint row = k0 + kr;
+            const uint t = row / cin;
+            const int sp = int(n_tile + bn) + int(t * dil) - int(pad);
+            Bs[kr][bn] = (sp >= 0 && sp < int(len)) ? x[(row - t * cin) * len + uint(sp)] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kb = 0; kb < BK; ++kb) {
+            float a[8], b[8];
+            for (uint i = 0; i < 8; ++i) { a[i] = As[kb][ty * 8 + i]; }
+            for (uint j = 0; j < 8; ++j) { b[j] = Bs[kb][tx * 8 + j]; }
+            for (uint i = 0; i < 8; ++i) {
+                for (uint j = 0; j < 8; ++j) { acc[i][j] = fma(a[i], b[j], acc[i][j]); }
+            }
+        }
+    }
+
+    for (uint i = 0; i < 8; ++i) {
+        device float *row = dst + (m0 + i) * len;
+        for (uint j = 0; j < 8; ++j) {
+            if (n0 + j < len) { row[n0 + j] = acc[i][j]; }
+        }
+    }
+}
+
+// ---- LSTM gates ----------------------------------------------------------------
+//
+// The whole of an LSTM step except its two matmuls. candle spends eleven dispatches per
+// timestep on this — four sigmoids and a tanh, each narrowed out of the gate vector, then
+// the cell update — and a prosody LSTM runs ~3000 timesteps, so the dispatches cost more
+// than the arithmetic by a wide margin.
+//
+// `gates` is the recurrent term `h @ w_hh`, `pre` the row of the input projection with
+// both biases already folded in. Output is `[2, hidden]`: the new h, then the new c.
+kernel void lstm_gates_f32(
+    device const float *gates [[buffer(0)]],
+    device const float *pre   [[buffer(1)]],
+    device const float *c_in  [[buffer(2)]],
+    device float       *dst   [[buffer(3)]],
+    constant uint      &hidden [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= hidden) { return; }
+    const uint h = hidden;
+    // torch's gate order is input, forget, cell, output.
+    const float gi = gates[gid] + pre[gid];
+    const float gf = gates[h + gid] + pre[h + gid];
+    const float gg = gates[2u * h + gid] + pre[2u * h + gid];
+    const float go = gates[3u * h + gid] + pre[3u * h + gid];
+    // `precise::`, not the default. Metal compiles with fast math on, and a recurrent
+    // net multiplies its own rounding: with the fast `exp` and `tanh` this kernel matched
+    // the composed form to 1e-7 for one step and to 4e-1 after sixty, which moved the
+    // predicted durations and changed the length of the audio.
+    const float it = 1.0f / (1.0f + metal::precise::exp(-gi));
+    const float ft = 1.0f / (1.0f + metal::precise::exp(-gf));
+    const float ot = 1.0f / (1.0f + metal::precise::exp(-go));
+    const float ct = ft * c_in[gid] + it * metal::precise::tanh(gg);
+    dst[h + gid] = ct;
+    dst[gid] = ot * metal::precise::tanh(ct);
 }
 
 // ---- decode attention ----------------------------------------------------------
@@ -563,6 +905,105 @@ kernel void swiglu_mul_f32(
     if (gid >= n) { return; }
     const float x = g[gid];
     dst[gid] = (x / (1.0f + exp(-x))) * u[gid];
+}
+
+// ---- short-time Fourier pair ----------------------------------------------------
+//
+// torch.stft / torch.istft with a periodic Hann window, reflect padding and a small
+// hop, as one dispatch each. The CPU pair costs tens of milliseconds per utterance
+// in trig calls alone — tens of millions of per-tap sin/cos/atan2 — while the
+// arithmetic is a 20-point DFT begging for tables. The tables hold the pure DFT
+// exponentials; windowing, the conjugate-pair weight and the 1/n stay runtime
+// multiplies in the reference's order, so the only numeric distance is
+// libm-vs-Metal trig (~1 ulp each).
+//
+// Forward layout matches the CPU code: mag rows then phase rows in one
+// `[2 * bins, frames]` buffer.
+kernel void stft_forward_f32(
+    device const float *x   [[buffer(0)]],
+    device const float *tre [[buffer(1)]],
+    device const float *tim [[buffer(2)]],
+    device const float *win [[buffer(3)]],
+    device float       *dst [[buffer(4)]],
+    constant uint      &len    [[buffer(5)]],
+    constant uint      &frames [[buffer(6)]],
+    constant uint      &n_fft  [[buffer(7)]],
+    constant uint      &hop    [[buffer(8)]],
+    constant uint      &pad    [[buffer(9)]],
+    constant uint      &bins   [[buffer(10)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint f = gid.x;
+    if (f >= frames) { return; }
+    const uint k = gid.y;
+    if (k >= bins) { return; }
+
+    float re = 0.0f;
+    float im = 0.0f;
+    const uint base = f * hop;
+    const uint trow = k * n_fft;
+    for (uint nn = 0; nn < n_fft; ++nn) {
+        const uint j = base + nn;
+        float s;
+        if (j < pad) {
+            s = x[pad - j];
+        } else if (j < pad + len) {
+            s = x[j - pad];
+        } else {
+            s = x[2u * len + pad - 2u - j];
+        }
+        const float v = s * win[nn];
+        re += v * tre[trow + nn];
+        im += v * tim[trow + nn];
+    }
+    dst[k * frames + f] = sqrt(re * re + im * im);
+    dst[(bins + k) * frames + f] = atan2(im, re);
+}
+
+// Overlap-add back to a waveform: out[t] for t in 0..(frames-1)*hop, one thread
+// each, gathering its covering frames. No races, no envelope array — the
+// envelope is signal-independent, so each thread rebuilds its own few terms.
+// `tc`/`ts` fold cos/sin(2πkn/n), the conjugate-pair weight and 1/n_fft.
+kernel void stft_inverse_f32(
+    device const float *mag   [[buffer(0)]],
+    device const float *phase [[buffer(1)]],
+    device const float *tc    [[buffer(2)]],
+    device const float *ts    [[buffer(3)]],
+    device const float *win   [[buffer(4)]],
+    device float       *dst   [[buffer(5)]],
+    constant uint      &out_len [[buffer(6)]],
+    constant uint      &frames  [[buffer(7)]],
+    constant uint      &bins    [[buffer(8)]],
+    constant uint      &n_fft   [[buffer(9)]],
+    constant uint      &hop     [[buffer(10)]],
+    constant uint      &pad     [[buffer(11)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const uint t = gid;
+    if (t >= out_len) { return; }
+    const uint g = pad + t;
+    // Covering frames: f*hop <= g < f*hop + n_fft.
+    uint f_lo = (g < n_fft) ? 0u : (g - n_fft + hop) / hop;
+    uint f_hi = g / hop;
+    if (f_hi >= frames) { f_hi = frames - 1u; }
+    float acc = 0.0f;
+    float env = 0.0f;
+    for (uint f = f_lo; f <= f_hi; ++f) {
+        const uint nn = g - f * hop;
+        float v = 0.0f;
+        for (uint k = 0; k < bins; ++k) {
+            const float m = mag[k * frames + f];
+            const float p = phase[k * frames + f];
+            const uint ti = k * n_fft + nn;
+            float cp;
+            const float sp = sincos(p, cp);
+            v += m * (cp * tc[ti] - sp * ts[ti]);
+        }
+        const float w = win[nn];
+        acc += v * w;
+        env += w * w;
+    }
+    dst[t] = (env > 1e-11f) ? acc / env : 0.0f;
 }
 "#;
 

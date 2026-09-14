@@ -29,9 +29,14 @@ pub mod attn;
 pub mod fused;
 pub mod im2col;
 pub(crate) mod mtl;
+pub mod mpsconv;
 pub mod nlc;
 mod nlcconv;
 pub mod skinny;
+pub mod stats;
+pub mod stft;
+pub mod tapconv;
+pub mod upconv;
 
 use anyhow::{Context, Result};
 
@@ -194,6 +199,12 @@ impl Weights {
         self.len() == 0
     }
 
+    /// A tensor's shape without loading it: the safetensors header carries it, so an
+    /// inventory check runs before the weights are downloaded, let alone read.
+    pub fn file_shape(&self, name: &str) -> Option<Vec<usize>> {
+        self.file.get(name).ok().map(|v| v.shape().to_vec())
+    }
+
     /// Every tensor name, sorted — for inventory checks and error messages.
     pub fn names(&self) -> Vec<String> {
         let mut n: Vec<String> = self.file.tensors().into_iter().map(|(k, _)| k).collect();
@@ -287,6 +298,14 @@ pub fn matmul_2d(x: &Tensor, w_t: &Tensor) -> Result<Tensor> {
         x.contiguous()?.reshape((rows, k))?
     };
     let y = flat.matmul(w_t)?;
+    crate::stats::record(
+        rows,
+        k,
+        w_t.dim(1)?,
+        (rows * k * x.dtype().size_in_bytes()
+            + k * w_t.dim(1)? * w_t.dtype().size_in_bytes()
+            + y.elem_count() * y.dtype().size_in_bytes()) as u64,
+    );
     let mut shape = dims[..dims.len() - 1].to_vec();
     shape.push(w_t.dim(1)?);
     Ok(y.reshape(shape)?)
@@ -545,7 +564,7 @@ pub fn causal_conv1d_gemm(
     dilation: usize,
 ) -> Result<Tensor> {
     let (_, cin, len) = x.dims3()?;
-    let cols_per_chunk = (gemm_col_budget() / (k * cin)).max(1);
+    let cols_per_chunk = chunk_width(gemm_col_budget() / (k * cin), len);
     if cols_per_chunk < len {
         let pad = (k - 1) * dilation;
         let mut pieces = Vec::new();
@@ -554,13 +573,81 @@ pub fn causal_conv1d_gemm(
             let width = cols_per_chunk.min(len - start);
             let ctx = pad.min(start);
             let piece = x.narrow(2, start - ctx, ctx + width)?.contiguous()?;
-            let y = conv1d_gemm_whole(&piece, w_tap, b, k, dilation)?;
+            let y = conv1d_gemm_whole(&piece, w_tap, b, k, dilation, None)?;
             pieces.push(y.narrow(2, ctx, width)?);
             start += width;
         }
         return Ok(Tensor::cat(&pieces, 2)?);
     }
-    conv1d_gemm_whole(x, w_tap, b, k, dilation)
+    conv1d_gemm_whole(x, w_tap, b, k, dilation, None)
+}
+
+/// A centred (symmetric-padded) convolution as one GEMM per chunk.
+///
+/// `pad_left + pad_right == (k-1) * dilation`, and the output is the input
+/// length — no pre-pad in, no re-centring slice out. Chunking carries context
+/// on both sides; the gather's zero regions coincide with true out-of-range
+/// exactly as in the causal form, so chunked and whole agree bit-for-bit.
+pub fn centered_conv1d_gemm(
+    x: &Tensor,
+    w_tap: &Tensor,
+    b: Option<&Tensor>,
+    k: usize,
+    dilation: usize,
+    pad_left: usize,
+) -> Result<Tensor> {
+    let (_, cin, len) = x.dims3()?;
+    let cols_per_chunk = chunk_width(centered_col_budget() / (k * cin), len);
+    if cols_per_chunk < len {
+        let pad_right = (k - 1) * dilation - pad_left;
+        let mut pieces = Vec::new();
+        let mut start = 0;
+        while start < len {
+            let width = cols_per_chunk.min(len - start);
+            let ctx_l = pad_left.min(start);
+            let ctx_r = pad_right.min(len - (start + width));
+            let piece = x
+                .narrow(2, start - ctx_l, ctx_l + width + ctx_r)?
+                .contiguous()?;
+            let y = conv1d_gemm_whole(&piece, w_tap, b, k, dilation, Some(pad_left))?;
+            pieces.push(y.narrow(2, ctx_l, width)?);
+            start += width;
+        }
+        return Ok(Tensor::cat(&pieces, 2)?);
+    }
+    conv1d_gemm_whole(x, w_tap, b, k, dilation, Some(pad_left))
+}
+
+/// The same budget for the centred path, which only Kokoro uses.
+///
+/// Splitting costs far more than the copies suggest: at `128ch @ 48240, k=11` a two-way
+/// split is 15.3 ms against 10.3 ms whole, and the pieces are 72 MB. So the budget has to
+/// clear a whole sentence rather than sit just under one — 64 M elements missed 48240
+/// columns by 578. 128 M is 512 MB at the widest shape and covers everything short of the
+/// 510-token cap, which chunks in two.
+fn centered_col_budget() -> usize {
+    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("TTS_GEMM_COL_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(|m: usize| m << 20)
+            .unwrap_or(128 << 20)
+    })
+}
+
+/// Spread `len` over as few chunks as the budget allows, evenly.
+///
+/// Taking `budget` columns at a time and leaving the remainder is what a greedy split
+/// does, and at `128ch @ 48240, k=11` the remainder is 578 columns: a third im2col
+/// allocation, a GEMM too narrow to reach the pipe, and a `cat` — 6 ms on top of an
+/// 11.8 ms convolution. An even split has the same peak footprint and none of that.
+fn chunk_width(budget: usize, len: usize) -> usize {
+    let budget = budget.max(1);
+    if budget >= len {
+        return len;
+    }
+    len.div_ceil(len.div_ceil(budget))
 }
 
 /// im2col elements per chunk, so every allocation lands in one `next_power_of_two` class.
@@ -586,6 +673,7 @@ fn conv1d_gemm_whole(
     b: Option<&Tensor>,
     k: usize,
     dilation: usize,
+    center: Option<usize>,
 ) -> Result<Tensor> {
     let (batch, cin, len) = x.dims3()?;
     let out = w_tap.dim(0)?;
@@ -593,9 +681,16 @@ fn conv1d_gemm_whole(
     // axis would need a division to unpack — the codec never batches these, so it falls
     // back rather than paying for the general case.
     let cols = if batch == 1 && x.device().is_metal() {
-        im2col::im2col_tap_major(&x.contiguous()?, k, dilation)?
+        match center {
+            None => im2col::im2col_tap_major(&x.contiguous()?, k, dilation)?,
+            Some(pad_left) => im2col::im2col_centered(&x.contiguous()?, k, dilation, pad_left)?,
+        }
     } else {
-        let xpad = x.pad_with_zeros(2, (k - 1) * dilation, 0)?;
+        let (pad_left, pad_right) = match center {
+            None => ((k - 1) * dilation, 0),
+            Some(p) => (p, (k - 1) * dilation - p),
+        };
+        let xpad = x.pad_with_zeros(2, pad_left, pad_right)?;
         let mut taps = Vec::with_capacity(k);
         for t in 0..k {
             taps.push(xpad.narrow(2, t * dilation, len)?);
@@ -604,6 +699,12 @@ fn conv1d_gemm_whole(
         Tensor::cat(&taps, 0)?.reshape((k * cin, len))?
     };
     let y = w_tap.matmul(&cols)?.reshape((batch, out, len))?;
+    crate::stats::record(
+        out,
+        k * cin,
+        len,
+        (out * k * cin + k * cin * len + out * len) as u64 * 4,
+    );
     Ok(match b {
         Some(b) => y.broadcast_add(&b.reshape((1, out, 1))?)?,
         None => y,
@@ -985,6 +1086,47 @@ pub fn abs_and_rel(a: &Tensor, b: &Tensor) -> Result<(f32, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The centred GEMM route against candle's same-padded conv, on every
+    /// available device and at the generator's shapes. CPU exercises the
+    /// two-sided pad fallback; Metal the centred gather.
+    #[test]
+    fn centered_conv_matches_candle() -> anyhow::Result<()> {
+        #[cfg(feature = "metal")]
+        let _gpu = crate::gpu_guard();
+        #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
+        let mut devices = vec![Device::Cpu];
+        if let Some(m) = crate::usable_metal() {
+            devices.push(m);
+        }
+        for d in devices {
+            for (cout, cin, len, k, dil) in [
+                (8usize, 4usize, 15usize, 3usize, 1usize),
+                (8, 8, 64, 7, 3),
+                (4, 4, 65, 11, 5),
+                (128, 128, 444, 3, 1),
+            ] {
+                let pad = (k - 1) * dil / 2;
+                let x = Tensor::randn(0f32, 1., (1, cin, len), &d)?;
+                let w = Tensor::randn(0f32, 0.1, (cout, cin, k), &d)?;
+                let b = Tensor::randn(0f32, 1., cout, &d)?;
+                let want = x
+                    .conv1d(&w, pad, 1, dil, 1)?
+                    .broadcast_add(&b.reshape((1, cout, 1))?)?;
+                let w_tap = tap_major_weight(&w)?;
+                let got = centered_conv1d_gemm(&x, &w_tap, Some(&b), k, dil, pad)?;
+                let (abs, rel) = abs_and_rel(
+                    &got.to_device(&Device::Cpu)?,
+                    &want.to_device(&Device::Cpu)?,
+                )?;
+                assert!(
+                    rel < 1e-5,
+                    "{d:?} {cout}x{cin} l={len} k={k} d={dil}: abs {abs:.3e} rel {rel:.3e}"
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn weight_norm_folds_to_the_stored_direction_when_the_gain_is_its_norm() -> Result<()> {

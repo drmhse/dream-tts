@@ -28,18 +28,26 @@
 //! - **Tap-major output** `[k * cin, len]`, which is exactly
 //!   [`tap_major_weight`](crate::tap_major_weight)'s existing contract — so the GEMM stays
 //!   `w_tap @ cols -> [cout, len]` and no transpose is ever needed.
-//! - **The causal pad folded in.** Out-of-range taps write zero instead of reading, which
-//!   removes the `pad_with_zeros` copy the `cat` route paid on every call.
+//! - **The pads folded in.** Out-of-range taps write zero instead of reading: the
+//!   causal left-pad, and — for the centred entry point — the right edge too.
+//!   That removes the `pad_with_zeros` copy the `cat` route paid on every call,
+//!   and the centred form additionally removes the re-centring copy on the way
+//!   out.
 //!
 //! The op falls back to a plain CPU implementation off Metal, which is also what the unit
 //! tests check the GPU path against.
 
 use candle_core::{CpuStorage, CustomOp1, Layout, Result, Shape, Tensor};
 
-/// `[1, cin, l_in] -> [k * cin, l_in]`, tap-major, causally padded.
+/// `[1, cin, l_in] -> [k * cin, l_in]`, tap-major.
+///
+/// `pad_left` taps of left context are folded in as zeros; taps reaching past
+/// the right edge are zero too. Causal is `pad_left == (k-1) * dilation`, for
+/// which the upper bound provably never fires and behaviour is unchanged.
 struct Im2ColTapMajor {
     k: usize,
     dilation: usize,
+    pad_left: usize,
 }
 
 impl CustomOp1 for Im2ColTapMajor {
@@ -58,15 +66,15 @@ impl CustomOp1 for Im2ColTapMajor {
             _ => candle_core::bail!("im2col_tap_major: only f32"),
         };
         let (o, st) = (layout.start_offset(), layout.stride());
-        let pad = (self.k - 1) * self.dilation;
+        let pad = self.pad_left;
         let mut dst = vec![0f32; self.k * cin * l_in];
         for t in 0..self.k {
             for c in 0..cin {
                 let row = (t * cin + c) * l_in;
                 for l in 0..l_in {
-                    // The causal pad: taps reaching before the start contribute zero.
+                    // Out-of-range taps contribute zero, either edge.
                     let s = (l + t * self.dilation) as isize - pad as isize;
-                    if s >= 0 {
+                    if s >= 0 && s < l_in as isize {
                         dst[row + l] = src[o + c * st[1] + (s as usize) * st[2]];
                     }
                 }
@@ -109,7 +117,7 @@ impl CustomOp1 for Im2ColTapMajor {
         encoder.set_bytes(2, &(l_in as u32));
         encoder.set_bytes(3, &(cin as u32));
         encoder.set_bytes(4, &(self.dilation as u32));
-        encoder.set_bytes(5, &(((self.k - 1) * self.dilation) as u32));
+        encoder.set_bytes(5, &(self.pad_left as u32));
         encoder.use_resource(storage.buffer(), MTLResourceUsage::Read);
         encoder.use_resource(dst.as_ref(), MTLResourceUsage::Write);
 
@@ -140,7 +148,21 @@ impl CustomOp1 for Im2ColTapMajor {
 /// The causal left-pad is applied inside the gather, so unlike the `cat` route the caller
 /// does not pass a pre-padded input.
 pub fn im2col_tap_major(x: &Tensor, k: usize, dilation: usize) -> Result<Tensor> {
-    x.apply_op1_no_bwd(&Im2ColTapMajor { k, dilation })
+    x.apply_op1_no_bwd(&Im2ColTapMajor {
+        k,
+        dilation,
+        pad_left: (k - 1) * dilation,
+    })
+}
+
+/// The same matrix for a centred (symmetric-padded) conv: output `t` spans
+/// `t-pad_left..` and needs no pre-pad and no re-centring slice afterwards.
+pub fn im2col_centered(x: &Tensor, k: usize, dilation: usize, pad_left: usize) -> Result<Tensor> {
+    x.apply_op1_no_bwd(&Im2ColTapMajor {
+        k,
+        dilation,
+        pad_left,
+    })
 }
 
 #[cfg(test)]
@@ -172,6 +194,46 @@ mod tests {
                 "cin={cin} len={len} k={k} dil={dil}"
             );
             assert_eq!(crate::max_abs_diff(&want, &got)?, 0.0);
+        }
+        Ok(())
+    }
+
+    /// The centred gather against hand-placed windows, on every available device.
+    /// Shapes are the generator's own (symmetric pads, dilations 1/3/5).
+    #[test]
+    fn centered_matches_windows() -> anyhow::Result<()> {
+        #[cfg(feature = "metal")]
+        let _gpu = crate::gpu_guard();
+        #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
+        let mut devices = vec![Device::Cpu];
+        if let Some(m) = crate::usable_metal() {
+            devices.push(m);
+        }
+        for d in devices {
+            for (cin, len, k, dil, pad) in [
+                (4usize, 15usize, 3usize, 1usize, 1usize),
+                (8, 64, 7, 3, 9),
+                (2, 65, 11, 5, 25),
+                (128, 444, 3, 1, 1),
+            ] {
+                let x = Tensor::randn(0f32, 1., (1, cin, len), &d)?;
+                // Reference: symmetric zero pad, then tap windows, tap-major.
+                let pad_r = (k - 1) * dil - pad;
+                let xpad = x.pad_with_zeros(2, pad, pad_r)?;
+                let taps: Vec<_> = (0..k)
+                    .map(|t| xpad.narrow(2, t * dil, len))
+                    .collect::<Result<Vec<_>>>()?;
+                let want = Tensor::cat(&taps, 0)?.reshape((k * cin, len))?;
+                let got = im2col_centered(&x, k, dil, pad)?;
+                let (abs, rel) = crate::abs_and_rel(
+                    &got.to_device(&Device::Cpu)?,
+                    &want.to_device(&Device::Cpu)?,
+                )?;
+                assert!(
+                    rel < 1e-6,
+                    "{d:?} cin={cin} len={len} k={k} dil={dil}: abs {abs:.3e} rel {rel:.3e}"
+                );
+            }
         }
         Ok(())
     }

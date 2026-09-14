@@ -1,0 +1,14 @@
+# Reference side only — the G2P oracle, fixtures and voice assets. Never runtime.
+#
+# Pinned exactly, not floated: the phoneme gate compares byte-identical output against
+# misaki, so a lexicon or tagger update upstream would fail the gate as if the port broke.
+kokoro==0.9.4
+misaki[en]==0.9.4
+spacy==3.8.16
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+
+# Fixtures are fp32 CPU, so CPU torch is enough.
+torch>=2.4
+safetensors>=0.4
+soundfile
+numpy

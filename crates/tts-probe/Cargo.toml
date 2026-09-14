@@ -13,6 +13,11 @@ audio8 = { path = "../audio8", default-features = false }
 cosyvoice = { path = "../cosyvoice", default-features = false }
 tts-core = { path = "../tts-core", default-features = false }
 tts-nn = { path = "../tts-nn", default-features = false }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSDictionary", "NSValue"] }
+objc2-metal = "0.3.2"
+objc2-metal-performance-shaders = { version = "0.3.2", features = ["MPSCore", "MPSCoreTypes"] }
+objc2-metal-performance-shaders-graph = { version = "0.3.2", features = ["MPSGraph", "MPSGraphCore", "MPSGraphTensor", "MPSGraphTensorData", "MPSGraphConvolutionOps", "MPSGraphMemoryOps", "MPSGraphDevice", "objc2-metal-performance-shaders"] }
 
 [features]
 default = ["metal"]

@@ -106,6 +106,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     if k != k2 {
         candle_core::bail!("gemm_skinny: {k} != {k2}");
     }
+    crate::stats::record(m, k, n, (2 * (m * k + k * n) + 4 * m * n) as u64);
     a.contiguous()?
         .apply_op2_no_bwd(&b.contiguous()?, &Skinny { m, k, n })
 }

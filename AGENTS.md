@@ -22,7 +22,14 @@ the task.
 cargo build --release           # NOT `-p qwen3tts`: `dream-tts` lives in tts-cli
 ./scripts/gates.sh              # fixture gates for all three engines, tests, HTTP smoke test
 cargo test --release -p tts-nn  # the kernels
+./scripts/check-phonemes.sh     # Kokoro's English frontend, against spaCy and misaki
+cargo run -p kokoro --release --bin kokoro-validate
 ```
+
+`kokoro` is a fourth engine in progress: the frontend and the model are both gated and
+passing, but it is not wired into the registry yet, so there is no `--engine kokoro`. See
+`docs/kokoro-frontend.md` and `docs/kokoro-model.md`, which carry its traps and its
+measurements.
 
 `cargo build -p <crate>` does not relink the binaries, and `cargo clippy --workspace` leaves them
 built **without Metal**. Rebuild with a plain `cargo build --release` before measuring anything.

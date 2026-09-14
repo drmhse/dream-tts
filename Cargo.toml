@@ -6,6 +6,7 @@ members = [
     "crates/tts-bench",
     "crates/tts-engines",
     "crates/tts-narrate",
+    "crates/tts-phoneme",
     "crates/tts-import",
     "crates/tts-jobs",
     "crates/tts-cli",
@@ -13,6 +14,7 @@ members = [
     "crates/audio8",
     "crates/cosyvoice",
     "crates/qwen3tts",
+    "crates/kokoro",
     "crates/tts-probe",
 ]
 

@@ -15,7 +15,11 @@ anyhow = { workspace = true }
 # `metal::Buffer`/`Device` types are the same instance and not two copies of one crate.
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-metal-kernels = { workspace = true }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSDictionary", "NSValue"] }
 objc2-metal = "0.3.2"
+objc2-metal-performance-shaders = { version = "0.3.2", features = ["MPSCore", "MPSCoreTypes"] }
+objc2-metal-performance-shaders-graph = { version = "0.3.2", features = ["MPSGraph", "MPSGraphCore", "MPSGraphTensor", "MPSGraphTensorData", "MPSGraphOperation", "MPSGraphConvolutionOps", "MPSGraphArithmeticOps", "MPSGraphMemoryOps", "MPSGraphDevice", "objc2-metal-performance-shaders"] }
 
 [features]
 default = ["metal"]
