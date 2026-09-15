@@ -4,11 +4,15 @@
 # the fixture oracles, and the two CosyVoice artifacts that need the upstream python
 # package to produce.
 #
-#   fixtures/{audio8,cosyvoice,qwen3tts}/*.safetensors   ground truth for ./scripts/gates.sh
+#   fixtures/{audio8,cosyvoice,kokoro,qwen3tts}/*.safetensors  ground truth for ./scripts/gates.sh
 #   references/cosyvoice/weights/rand_noise.safetensors  the CFM decoder's fixed noise
 #   references/cosyvoice/weights/tokenizer.json          the ~250-special-token tokenizer
+#   references/kokoro/weights/frontend/*                 the exported spaCy tagger and lexicons
 #
-# The last two are why this script exists. Producing them imports CosyVoice model code,
+# Kokoro's frontend is here for the same reason: exporting it imports spaCy and misaki,
+# which pin their own torch, and the result is 18 MB of tables that never change.
+#
+# The CosyVoice pair is why this script exists. Producing them imports CosyVoice model code,
 # which pins python 3.10 and torch 2.3.1; fetching them instead means *running* CosyVoice
 # needs neither, only the checkpoint and a plain `torch.load`. See docs/reference.md#setup.
 #
@@ -53,6 +57,7 @@ if [ -t 2 ]; then PROGRESS=(-#); else PROGRESS=(-sS); fi
 dest_for() {
   case "$1" in
     cosyvoice/*) printf 'references/cosyvoice/weights/%s' "${1#cosyvoice/}" ;;
+    kokoro/*)    printf 'references/kokoro/weights/%s' "${1#kokoro/}" ;;
     fixtures/*)  printf '%s' "$1" ;;
     *)           printf '' ;;
   esac

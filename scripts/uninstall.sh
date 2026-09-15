@@ -22,7 +22,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 
-ENGINES="qwen3tts audio8 cosyvoice"
+ENGINES="qwen3tts kokoro audio8 cosyvoice"
 YES=""
 WHAT=""
 ONLY_ENGINE=""
@@ -39,7 +39,7 @@ while [ $# -gt 0 ]; do
       WHAT="$WHAT weights"
       # An engine id may follow, as in `--weights qwen3tts`.
       case "${2:-}" in
-        qwen3tts|audio8|cosyvoice) ONLY_ENGINE="$2"; shift ;;
+        qwen3tts|kokoro|audio8|cosyvoice) ONLY_ENGINE="$2"; shift ;;
       esac
       shift ;;
     --venvs)      WHAT="$WHAT venvs";    shift ;;

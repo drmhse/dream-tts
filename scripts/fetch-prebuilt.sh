@@ -16,7 +16,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 REPO="${DREAM_TTS_RELEASE_REPO:-drmhse/dream-tts}"
-BINS="dream-tts dream-tts-serve audio8-validate cosyvoice-validate qwen3tts-validate"
+BINS="dream-tts dream-tts-serve audio8-validate cosyvoice-validate kokoro-validate qwen3tts-validate"
 MODE="${1:-}"
 FORCE=""
 CHECK=""

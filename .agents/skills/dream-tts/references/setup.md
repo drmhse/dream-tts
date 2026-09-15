@@ -24,24 +24,26 @@ finds a toolchain and sources:
 
 Every step is skipped when its output exists, so re-running after an interruption is cheap.
 
-## The other two engines
+## The other three engines
 
 ```sh
 ./scripts/bootstrap.sh --list              # ids, models, what each costs
 ./scripts/bootstrap.sh audio8 cosyvoice
-./scripts/bootstrap.sh --all               # ~13 GB
+./scripts/bootstrap.sh kokoro              # ~0.7 GB
+./scripts/bootstrap.sh --all               # ~14 GB
 ```
 
-Both convert their checkpoints with PyTorch, so they want python >= 3.10 and a torch venv from
+Each converts its checkpoint with PyTorch, so they want python >= 3.10 and a torch venv from
 `references/<engine>/requirements.txt`. That cost is paid only by whoever asks for them.
 
 ## What it needs
 
 | engine | peak footprint | RTF on a short passage | reach for it when |
 |---|---|---|---|
-| `qwen3tts` | 12.3 GB | 0.397 | the default: best quality, and the only one practical for books |
+| `qwen3tts` | 12.3 GB | 0.397 | the default: best quality, and the only cloning engine practical for books |
 | `audio8` | 9.7 GB | 0.544 | 44.1 kHz output |
-| `cosyvoice` | 5.0 GB | 0.716 | widest language coverage, smallest footprint |
+| `cosyvoice` | 5.0 GB | 0.716 | widest language coverage |
+| `kokoro` | 1.3 GB | 0.044 | fastest and smallest by far, English only, cannot clone: `--set voice=<name>` |
 
 **16 GB for the default engine.** Most of its peak is the codec decoder's activations rather
 than weights — one 300-frame chunk is 5.5 GB — so no weight format moves the floor. Under 16 GB
@@ -103,7 +105,7 @@ an encoder.
 ./scripts/gates.sh
 ```
 
-Fixture gates for all three engines, the unit tests, and an HTTP smoke test. The qwen3tts gate
+Fixture gates for all four engines, the unit tests, and an HTTP smoke test. The qwen3tts gate
 alone is 65 rows comparing tensors against dumps from the reference implementation. It compares
 **absolute** difference against a per-row tolerance, and it decodes a single lane — so it does
 not exercise the batched decode path or the GEMM that path uses.

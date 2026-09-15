@@ -28,12 +28,13 @@ if command -v cargo >/dev/null && [ -f Cargo.toml ]; then HAVE_CARGO=1; else HAV
 
 # Whether an engine's converted weights are present. The gates and the renders both need
 # this, and with the default bootstrap installing one engine it is the common case that
-# two of the three are legitimately absent.
+# three of the four are legitimately absent.
 engine_ready() {
   case "$1" in
     qwen3tts)  [ -f references/qwen3tts/weights/model.safetensors ] ;;
     audio8)    [ -f references/audio8/weights/codec.safetensors ] ;;
     cosyvoice) [ -f references/cosyvoice/weights/llm.safetensors ] ;;
+    kokoro)    [ -f references/kokoro/weights/kokoro.safetensors ] ;;
     *) return 1 ;;
   esac
 }
@@ -120,16 +121,30 @@ else
   skip "references/qwen3tts/weights/model.safetensors missing"
 fi
 
+say "Kokoro gate"
+# A shape audit over the 459 tensors, then every deterministic stage against
+# fixtures/kokoro. The last row is the excitation, which is stochastic and is judged by SNR
+# against the reference rather than by tolerance — docs/kokoro-model.md says why.
+if [ -f fixtures/kokoro/forward.safetensors ] && engine_ready kokoro; then
+  run kokoro-validate || fail=1
+else
+  skip "fixtures/kokoro/forward.safetensors or references/kokoro/weights missing"
+fi
+
 say "End-to-end renders"
 mkdir -p target/gate
-for spec in "qwen3tts:voices/cosy-default-qwen3tts" "audio8:voices/cosy-default" \
-           "cosyvoice:voices/cosy-default-cosyvoice"; do
+# The second field is the whole voice argument, not a path: kokoro cannot clone, and picks
+# one of its built-in style tables instead of loading an asset.
+for spec in "qwen3tts:--voice voices/cosy-default-qwen3tts" "kokoro:--set voice=af_heart" \
+           "audio8:--voice voices/cosy-default" "cosyvoice:--voice voices/cosy-default-cosyvoice"; do
   id="${spec%%:*}"; voice="${spec##*:}"
+  asset="${voice#--voice }"
   if ! engine_ready "$id"; then
     skip "$id: weights not installed (./scripts/bootstrap.sh $id)"
-  elif [ ! -d "$voice" ]; then
-    skip "$id: voice asset $voice missing"
-  elif ! run dream-tts speak --engine "$id" --voice "$voice" \
+  elif [ "$asset" != "$voice" ] && [ ! -d "$asset" ]; then
+    skip "$id: voice asset $asset missing"
+  # shellcheck disable=SC2086
+  elif ! run dream-tts speak --engine "$id" $voice \
       --text-file examples/senior.txt --out "target/gate/$id.wav"; then
     echo "render FAILED for $id"; fail=1
   fi
@@ -139,7 +154,7 @@ say "HTTP service smoke test"
 # Whichever engine is installed, in catalogue order. Pinning this to cosyvoice made the
 # tier skip on every checkout that took the default bootstrap.
 smoke_engine=""
-for id in qwen3tts audio8 cosyvoice; do
+for id in qwen3tts kokoro audio8 cosyvoice; do
   if engine_ready "$id"; then smoke_engine="$id"; break; fi
 done
 smoke_bin=""

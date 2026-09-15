@@ -26,9 +26,10 @@ cd dream-tts && ./scripts/bootstrap.sh
 ```sh
 # From a clone.
 ./scripts/bootstrap.sh                       # qwen3tts, the default, ~4.3 GB
-./scripts/bootstrap.sh --all                 # all three engines, ~13 GB
+./scripts/bootstrap.sh --all                 # all four engines, ~14 GB
 ./scripts/bootstrap.sh --list                # the ids, their models, what each costs
 ./scripts/bootstrap.sh audio8 cosyvoice      # two of them
+./scripts/bootstrap.sh kokoro                # the cheap one, ~0.7 GB
 ./scripts/bootstrap.sh --force audio8        # redo a conversion that already ran
 ./scripts/bootstrap.sh --prebuilt            # download the binaries rather than build them
 ```
@@ -40,10 +41,10 @@ section is what it does on your behalf, for when a step fails or you want to do 
 
 **Why the default is one engine.** `qwen3tts` alone is the only configuration whose setup is
 downloads and nothing else — no conversion, so no Python, so no torch venv. `audio8` folds a
-`weight_norm` pickle and `cosyvoice` re-serialises a `torch.load`, and both want python
->= 3.10. Naming either is what buys that cost. The default used to be all three, which meant
-every first run paid ~13 GB and a 2.5 GB venv to get an engine that is also the slowest of
-the three on book-length text.
+`weight_norm` pickle, `cosyvoice` re-serialises a `torch.load` and `kokoro` folds 89 weight
+norms, and all three want python >= 3.10. Naming one is what buys that cost. The default used
+to be all of them, which meant every first run paid ~13 GB and a 2.5 GB venv to get an engine
+that is also the slowest on book-length text.
 
 **Building versus downloading.** `bootstrap.sh` builds when there is a toolchain *and*
 sources, and downloads `scripts/fetch-prebuilt.sh`'s archive otherwise; `--build` and
@@ -93,7 +94,7 @@ pickle where every convolution is wrapped in `weight_norm`, so stored parameters
 magnitude and a direction rather than a weight. Folding once means the Rust side memory-maps
 plain weights and does no reparametrisation at runtime.
 
-### 2. The other two checkpoints
+### 2. The other three checkpoints
 
 **CosyVoice.** Two artifacts it needs are not in the checkpoint and cannot be produced without
 the upstream python package: `rand_noise.safetensors` (the CFM decoder builds it once under
@@ -136,6 +137,25 @@ pt). `f16` is its default because it is the only format that batches, and batchi
 this engine is for; `f32` measured 38× slower on a 16 GB machine and `q8_0` gives up 4.5× on a
 chapter to save 0.58 GB.
 
+**Kokoro.** The checkpoint is curl and the conversion is torch; the *frontend* is neither,
+which is why it is an asset. Exporting it imports spaCy and misaki — a pinned torch of their
+own — and produces 18 MB of tables that never change: three tokenizer regexes with 1347
+exceptions, the POS tagger as safetensors, and the two lexicons. `fetch-assets.sh` places
+them under `references/kokoro/weights/frontend`, and `references/kokoro/export_frontend.py`
+regenerates them if you are auditing rather than using.
+
+```sh
+scripts/fetch-weights.sh references/kokoro/weights \
+    https://huggingface.co/hexgrad/Kokoro-82M/resolve/main \
+    config.json kokoro-v1_0.pth voices/af_heart.pt          # …and the other 27
+references/audio8/.venv/bin/python references/kokoro/convert.py
+```
+
+`convert.py` prints `459 tensors, 81.7M parameters, 89 weight norms folded` and packs every
+`voices/*.pt` it finds into one `voices.safetensors`. Only the 28 `a*`/`b*` voicepacks are
+fetched: the other 26 are Spanish, French, Hindi, Italian, Japanese, Portuguese and Chinese,
+and this frontend is an English lexicon, so they have no faithful path through it.
+
 ### 3. Regenerating the fixtures
 
 `fetch-assets.sh` pulls ~130 MB of checksummed ground truth from
@@ -156,6 +176,8 @@ PYTHONPATH=.:third_party/Matcha-TTS .venv/bin/python \
 
 references/qwen3tts/.venv/bin/python references/qwen3tts/dump_fixtures.py \
     --model references/qwen3tts/weights --voice voices/cosy-default-qwen3tts --out fixtures/qwen3tts
+
+cd references/kokoro && .venv/bin/python dump_fixtures.py   # its own venv: kokoro, not torch alone
 ```
 
 Building a new voice uses the same venvs via each engine's `export_voice.py`. The transcript
@@ -166,7 +188,7 @@ nothing in its frontend adds it.
 
 | path | size | tracked |
 |---|---|---|
-| `references/*/weights/` | ~3.4–4.3 GB each | no |
+| `references/*/weights/` | ~3.4–4.3 GB each, `kokoro` ~0.7 GB | no |
 | `fixtures/` | ~130 MB | no — fetched |
 | `voices/` | ~200 KB | **yes** |
 | `target/` | ~1.8 GB | no |
@@ -175,12 +197,12 @@ nothing in its frontend adds it.
 
 ## Architecture
 
-Ten crates. Everything shared is `tts-*`; everything engine-specific is named for its engine
-and matches the id `--engine` takes.
+Fifteen crates. Everything shared is `tts-*`; everything engine-specific is named for its
+engine and matches the id `--engine` takes.
 
-**Voice assets are the decision that made a second and third engine tractable.** All three
-models clone from a reference clip, and in every case turning audio into conditioning needs
-machinery the runtime should not carry:
+**Voice assets are the decision that made a second and third engine tractable.** Three of the
+four models clone from a reference clip, and in every case turning audio into conditioning
+needs machinery the runtime should not carry:
 
 | engine | the clip must become | in-process cost avoided |
 |---|---|---|
@@ -191,6 +213,13 @@ machinery the runtime should not carry:
 None of it depends on the text being spoken, so it happens once, offline, in Python, and ships
 as a directory of `voice.json` + `voice.safetensors`. `Voice::load` checks the `engine` field
 and a mismatch is a hard error rather than a silent substitution.
+
+`kokoro` is the exception and it is `Cloning::None`: its voices are 28 `[510, 256]` style
+tables inside the checkpoint, and there is no path from a reference clip to one of them.
+`--set voice=<name>` picks one, `--voice` is refused rather than ignored, and
+`tts_engines::builtin_voices` reads the names out of the asset so a caller can ask what is
+installed. The same fork runs through the CLI and the service: neither loads a voice asset
+for an engine that cannot use one.
 
 `Capabilities` is deliberately blunt about what engines genuinely differ on — sample rate,
 cloning, streaming, and the quantizations each supports. Neither of the first two models can
@@ -230,6 +259,8 @@ is a 3.35× win while quantizing the DiT — which only runs on full sequences �
 | `audio8-validate` | 8 checks; greedy generation **bit-identical** to the reference |
 | `cosyvoice-validate` | 27 checks; teacher-forced argmax **105/105 identical** |
 | `qwen3tts-validate` | 65 rows; argmax codebook 0 identical, predictor **15/15** |
+| `kokoro-validate` | 10 rows; every deterministic stage, then the excitation and the audio by SNR |
+| `check-phonemes.sh` | the English frontend, **byte-identical to misaki** over 522,542 tokens |
 | `cargo test --release` | 32 tests including the `tts_engines` doctest |
 
 Gates compare against per-stage fp32 activations dumped from PyTorch, so a failure localises
@@ -239,6 +270,14 @@ to a stage rather than to "the audio sounds wrong". A tier whose inputs are abse
 Sampled output is deliberately *not* gated on equality: `ras_sampling` draws from torch's
 generator, so the sampled sequence is not reproducible across implementations. The gates check
 prefill logits and a greedy rollout instead, and quality is checked separately by WER.
+
+`kokoro` has no sampler, so its stages are compared directly — but its excitation is not
+reproducible at fp32 *upstream either*: the phase accumulates unwrapped to 165,303 radians,
+where one f32 ulp is 0.0156 rad, so `sin` of it is uncertain at 1.6% from the representation
+alone. The gate's criterion is therefore set by the reference rather than by eye — the port
+must sit closer to the reference than the reference sits to itself under a different noise
+draw. It does: **25.3 dB SNR and 1.54 dB log-spectral, against upstream's own 19.7/20.7 dB
+and 2.18/2.09 dB.** `docs/kokoro-model.md` has the derivation.
 
 ---
 
@@ -253,7 +292,7 @@ Two fixtures, both tracked so any figure here can be reproduced:
 
 ### Short passage
 
-`examples/senior.txt`, M4 / 16 GB. Median of five samples with the three engines interleaved in
+`examples/senior.txt`, M4 / 16 GB. Median of five samples with the cloning engines interleaved in
 one session, taken when `qwen3tts`'s default was `q8_0`; at today's `f16` default the same
 passage reads **0.397**, still the wrong case for it.
 
@@ -262,6 +301,7 @@ passage reads **0.397**, still the wrong case for it.
 | `audio8` | 1.307 (PyTorch bf16 MPS, batched) | **0.554** | 0.547–0.562 | 2.36× faster |
 | `cosyvoice` | 4.370 (stock PyTorch, CPU-only) | **0.726** | 0.697–0.734 | 6.02× faster |
 | `qwen3tts` | — | **0.665** | 0.642–0.687 | the wrong case for it; see below |
+| `kokoro` | — | **0.044** | 0.044–0.046 | no loop to fill, so this is its normal rate |
 
 ### Chapter, and what batching is actually worth
 
@@ -294,7 +334,7 @@ talker (0.588 → 0.187); the codec is unchanged at 0.072, as it must be, since 
 being varied is the talker's.
 
 This is why the narration path uses `f16` and why `qwen3tts` is the default for a book despite
-being the slowest of the three on a short passage. Reproduce with:
+being the slowest of the cloning engines on a short passage. Reproduce with:
 
 ```sh
 ./dream-tts speak --engine qwen3tts \
@@ -305,6 +345,45 @@ being the slowest of the three on a short passage. Reproduce with:
 An RTF of **0.253** was previously quoted for this configuration with no fixture behind it and
 no end-to-end render supporting it. The measurement above is what replaced it; the claim turned
 out to be close to right, which is luck rather than evidence.
+
+### Chapter, the other three engines
+
+Same fixture, same machine, one voice each. `kokoro` is here rather than above because it is
+the only engine whose short-passage and long-form numbers are the same figure.
+
+| engine | voice | RTF | wall | audio | peak footprint |
+|---|---|---|---|---|---|
+| `kokoro` | `af_heart` | **0.043** | 31.2 s | 12:15 | 1.68 GB |
+| `kokoro` | `am_michael` | **0.041** | 33.4 s | 13:32 | — |
+| `audio8` | cloned female / male | 0.536 / 0.527 | 6m 12s / 5m 47s | 11:34 / 10:59 | — |
+| `cosyvoice` | cloned female / male | 0.718 / 0.703 | 9m 12s / 8m 15s | 12:48 / 11:44 | — |
+
+The stage split under `kokoro` is flat across both: decoder 78–80%, prosody 7.6%, bert 6.4%,
+duration 4.3%, encoder 1.5%. A segment is one forward pass, so there is no batch to fill and
+nothing that rewards length — 0.044 on seven segments against 0.043 on a hundred is the whole
+story, and it is why the engine is worth having on a machine that cannot hold `qwen3tts`.
+Peak footprint is 1.29 GB on the short passage, against 12.3 for the default.
+
+### Word error rate, all eight demo renders
+
+Whisper `small.en` through `faster-whisper` (batched, int8), the same normalisation for every
+file: `references/cosyvoice/wer.py --text-file examples/chapter.txt <files>`. The reference is
+1612 words.
+
+| engine | female / first voice | male / second voice |
+|---|---|---|
+| `kokoro` | **0.009** (15 errors) | 0.042 (68) |
+| `qwen3tts` | 0.011 (18) | 0.050 (80) |
+| `audio8` | 0.012 (19) | 0.011 (17) |
+| `cosyvoice` | 0.019 (31) | 0.017 (28) |
+
+Read this as renders compared against each other, not as a publishable WER: the normalisation
+is blunt and the transcriber is the same for every row, which is the only property that
+matters here. Two things it does say. The spread *within* an engine is larger than the spread
+between engines — `qwen3tts` covers 0.011 to 0.050 across two voices of the same model — so a
+voice is at least as much of the quality story as an engine is. And the six cloned files were
+rendered at an earlier revision than the two `kokoro` ones; the text and the measurement are
+identical, the engine revisions are not.
 
 ### Where the time goes
 
@@ -336,7 +415,9 @@ service's reload path.
 ### Kokoro's decoder, and what is left in it
 
 A 10 s render on an M4 (canary 60 ms, so a cool machine) went **0.075 -> 0.038 RTF**. The
-decoder was 86% of it at the start and is 78% now.
+decoder was 86% of it at the start and is 78% now. That figure is one utterance through
+`kokoro-render`; through the CLI a chapter measures 0.043, and the difference is the frontend
+and the per-segment launches, not the decoder.
 
 | | before | after |
 |---|---|---|

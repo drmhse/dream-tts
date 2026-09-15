@@ -2,14 +2,15 @@
 
 ## The shape of it
 
-Three engines behind one `Engine` trait, chosen by string id at request time. `qwen3tts` is the
-default and carries the project; the other two exist because they are better at one thing each.
+Four engines behind one `Engine` trait, chosen by string id at request time. `qwen3tts` is the
+default and carries the project; the other three exist because they are better at one thing each.
 
 | engine | model | output | notes |
 |---|---|---|---|
 | `qwen3tts` | Qwen3-TTS-12Hz-1.7B-Base | 24 kHz | default. Qwen3 talker, 15-step depth transformer, RVQ codec. No diffusion, no conversion step, ten languages |
 | `audio8` | Audio8-TTS-Preview-0.6b | 44.1 kHz | DualAR + RVQ codec. Highest fidelity here; 2.36x its PyTorch reference like for like |
-| `cosyvoice` | Fun-CosyVoice3-0.5B | 24 kHz | Qwen2 LLM + DiT flow matching + HiFTGenerator. Unrestricted languages, smallest footprint |
+| `cosyvoice` | Fun-CosyVoice3-0.5B | 24 kHz | Qwen2 LLM + DiT flow matching + HiFTGenerator. Unrestricted languages |
+| `kokoro` | Kokoro-82M | 24 kHz | The only non-autoregressive one: durations for every phoneme at once, one iSTFTNet pass. 23x realtime in 1.3 GB, English only, 28 built-in voices and no cloning |
 
 `dream-tts engines` prints this live, with the weight formats each accepts and which is the
 default.

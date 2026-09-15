@@ -17,10 +17,10 @@ cd "$(dirname "$0")/.."
 ROOT="$PWD"
 OUT="${1:-$ROOT/dist}"
 
-# The product, plus the three fixture gates: without them a cargo-less install cannot run
+# The product, plus the four fixture gates: without them a cargo-less install cannot run
 # ./scripts/gates.sh, and qwen3tts's shape-audit tier is the one check that works
 # mid-download.
-BINS="dream-tts dream-tts-serve audio8-validate cosyvoice-validate qwen3tts-validate"
+BINS="dream-tts dream-tts-serve audio8-validate cosyvoice-validate kokoro-validate qwen3tts-validate"
 
 say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }

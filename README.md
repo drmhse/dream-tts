@@ -1,9 +1,10 @@
 # dream-tts
 
 Narrate anything in a cloned voice, on your own Mac, offline. A 1612-word chapter becomes
-11 minutes of speech in 1m 44s. One binary, no service, no API key.
+11 minutes of speech in 1m 44s — or 12 minutes in 31 seconds, if a built-in voice will do.
+One binary, no service, no API key.
 
-### ▶ [Hear it first: one chapter, three engines, two cloned voices](https://drmhse.github.io/dream-tts/)
+### ▶ [Hear it first: one chapter, four engines, two voices each](https://drmhse.github.io/dream-tts/)
 
 **Requirements: macOS 13 or newer on Apple silicon, and `curl`.** The custom kernels are
 Metal. Every number here was measured on an M4 with 16 GB. It builds and runs elsewhere with
@@ -22,10 +23,12 @@ cd dream-tts && ./scripts/bootstrap.sh       # the model. ~4.3 GB, resumable, ve
 
 **`curl` is the only prerequisite.** No Rust toolchain, no Python. That holds because the
 default engine, `qwen3tts`, has no conversion step — its checkpoint is a plain download —
-and because a `v*` tag publishes prebuilt arm64 binaries. It is also the best quality of the
-three and more than three times as fast on book-length text, so the cheapest path is also
-the one you want. The [demo](https://drmhse.github.io/dream-tts/) is there so you can
-disagree before you download anything.
+and because a `v*` tag publishes prebuilt arm64 binaries. It is also the best quality here
+and more than three times as fast on book-length text as the other two cloning engines, so
+the cheapest path is also the one you want. (`kokoro` is faster still — 23× realtime — but
+it cannot clone a voice and speaks English only.) The
+[demo](https://drmhse.github.io/dream-tts/) is there so you can disagree before you download
+anything.
 
 From a git clone instead, with a toolchain, it is one command:
 
@@ -40,10 +43,11 @@ downloads otherwise. Nothing is manual. Add the other engines whenever you want 
 ```sh
 ./scripts/bootstrap.sh --list              # the ids, their models, what each costs
 ./scripts/bootstrap.sh audio8 cosyvoice    # 44.1 kHz output, and the widest language coverage
-./scripts/bootstrap.sh --all               # all three, ~13 GB
+./scripts/bootstrap.sh kokoro              # 0.7 GB, and the fastest engine here
+./scripts/bootstrap.sh --all               # all four, ~14 GB
 ```
 
-Those two are where Python appears: both convert their checkpoints with PyTorch, so they
+Those three are where Python appears: each converts its checkpoint with PyTorch, so they
 want python >= 3.10 and a torch venv. Asking for them is what buys that cost, and it is
 never paid by someone who did not. Every step is skipped if its output exists, so re-running
 is cheap. Details in **[docs/reference.md](docs/reference.md#setup)**.
@@ -73,26 +77,36 @@ This export is the only step that wants Python, and it runs once per voice. Inst
 `references/<engine>/requirements.txt` in a venv first. The speaker encoders stay there: the
 runtime loads the exported conditioning and never carries an encoder.
 
+`kokoro` is the exception: it cannot clone. Its voices are 28 style tables inside the
+checkpoint, and it takes one by name instead of an asset:
+
+```sh
+./dream-tts speak --engine kokoro --set voice=am_michael --text "Built in, not cloned." --out m.wav
+```
+
 ## The engines, and what they cost
 
-All three narrate the same 1612-word chapter (`examples/chapter.txt`, in the repo). Each runs
-in the configuration it ships in, in two cloned voices, on one M4 with 16 GB and no Python
-running. GitHub cannot embed audio in markdown, so the
-[demo page](https://drmhse.github.io/dream-tts/) plays all six in place.
+All four narrate the same 1612-word chapter (`examples/chapter.txt`, in the repo). Each runs
+in the configuration it ships in, in two voices — cloned from a ten-second clip, except
+`kokoro`, whose two are built in — on one M4 with 16 GB and no Python running. GitHub cannot
+embed audio in markdown, so the [demo page](https://drmhse.github.io/dream-tts/) plays all
+eight in place.
 
 | engine | RTF | wall time | audio produced | reach for it when |
 |---|---|---|---|---|
 | `audio8` | 0.527-0.536 | 5m 47s | 11:34 / 10:59 | you want 44.1 kHz, the highest-fidelity output here |
 | `cosyvoice` | 0.703-0.718 | 8m 15s | 12:48 / 11:44 | you want the widest language coverage |
-| `qwen3tts` | **0.148** | **1m 44s** | 11:44 / 10:34 | the default. Best quality here, and the only one that makes book-length text practical |
+| `qwen3tts` | **0.148** | **1m 44s** | 11:44 / 10:34 | the default. Best quality here, and the only one of the three cloning engines that makes book-length text practical |
+| `kokoro` | **0.041-0.043** | **31s** | 12:15 / 13:32 | English, no cloning, and you want it now — or you have 2 GB to spend rather than 12 |
 
-**That bottom row is the point of the project.** A chapter becomes 11 minutes of speech in
-1m 44s, on a laptop — 6.8× faster than realtime. A 16-hour book costs about 2.4 hours of
-compute rather than 11.5.
+**Those two bottom rows are the point of the project.** A chapter becomes 11 minutes of
+speech in 1m 44s with a cloned voice, on a laptop — 6.8× faster than realtime, so a 16-hour
+book costs about 2.4 hours of compute rather than 11.5. Give up cloning and it is **31
+seconds**, 23× realtime, in 1.7 GB.
 
-Compare the wall-time column, not just RTF. The three do not produce the same duration from
-the same text. `cosyvoice` speaks slowest, 12:48 against `audio8`'s 11:34. RTF divides by audio
-produced, so a slower-speaking engine flatters its own RTF.
+Compare the wall-time column, not just RTF. The four do not produce the same duration from
+the same text. `kokoro`'s male voice speaks slowest, 13:32 against `audio8`'s 11:34. RTF
+divides by audio produced, so a slower-speaking engine flatters its own RTF.
 
 ```sh
 ./dream-tts speak --text-file examples/chapter.txt --out chapter.wav
@@ -100,12 +114,12 @@ produced, so a slower-speaking engine flatters its own RTF.
 
 No flags: `qwen3tts` at f16 and 48 lanes is what you get by asking for nothing. It gets there
 by batching across sections, so it wants length — on a 7-segment passage it is 0.397, against
-0.148 on the chapter. The other two do not batch meaningfully and are steady at any length.
+0.148 on the chapter. The other three do not batch meaningfully and are steady at any length.
 `audio8` is **2.36× its PyTorch reference** like for like, with that reference running on MPS
 too.
 
 Short-passage figures, for comparison. `examples/senior.txt`, 132 words: `audio8` 0.544,
-`cosyvoice` 0.716, `qwen3tts` 0.397.
+`cosyvoice` 0.716, `qwen3tts` 0.397, `kokoro` 0.044.
 
 ### What it needs to be this fast
 
@@ -125,9 +139,14 @@ What does help a smaller machine is a different engine. Same passage, same measu
 
 | engine | peak footprint | RTF |
 |---|---|---|
-| `cosyvoice` | **5.0 GB** | 0.716 |
+| `kokoro` | **1.3 GB** | 0.044 |
+| `cosyvoice` | 5.0 GB | 0.716 |
 | `audio8` | 9.7 GB | 0.544 |
 | `qwen3tts` | 12.3 GB | 0.397 |
+
+`kokoro` is an order of magnitude below the rest and faster than all of them, and the price is
+stated plainly: it cannot clone a voice, and it speaks English only. A chapter takes it to
+1.7 GB.
 
 `QWEN3TTS_MAX_BATCH` trades lanes for footprint if you want to stay on this engine, but it
 cannot go under the codec's own ~12 GB.
@@ -235,6 +254,56 @@ Regenerate the diagram after any change to those numbers:
 
 ```sh
 plantuml -tpng docs/qwen3tts-speedup.puml
+```
+
+## `kokoro`, and what dropping the autoregressive loop buys
+
+Every other engine here generates audio tokens one step at a time, and that loop is what the
+whole `qwen3tts` section above is about. Kokoro-82M does not have one. It predicts a duration
+for *every phoneme at once*, stretches the encoding to match, and runs a single pass through an
+iSTFTNet decoder. What follows from that is most of what makes it worth having:
+
+- **RTF 0.041-0.043, and it does not depend on length.** 12m 15s of speech in 31 seconds, 23×
+  realtime — and 0.044 on a 132-word passage, where `qwen3tts` needs a long document to reach
+  0.148. There is no batch to fill, so a single sentence runs at the same rate as a chapter.
+- **1.3 GB of peak footprint**, against 12.3 for the default. 82M parameters and no KV cache.
+- **No sampler, so no length drift.** Two renders of the same text are the same length; the
+  only stochastic stage is the decoder's excitation noise, which is seeded.
+- **It cannot clone.** Its voices are 28 style tables of `[510, 256]` shipped inside the
+  checkpoint — there is no path from a reference clip to one of them. `--set voice=<name>`
+  picks one; `--voice` is an error rather than a silent fallback.
+- **English only, and the lexicon says so out loud.** Kokoro takes IPA from `misaki`, which
+  reaches for espeak-ng on any word its lexicon misses. espeak-ng is GPL-3.0, so this port
+  does not have it: `crates/tts-phoneme` is a lexicon, a tokenizer and a port of spaCy's POS
+  tagger, **byte-identical to the pinned Python over 522,542 tokens** of real narration, and a
+  word it cannot pronounce is *named in a lint* rather than guessed at.
+
+Word error rate against the chapter, transcribed with the same Whisper settings as every other
+engine here, is **0.009** for `af_heart` — the lowest of the eight files on the demo page — and
+0.042 for `am_michael`. The full table, and the caveat that WER is comparing renders against
+each other rather than reporting a publishable figure, is in
+[docs/reference.md](docs/reference.md#performance).
+
+**Where the time goes: 78% is the decoder**, and inside it the generator's convolutions. Those
+run through MPSGraph rather than candle, which materialises no im2col matrix — 1.7× on the
+shape that dominates, with a dynamic length axis so one compiled graph serves every utterance.
+The recurrences are the other half of the story: Metal compiles with fast math on by default,
+and an LSTM multiplies its own rounding, which was enough here to move the predicted durations
+and *halve the length of the audio*. `lstm_gates` uses `precise::exp` and `precise::tanh` for
+that reason and no other.
+
+The gate is `cargo run -p kokoro --release --bin kokoro-validate`, and its last row is the one
+worth reading: the excitation phase accumulates to 165,303 radians, where one f32 ulp is 0.0156
+— so upstream is not reproducible against *itself* at fp32. The criterion is therefore that
+this port sits closer to the reference than the reference sits to itself under a different
+noise draw: **25.3 dB against upstream's own 19.7 and 20.7**. `docs/kokoro-model.md` and
+`docs/kokoro-frontend.md` carry that and the other nine traps.
+
+```sh
+./scripts/bootstrap.sh kokoro              # ~0.7 GB, and a torch venv for the conversion
+./dream-tts speak --engine kokoro --set voice=af_heart \
+    --text-file examples/chapter.txt --out chapter.wav
+./dream-tts engines                        # every voice name it will take
 ```
 
 ## Narrate a whole book, from any document
@@ -466,6 +535,11 @@ install and the data directory, and refuses to run unattended without `--yes`.
   a hard rejection — identifying a language from arbitrary text is a guess, and a guess that
   refused valid English would be worse than the warning. Use `--engine audio8` or
   `--engine cosyvoice` for anything outside the list.
+- **`kokoro` speaks English, cannot clone, and will tell you which words it could not
+  pronounce.** Its lexicon has no espeak-ng fallback — espeak-ng is GPL-3.0 and this is
+  Apache-2.0 — so a word that is in neither the lexicon nor the derivation rules is listed on
+  stderr rather than guessed at. Feed it `dream-tts narrate` output and most of what would
+  have been unknown (numbers, units, currency) has already been verbalised.
 - **A known performance regression, undiagnosed.** `audio8`'s codec and `cosyvoice`'s vocoder
   are 35% and 32% slower than when first measured, while every transformer stage is unchanged.
   Both are convolution-heavy. The cause is likely the channels-last conv path.
@@ -479,7 +553,7 @@ Against a service that does use MPS it is ahead by about 5%.
 
 ## How it is built
 
-Three PyTorch models, ported to Rust and candle, with the Metal kernels written here. Each
+Four PyTorch models, ported to Rust and candle, with the Metal kernels written here. Each
 stage is validated against fp32 activations dumped from its reference, so a mismatch names the
 layer that caused it. `scripts/fetch-assets.sh` pulls ~130 MB of checksummed ground truth from
 [`drmhse/tts-rs-assets`](https://huggingface.co/datasets/drmhse/tts-rs-assets), so

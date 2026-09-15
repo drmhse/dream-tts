@@ -23,7 +23,7 @@ pub struct Model {
     device: Device,
 }
 
-/// The 54 shipped voices, each a `[510, 256]` table indexed by phoneme count.
+/// The shipped voices, each a `[510, 256]` table indexed by phoneme count.
 ///
 /// A voice is 522 KB of style vectors, not a model — which is why they all fit in one file
 /// and why this engine cannot clone: there is no path from reference audio to one of these.
@@ -37,6 +37,15 @@ impl Voices {
             map.insert(name.clone(), w.get(&name)?);
         }
         Ok(Self(map))
+    }
+
+    /// The names in the asset without loading it onto a device — the header alone answers
+    /// "what can I ask for", and a caller that only wants the list has no device yet.
+    pub fn names_in(path: &Path) -> Result<Vec<String>> {
+        let w = Weights::load(path.to_str().context("voice path")?, &Device::Cpu)?;
+        let mut names = w.names();
+        names.sort();
+        Ok(names)
     }
 
     pub fn names(&self) -> Vec<&str> {

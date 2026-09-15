@@ -2812,6 +2812,7 @@ dependencies = [
  "anyhow",
  "audio8",
  "cosyvoice",
+ "kokoro",
  "qwen3tts",
  "tts-core",
 ]

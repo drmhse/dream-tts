@@ -160,7 +160,7 @@ fn parse_override(s: &str) -> Result<(String, PathBuf), String> {
     Ok((k.to_string(), PathBuf::from(v)))
 }
 
-fn cmd_engines() -> Result<()> {
+fn cmd_engines(cfg: &Config) -> Result<()> {
     let default = tts_engines::default_id();
     // The catalogue is preference order, so it prints in that order and the default is
     // marked rather than re-sorted to the top — the order is information.
@@ -185,7 +185,7 @@ fn cmd_engines() -> Result<()> {
                 "{} Hz · {} · {}",
                 c.sample_rate,
                 match c.cloning {
-                    Cloning::None => "single speaker",
+                    Cloning::None => "built-in voices",
                     Cloning::PrecomputedAsset => "voice cloning",
                 },
                 if c.streaming {
@@ -205,6 +205,17 @@ fn cmd_engines() -> Result<()> {
                 ui::yellow("(closed list)")
             ),
             None => println!("    {} unrestricted", ui::dim("languages")),
+        }
+        // Only for an engine that cannot clone: for the others the answer is "any asset you
+        // built", which is not a list.
+        if c.cloning == Cloning::None {
+            let root = cfg.data_path(tts_engines::default_root(c.id));
+            match tts_engines::builtin_voices(c.id, &root)? {
+                v if v.is_empty() => {
+                    println!("    {} not installed", ui::dim("voices   "))
+                }
+                v => println!("    {} {}", ui::dim("voices   "), v.join(", ")),
+            }
         }
         if let Some(reason) = c.reason {
             println!("    {} {reason}", ui::yellow("unavailable:"));
@@ -303,15 +314,22 @@ fn cmd_config(cfg: &Config) -> Result<()> {
         weights.display().to_string(),
         &present(weights.is_dir(), "downloaded", "not downloaded"),
     );
-    let voice = match &cfg.settings.voice {
-        Some(v) => cfg.root_path(v),
-        None => cfg.root_path(tts_engines::default_voice(&id)),
-    };
-    ui::field_note(
-        "voice",
-        voice.display().to_string(),
-        &present(voice.is_dir(), "present", "missing"),
-    );
+    // An engine that cannot clone has no asset path to resolve, and printing the repo root
+    // as its "voice" would be a plausible-looking lie.
+    match tts_engines::default_voice(&id) {
+        "" => ui::field_note("voice", "—".to_string(), "built into the checkpoint"),
+        shipped => {
+            let voice = match &cfg.settings.voice {
+                Some(v) => cfg.root_path(v),
+                None => cfg.root_path(shipped),
+            };
+            ui::field_note(
+                "voice",
+                voice.display().to_string(),
+                &present(voice.is_dir(), "present", "missing"),
+            );
+        }
+    }
 
     ui::heading("settings as read");
     let json = serde_json::to_string_pretty(&cfg.settings)?;
@@ -743,7 +761,7 @@ fn main() -> std::process::ExitCode {
     // Errors are rendered here rather than by `Termination`'s `Debug` formatting, which
     // prints the whole chain on one colon-joined line and buries the actionable end of it.
     let result = Config::load(cli.config.as_deref()).and_then(|cfg| match &cli.command {
-        Command::Engines => cmd_engines(),
+        Command::Engines => cmd_engines(&cfg),
         Command::Voice { path } => cmd_voice(path),
         Command::Speak(args) => cmd_speak(args, &cfg),
         Command::Book(args) => book::cmd_book(args, &cfg),

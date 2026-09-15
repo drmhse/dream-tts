@@ -29,7 +29,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::Response;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tts_core::{Gaps, Sampling, SynthesisRequest, Voice};
+use tts_core::{Gaps, Sampling, SynthesisRequest};
 
 /// Chunks queued ahead of a slow reader before synthesis waits for it.
 ///
@@ -45,11 +45,7 @@ pub async fn post_tts_stream(
 ) -> Result<Response, ApiError> {
     require_key(&app, &headers)?;
 
-    let voice = match &req.voice {
-        None => app.voice.clone(),
-        Some(dir) => Voice::load(dir)
-            .map_err(|e| bad(StatusCode::BAD_REQUEST, format!("loading voice {dir}: {e}")))?,
-    };
+    let voice = crate::request_voice(&app, &req.voice)?;
     let sample_rate = app.sample_rate;
 
     // Paragraphs of segments, exactly as the engine would split it, so the streamed render
@@ -90,7 +86,7 @@ pub async fn post_tts_stream(
             let engine = Arc::clone(&worker);
             let voice = voice.clone();
             let rendered = tokio::task::spawn_blocking(move || {
-                let mut request = SynthesisRequest::new(text).with_voice(voice);
+                let mut request = crate::with_optional_voice(SynthesisRequest::new(text), voice);
                 // One segment per call, so the engine must not split it again.
                 request.max_chars = usize::MAX;
                 if let Some(s) = seed {

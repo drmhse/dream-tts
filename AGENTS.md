@@ -1,6 +1,6 @@
 # dream-tts Repository Guide
 
-Offline text-to-speech in Rust with Metal kernels: three engines behind one CLI, no Python at
+Offline text-to-speech in Rust with Metal kernels: four engines behind one CLI, no Python at
 runtime. `qwen3tts` is the default and carries the project.
 
 Start with the **`dream-tts` skill** in `.agents/skills/dream-tts/` — it covers setup, narrating
@@ -20,16 +20,17 @@ the task.
 ```sh
 ./scripts/bootstrap.sh          # checkpoint, assets, build. ~4.3 GB, resumable
 cargo build --release           # NOT `-p qwen3tts`: `dream-tts` lives in tts-cli
-./scripts/gates.sh              # fixture gates for all three engines, tests, HTTP smoke test
+./scripts/gates.sh              # fixture gates for all four engines, tests, HTTP smoke test
 cargo test --release -p tts-nn  # the kernels
 ./scripts/check-phonemes.sh     # Kokoro's English frontend, against spaCy and misaki
 cargo run -p kokoro --release --bin kokoro-validate
 ```
 
-`kokoro` is a fourth engine in progress: the frontend and the model are both gated and
-passing, but it is not wired into the registry yet, so there is no `--engine kokoro`. See
-`docs/kokoro-frontend.md` and `docs/kokoro-model.md`, which carry its traps and its
-measurements.
+`kokoro` is the fourth engine and the only non-autoregressive one. It cannot clone — its
+voices are 28 style tables inside the checkpoint, picked with `--set voice=<name>` — and its
+English frontend is a lexicon with no espeak fallback, so an unknown word is named in a lint
+rather than guessed. `docs/kokoro-frontend.md` and `docs/kokoro-model.md` carry its traps and
+its measurements.
 
 `cargo build -p <crate>` does not relink the binaries, and `cargo clippy --workspace` leaves them
 built **without Metal**. Rebuild with a plain `cargo build --release` before measuring anything.

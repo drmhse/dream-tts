@@ -84,9 +84,10 @@
 
   <h1>dream-tts</h1>
   <p class="lede">
-    Local text-to-speech in Rust. Three voice-cloning speech models ported from PyTorch,
-    validated stage by stage against fp32 activations dumped from their references.
-    A 1612-word chapter becomes eleven minutes of speech in 1m 44s, on a laptop.
+    Local text-to-speech in Rust. Four speech models ported from PyTorch — three that clone
+    a voice from a ten-second clip, one that does not — validated stage by stage against fp32
+    activations dumped from their references. A 1612-word chapter becomes eleven minutes of
+    speech in 1m 44s with a cloned voice, or twelve minutes in 31 seconds without.
     One process, no Python at runtime.
   </p>
   <p class="caveat">
@@ -99,8 +100,10 @@
     1612 words of prose — <code>examples/chapter.txt</code> in the repo — rendered on one
     M4 / 16&nbsp;GB laptop, each engine in the configuration it ships in. These are the
     complete chapters — eleven to thirteen minutes each — in two voices, cloned from two
-    reference clips of about ten seconds. Ordered by how they sound on this passage, best
-    first &mdash; a listening judgement, not a measured one, so trust your own ears over it.
+    reference clips of about ten seconds. The first three are ordered by how they sound on
+    this passage, best first &mdash; a listening judgement, not a measured one, so trust your
+    own ears over it. <code>kokoro</code> comes last because it is not in that comparison
+    at all: it cannot clone, so its two voices are its own.
   </p>
 
   <div class="engine">
@@ -174,10 +177,41 @@
     </div>
   </div>
 
+  <div class="engine">
+    <header>
+      <h3>kokoro</h3>
+      <span class="tag">Kokoro-82M · 82 M · 24 kHz · non-autoregressive, no cloning</span>
+    </header>
+    <div class="voices">
+      <label>af_heart</label>
+      <audio controls preload="none" src="https://huggingface.co/datasets/drmhse/tts-rs-assets/resolve/main/samples/chapter-kokoro.webm">
+        <a href="https://huggingface.co/datasets/drmhse/tts-rs-assets/resolve/main/samples/chapter-kokoro.webm">download</a>
+      </audio>
+      <label>am_michael</label>
+      <audio controls preload="none" src="https://huggingface.co/datasets/drmhse/tts-rs-assets/resolve/main/samples/chapter-kokoro-male.webm">
+        <a href="https://huggingface.co/datasets/drmhse/tts-rs-assets/resolve/main/samples/chapter-kokoro-male.webm">download</a>
+      </audio>
+    </div>
+    <div class="stats">
+      <span>af_heart <b>0.043</b> · 31s → 12:15</span>
+      <span>am_michael <b>0.041</b> · 33s → 13:32</span>
+    </div>
+    <p class="caveat">
+      These two are not cloned voices — they are 2 of the 28 style tables that ship inside
+      the checkpoint, so this row answers &ldquo;what does it sound like&rdquo; and not
+      &ldquo;how well does it clone&rdquo;. It is the only engine here with no
+      token-by-token loop: a duration is predicted for every phoneme at once and one
+      iSTFTNet pass produces the waveform, which is where <strong>23× realtime in
+      1.7&nbsp;GB</strong> comes from. Word error rate against the chapter text is
+      <b>0.009</b> for <code>af_heart</code> — the lowest of the eight files on this page —
+      and 0.042 for <code>am_michael</code>.
+    </p>
+  </div>
+
   <p class="headline">
-    A chapter becomes <strong>11 minutes of speech in 1m 44s</strong>, on a laptop —
-    6.8× faster than realtime. A 16-hour book is about
-    <strong>2.4 hours</strong> of compute rather than 11.5.
+    A chapter becomes <strong>11 minutes of speech in 1m 44s</strong> in a cloned voice, on a
+    laptop — 6.8× faster than realtime, so a 16-hour book is about <strong>2.4 hours</strong>
+    of compute rather than 11.5. Without cloning it is <strong>31 seconds</strong>.
   </p>
 
   <h2>Try it</h2>
@@ -190,9 +224,16 @@ cd dream-tts &amp;&amp; ./scripts/bootstrap.sh
     Python. The default engine, <code>qwen3tts</code>, has no conversion step, and a tagged
     release publishes prebuilt Apple-silicon binaries. <code>bootstrap.sh</code> downloads
     the checkpoint (~4.3&nbsp;GB, resumable, sha256-verified) and the correctness fixtures.
-    Add the other two with <code>bootstrap.sh audio8 cosyvoice</code> — those convert their
-    checkpoints with PyTorch, which is why they are not the default. <code>--list</code>
-    prints the ids and what each costs.
+    Add the others with <code>bootstrap.sh audio8 cosyvoice kokoro</code> — each converts its
+    checkpoint with PyTorch, which is why none of them is the default. <code>kokoro</code> is
+    the cheap one at ~0.7&nbsp;GB. <code>--list</code> prints the ids and what each costs.</p>
+<pre><code>./scripts/bootstrap.sh kokoro
+./dream-tts speak --engine kokoro --set voice=am_michael \
+    --text-file examples/chapter.txt --out chapter.wav</code></pre>
+  <p class="caveat">
+    <code>kokoro</code> takes <code>--set voice=&lt;name&gt;</code> rather than
+    <code>--voice</code>, because there is no asset to point at: the 28 voices live in the
+    checkpoint. <code>dream-tts engines</code> lists the ones installed.
   </p>
 
   <h2>Narrate a whole book</h2>
@@ -400,23 +441,27 @@ curl -X POST localhost:3003/v1/jobs/&lt;id&gt;/cancel    -H 'X-API-Key: secret'<
       <tr><td class="mono">qwen3tts</td><td class="num">0.148</td><td class="num">1m 44s</td><td>yes, 48 lanes</td><td>the default. Best quality here, and the only one that makes a book practical</td></tr>
       <tr><td class="mono">cosyvoice</td><td class="num">0.703–0.718</td><td class="num">8m 15s</td><td>no</td><td>you want the widest language coverage</td></tr>
       <tr><td class="mono">audio8</td><td class="num">0.527–0.536</td><td class="num">5m 47s</td><td>no</td><td>you want 44.1 kHz, the highest-fidelity output here</td></tr>
+      <tr><td class="mono">kokoro</td><td class="num">0.041–0.043</td><td class="num">31s</td><td>n/a, no loop</td><td>English, no cloning, and you want it now — or you have 2&nbsp;GB rather than 12</td></tr>
     </tbody>
   </table>
   </div>
   <p class="caveat">
-    Compare wall time, not just RTF: the three do not produce the same duration from the same
-    text — <code>cosyvoice</code> speaks slowest, 12:48 against <code>audio8</code>&rsquo;s
-    11:34 — and RTF divides by audio produced, which flatters a slower-speaking engine.
-    <code>qwen3tts</code> wins by this much only because it batches across sections, so it
-    wants length: on a 132-word passage it is 0.397, against 0.544 for <code>audio8</code>
-    and 0.716 for <code>cosyvoice</code>. Never benchmark it on a paragraph.
+    Compare wall time, not just RTF: the four do not produce the same duration from the same
+    text — <code>kokoro</code>&rsquo;s male voice speaks slowest, 13:32 against
+    <code>audio8</code>&rsquo;s 11:34 — and RTF divides by audio produced, which flatters a
+    slower-speaking engine. <code>qwen3tts</code> leads the cloning engines by this much only
+    because it batches across sections, so it wants length: on a 132-word passage it is 0.397,
+    against 0.544 for <code>audio8</code> and 0.716 for <code>cosyvoice</code>. Never
+    benchmark it on a paragraph. <code>kokoro</code> has nothing to batch and is steady at any
+    length — 0.044 on that same passage.
   </p>
   <p class="caveat">
     Memory is the other axis, and it runs the other way. On that short passage
-    <code>cosyvoice</code> peaks at 5.0&nbsp;GB and <code>audio8</code> at 9.7, against
-    <code>qwen3tts</code>&rsquo;s 12.3 — almost all of it the codec decoder&rsquo;s
-    activations rather than weights. <strong>16&nbsp;GB is what the default engine wants.</strong>
-    A smaller machine is better served by a different engine than by a smaller weight format.
+    <code>kokoro</code> peaks at 1.3&nbsp;GB, <code>cosyvoice</code> at 5.0 and
+    <code>audio8</code> at 9.7, against <code>qwen3tts</code>&rsquo;s 12.3 — almost all of the
+    last one the codec decoder&rsquo;s activations rather than weights.
+    <strong>16&nbsp;GB is what the default engine wants.</strong> A smaller machine is better
+    served by a different engine than by a smaller weight format.
   </p>
 
   <h2>What makes it fast</h2>
@@ -454,7 +499,12 @@ curl -X POST localhost:3003/v1/jobs/&lt;id&gt;/cancel    -H 'X-API-Key: secret'<
     Every engine is gated against per-stage fp32 activations dumped from its PyTorch
     reference, so a failure localises to a stage rather than to “the audio sounds wrong”.
     <code>audio8</code>’s greedy generation is <strong>bit-identical</strong> to its reference;
-    <code>cosyvoice</code>’s teacher-forced argmax matches 105/105.
+    <code>cosyvoice</code>’s teacher-forced argmax matches 105/105. <code>kokoro</code> has no
+    sampler at all, so every deterministic stage is compared directly — and its one stochastic
+    stage, the decoder’s excitation, is judged by a criterion the reference sets itself: the
+    phase accumulates to 165,303 radians, where one f32 ulp is 0.0156, so upstream does not
+    reproduce against <em>itself</em>. The port lands <strong>25.3&nbsp;dB</strong> from the
+    reference where the reference lands 19.7 and 20.7&nbsp;dB from its own other draws.
   </p>
   <p class="caveat">
     Free-running sampled output is deliberately <em>not</em> gated on equality —
@@ -467,7 +517,8 @@ curl -X POST localhost:3003/v1/jobs/&lt;id&gt;/cancel    -H 'X-API-Key: secret'<
   <footer>
     Ported from <a href="https://huggingface.co/Audio8/Audio8-TTS-Preview-0.6b">Audio8-TTS-Preview-0.6b</a>,
     <a href="https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B">Fun-CosyVoice3-0.5B</a> and
-    <a href="https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base">Qwen3-TTS-12Hz-1.7B-Base</a>,
+    <a href="https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base">Qwen3-TTS-12Hz-1.7B-Base</a> and
+    <a href="https://huggingface.co/hexgrad/Kokoro-82M">Kokoro-82M</a>,
     all Apache-2.0. This repository contains no model weights.
     Samples hosted in the <a href="https://huggingface.co/datasets/drmhse/tts-rs-assets">companion dataset</a>.
   </footer>

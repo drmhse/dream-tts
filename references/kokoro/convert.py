@@ -44,8 +44,8 @@ def main():
     total = sum(v.numel() for v in tensors.values())
     print(f'{len(tensors)} tensors, {total/1e6:.1f}M parameters, {folded_total} weight norms folded')
 
-    # One file for every voice: 54 x 522 KB of style vectors is not worth 54 downloads, and
-    # the engine has to be able to list them without fetching them.
+    # One file for every voice: 522 KB of style vectors each is not worth a download apiece,
+    # and the engine has to be able to list them without fetching them.
     voices = {}
     for name in sorted(os.listdir(args.voices)):
         if not name.endswith('.pt'):

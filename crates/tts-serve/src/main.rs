@@ -83,11 +83,14 @@ struct Args {
     #[arg(long)]
     engine: Option<String>,
     /// Voice asset directory used when a request does not name one. Defaults to the
-    /// asset shipped for the selected engine.
+    /// asset shipped for the selected engine, and is unused by an engine that cannot clone.
     #[arg(long)]
     voice: Option<String>,
     #[arg(long)]
     model_root: Option<String>,
+    /// Engine setting, e.g. `--set voice=am_michael` for kokoro's built-in voices.
+    #[arg(long = "set", value_parser = parse_override)]
+    overrides: Vec<(String, std::path::PathBuf)>,
     #[arg(long)]
     quant: Option<String>,
     #[arg(long)]
@@ -110,7 +113,9 @@ struct Args {
 
 pub struct App {
     engine: Box<dyn Engine>,
-    voice: Voice,
+    /// `None` for an engine that cannot clone: its voices are inside the checkpoint, so
+    /// there is no asset to hold and a request must not be given one.
+    voice: Option<Voice>,
     engine_id: String,
     sample_rate: u32,
     max_chars: usize,
@@ -334,12 +339,40 @@ struct Rendered {
     stages: Vec<(&'static str, f64)>,
 }
 
-async fn render(app: &Arc<App>, req: TtsRequest) -> Result<Rendered, ApiError> {
-    let voice = match &req.voice {
-        None => app.voice.clone(),
+/// The voice a request runs with: the one it named, else the process default. An engine
+/// that cannot clone rejects a named voice here rather than after the text is segmented.
+pub fn request_voice(app: &Arc<App>, named: &Option<String>) -> Result<Option<Voice>, ApiError> {
+    match named {
+        None => Ok(app.voice.clone()),
+        Some(dir) if app.voice.is_none() => Err(bad(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "engine `{}` cannot clone, so it takes no voice asset",
+                app.engine_id
+            ),
+        )),
         Some(dir) => Voice::load(dir)
-            .map_err(|e| bad(StatusCode::BAD_REQUEST, format!("loading voice {dir}: {e}")))?,
-    };
+            .map(Some)
+            .map_err(|e| bad(StatusCode::BAD_REQUEST, format!("loading voice {dir}: {e}"))),
+    }
+}
+
+pub fn with_optional_voice(request: SynthesisRequest, voice: Option<Voice>) -> SynthesisRequest {
+    match voice {
+        Some(v) => request.with_voice(v),
+        None => request,
+    }
+}
+
+fn parse_override(s: &str) -> Result<(String, std::path::PathBuf), String> {
+    let (k, v) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected key=value, got {s:?}"))?;
+    Ok((k.to_string(), std::path::PathBuf::from(v)))
+}
+
+async fn render(app: &Arc<App>, req: TtsRequest) -> Result<Rendered, ApiError> {
+    let voice = request_voice(app, &req.voice)?;
 
     let text = req.text.clone();
     let seed = req.seed;
@@ -355,7 +388,7 @@ async fn render(app: &Arc<App>, req: TtsRequest) -> Result<Rendered, ApiError> {
     let app2 = Arc::clone(app);
     let started = Instant::now();
     let out = tokio::task::spawn_blocking(move || {
-        let mut request = SynthesisRequest::new(text).with_voice(voice);
+        let mut request = with_optional_voice(SynthesisRequest::new(text), voice);
         request.max_chars = app2.segment_chars;
         if let Some(s) = seed {
             request.sampling = Sampling {
@@ -881,6 +914,10 @@ async fn main() -> Result<()> {
             tts_engines::default_id().to_string()
         }
     };
+    let clones = tts_engines::catalogue()
+        .into_iter()
+        .find(|c| c.id == engine_id)
+        .is_some_and(|c| c.cloning == tts_core::Cloning::PrecomputedAsset);
     // Same lenient resolution as the CLI: as typed, else against the install root, so a
     // service started from anywhere finds the voices that shipped with it.
     let voice_path = match args
@@ -888,23 +925,31 @@ async fn main() -> Result<()> {
         .clone()
         .or_else(|| cfg.settings.voice.as_ref().map(|p| p.display().to_string()))
     {
-        Some(v) => cfg.locate_or_err(std::path::Path::new(&v), "voice asset")?,
-        None => cfg.locate_or_err(
+        Some(v) if !clones => anyhow::bail!(
+            "engine `{engine_id}` cannot clone, so --voice {v} has nothing to load. \
+             Its own voices are selected with --set voice=<name>"
+        ),
+        Some(v) => Some(cfg.locate_or_err(std::path::Path::new(&v), "voice asset")?),
+        None if clones => Some(cfg.locate_or_err(
             std::path::Path::new(tts_engines::default_voice(&engine_id)),
             &format!("shipped voice for `{engine_id}`"),
-        )?,
+        )?),
+        None => None,
     }
-    .display()
-    .to_string();
+    .map(|p| p.display().to_string());
     let root = match &args.model_root {
         Some(p) => std::path::PathBuf::from(p),
         None => cfg.data_path(tts_engines::default_root(&engine_id)),
     };
+    let mut overrides = BTreeMap::new();
+    for (k, v) in &args.overrides {
+        overrides.insert(k.clone(), v.clone());
+    }
     let config = EngineConfig {
         model_root: root,
         quant: args.quant.clone().or_else(|| cfg.settings.quant.clone()),
         cpu: args.cpu,
-        overrides: BTreeMap::new(),
+        overrides,
     };
 
     // Before the weights: the load itself is most of the memory pressure this guards, and
@@ -920,8 +965,10 @@ async fn main() -> Result<()> {
     let load = Instant::now();
     let engine = tts_engines::load(&engine_id, &config)
         .with_context(|| format!("loading engine {engine_id}"))?;
-    let voice =
-        Voice::load(&voice_path).with_context(|| format!("loading voice asset {voice_path}"))?;
+    let voice = match &voice_path {
+        Some(p) => Some(Voice::load(p).with_context(|| format!("loading voice asset {p}"))?),
+        None => None,
+    };
     let caps = engine.capabilities();
     eprintln!(
         "loaded in {:.2}s — {} at {} Hz",
@@ -940,7 +987,17 @@ async fn main() -> Result<()> {
         api_key,
         gpu: tokio::sync::Semaphore::new(1),
         started: Instant::now(),
-        voice_name: voice_path.clone(),
+        // What the page and a job record report. An engine without assets names the
+        // built-in voice it was started with instead of a path that does not exist.
+        voice_name: voice_path.clone().unwrap_or_else(|| {
+            let name = args
+                .overrides
+                .iter()
+                .find(|(k, _)| k == "voice")
+                .map(|(_, v)| v.display().to_string())
+                .unwrap_or_else(|| "engine default".to_string());
+            format!("{name} (built-in)")
+        }),
         config_source: cfg.source.clone(),
         port,
         jobs: jobs::Jobs::open(&cfg.data_dir)?,

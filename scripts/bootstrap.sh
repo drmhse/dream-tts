@@ -3,7 +3,7 @@
 # From a fresh clone to working speech. Nothing here is manual.
 #
 #   ./scripts/bootstrap.sh                              qwen3tts, the default, ~4.3 GB
-#   ./scripts/bootstrap.sh --all                        all three engines, ~13 GB
+#   ./scripts/bootstrap.sh --all                        all four engines, ~14 GB
 #   ./scripts/bootstrap.sh audio8 cosyvoice             two of them
 #   ./scripts/bootstrap.sh --list                       what the ids are, and what each costs
 #   ./scripts/bootstrap.sh --force audio8               redo a conversion that already ran
@@ -14,8 +14,8 @@
 #
 # The default is qwen3tts alone, and that is the whole reason the default path needs
 # nothing but curl: its checkpoint is a plain download and it has no conversion step.
-# audio8 and cosyvoice both want python and a torch venv, so asking for either is what
-# buys you that cost — it is never paid by someone who did not ask.
+# audio8, cosyvoice and kokoro all want python and a torch venv, so asking for one of them
+# is what buys you that cost — it is never paid by someone who did not ask.
 #
 # No engine needs its upstream *repository*. CosyVoice's two un-derivable artifacts are
 # fetched as assets, so converting its checkpoint is a plain `torch.load`.
@@ -27,7 +27,7 @@ cd "$(dirname "$0")/.."
 ROOT="$PWD"
 
 # Catalogue order, matching `tts_engines::catalogue()`: the default leads.
-ALL_ENGINES="qwen3tts audio8 cosyvoice"
+ALL_ENGINES="qwen3tts kokoro audio8 cosyvoice"
 FORCE=""
 ENGINES=""
 BUILD_MODE=auto
@@ -36,8 +36,8 @@ usage() {
   cat <<'USAGE'
 usage: scripts/bootstrap.sh [--force] [--list] [engine ...]
 
-  engine    audio8 | cosyvoice | qwen3tts   (default: qwen3tts alone)
-  --all     every engine, ~13 GB, and a torch venv
+  engine    audio8 | cosyvoice | kokoro | qwen3tts   (default: qwen3tts alone)
+  --all     every engine, ~14 GB, and a torch venv
   --prebuilt  download this version's release binaries instead of building
   --build     build from source even on a machine that could download
   --force   redo a conversion whose output already exists
@@ -54,12 +54,13 @@ while [ $# -gt 0 ]; do
     --list)
       printf '%-11s %-34s %8s %-8s %s\n' engine model disk needs notes
       printf '%-11s %-34s %8s %-8s %s\n' qwen3tts  Qwen3-TTS-12Hz-1.7B-Base  "~4.3 GB" curl  "the default. Batches; best for long documents"
+      printf '%-11s %-34s %8s %-8s %s\n' kokoro    Kokoro-82M                "~0.7 GB" python "fastest here. 28 built-in voices, no cloning"
       printf '%-11s %-34s %8s %-8s %s\n' audio8    Audio8-TTS-Preview-0.6b   "~4 GB"   python "44.1 kHz, highest fidelity"
       printf '%-11s %-34s %8s %-8s %s\n' cosyvoice Fun-CosyVoice3-0.5B       "~4 GB"   python "widest language coverage"
       printf '\n%s\n' "python means a torch venv (~2.5 GB) for the conversion step, and python >= 3.10."
       exit 0 ;;
     -h|--help) usage; exit 0 ;;
-    audio8|cosyvoice|qwen3tts) ENGINES="$ENGINES $1"; shift ;;
+    audio8|cosyvoice|kokoro|qwen3tts) ENGINES="$ENGINES $1"; shift ;;
     --audio8-only) ENGINES="$ENGINES audio8"; shift ;;   # the old spelling
     *) usage >&2; printf '\nunknown argument: %s\n' "$1" >&2; exit 2 ;;
   esac
@@ -168,10 +169,10 @@ fi
 
 # ------------------------------------------------------------------ 3. python env
 #
-# Needed by Audio8's codec fold and by CosyVoice's conversion. Qwen3-TTS alone needs no
-# python at all — its setup is downloads — so building a torch venv for it would be waste.
+# Needed by Audio8's codec fold, CosyVoice's conversion and Kokoro's. Qwen3-TTS alone needs
+# no python at all — its setup is downloads — so building a torch venv for it would be waste.
 
-if ! wants audio8 && ! wants cosyvoice; then
+if ! wants audio8 && ! wants cosyvoice && ! wants kokoro; then
   say "Skipping the python env (only qwen3tts selected, which needs none)"
 elif [ -x "$VENV/bin/python" ]; then
   say "references/audio8/.venv already exists — skipping (delete it to rebuild)"
@@ -244,6 +245,40 @@ else
     || die "Qwen3-TTS download failed. Re-run to resume where it stopped."
 fi
 
+# ------------------------------------------------------------------ 4c. Kokoro
+#
+# The checkpoint is curl; the conversion is `torch.load` and a weight_norm fold, so it wants
+# the venv. The frontend — the exported spaCy tagger and the two lexicons — is fetched as an
+# asset in step 5, because exporting it needs spaCy and misaki rather than torch.
+
+KOKORO_W="$ROOT/references/kokoro/weights"
+if ! wants kokoro; then
+  say "Skipping the Kokoro checkpoint (not selected)"
+elif [ -f "$KOKORO_W/kokoro.safetensors" ] && [ -f "$KOKORO_W/voices.safetensors" ] && [ -z "$FORCE" ]; then
+  say "Kokoro checkpoint already converted — skipping (pass --force to redo)"
+else
+  # The 26 voicepacks this omits are the Spanish, French, Hindi, Italian, Japanese,
+  # Portuguese and Chinese ones. The frontend is an English lexicon, so they have no
+  # faithful path through it — shipping them would only offer a wrong pronunciation in a
+  # convincing voice.
+  say "Fetching Kokoro-82M (~340 MB) and its 28 English voicepacks"
+  voices=""
+  for v in af_alloy af_aoede af_bella af_heart af_jessica af_kore af_nicole af_nova \
+           af_river af_sarah af_sky am_adam am_echo am_eric am_fenrir am_liam am_michael \
+           am_onyx am_puck am_santa bf_alice bf_emma bf_isabella bf_lily bm_daniel \
+           bm_fable bm_george bm_lewis; do
+    voices="$voices voices/$v.pt"
+  done
+  # shellcheck disable=SC2086
+  "$ROOT/scripts/fetch-weights.sh" "$KOKORO_W" \
+    https://huggingface.co/hexgrad/Kokoro-82M/resolve/main \
+    config.json kokoro-v1_0.pth $voices \
+    || die "Kokoro download failed. Re-run to resume where it stopped."
+  need_python
+  say "Folding weight_norm and packing the voicepacks into safetensors"
+  ( cd "$ROOT/references/kokoro" && "$VENV/bin/python" convert.py )
+fi
+
 # ------------------------------------------------------------------ 5. derived assets
 
 # The fixture oracles and the two CosyVoice artifacts that need the upstream python package.
@@ -270,15 +305,16 @@ fi
 # keep working when a later bootstrap adds a second engine.
 first="${ENGINES%% *}"
 case "$first" in
-  audio8)    voice=voices/cosy-default ;;
-  cosyvoice) voice=voices/cosy-default-cosyvoice ;;
-  qwen3tts)  voice=voices/cosy-default-qwen3tts ;;
+  audio8)    voice="--voice voices/cosy-default" ;;
+  cosyvoice) voice="--voice voices/cosy-default-cosyvoice" ;;
+  qwen3tts)  voice="--voice voices/cosy-default-qwen3tts" ;;
+  kokoro)    voice="--set voice=af_heart" ;;   # no asset: the voices are in the checkpoint
 esac
 
 say "Done — set up: $ENGINES"
 cat <<EOF
 
-    ./dream-tts speak --engine $first --voice $voice \\
+    ./dream-tts speak --engine $first $voice \\
         --text "Hello from a fresh checkout." --out hello.wav
 
     ./dream-tts engines           # what is installed, and what each supports
@@ -301,12 +337,17 @@ wants cosyvoice && [ ! -f "$COSY_W/llm.safetensors" ] && {
   printf '\n  * CosyVoice has no checkpoint — see docs/reference.md#setup.\n'; missing=1; }
 wants qwen3tts && [ ! -f "$QWEN_W/model.safetensors" ] && {
   printf '\n  * Qwen3-TTS has no checkpoint — see docs/reference.md#setup.\n'; missing=1; }
-for e in audio8 cosyvoice qwen3tts; do
-  if [ ! -f "$ROOT/fixtures/$e/oracle.safetensors" ]; then
+wants kokoro && [ ! -f "$KOKORO_W/kokoro.safetensors" ] && {
+  printf '\n  * Kokoro has no checkpoint — see docs/reference.md#setup.\n'; missing=1; }
+# kokoro's oracle is `forward`, not `oracle`: its gate compares stage activations rather
+# than one dumped tensor set.
+for e in audio8 cosyvoice kokoro qwen3tts; do
+  oracle=oracle; [ "$e" = kokoro ] && oracle=forward
+  if [ ! -f "$ROOT/fixtures/$e/$oracle.safetensors" ]; then
     printf '  * The %s fixture gate has no fixtures — rerun ./scripts/fetch-assets.sh\n' "$e"
     missing=1
   fi
 done
-[ "$missing" -eq 0 ] && printf '\nEverything selected is present, and all three fixture gates.\n'
+[ "$missing" -eq 0 ] && printf '\nEverything selected is present, and all four fixture gates.\n'
 
 printf '\nVerify with:  ./scripts/gates.sh\n'

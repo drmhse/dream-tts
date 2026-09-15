@@ -5,8 +5,9 @@ description: Set up and drive dream-tts, the offline text-to-speech engine at ~/
 
 # dream-tts
 
-Offline TTS in Rust with Metal kernels. Three engines behind one CLI; `qwen3tts` is the default
-and the one to use unless something specific rules it out.
+Offline TTS in Rust with Metal kernels. Four engines behind one CLI; `qwen3tts` is the default
+and the one to use unless something specific rules it out. `kokoro` is the exception worth
+knowing: 23x realtime in 1.3 GB, English only, and it cannot clone a voice.
 
 Repository: `~/Desktop/projects/AI/tts/tts-rs`. Read `AGENTS.md` in the repo root first; it
 carries the rules that hold regardless of the task. `README.md` is the canonical guide and

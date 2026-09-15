@@ -59,9 +59,13 @@ use tts_core::{Capabilities, Engine, EngineConfig};
 /// [`Capabilities::languages`] and is reported by [`default_caveat`], so a caller that
 /// did not choose an engine is told what it got instead of being quietly given a
 /// different one.
+///
+/// `kokoro` follows it rather than leads despite being the fastest here: it cannot clone,
+/// so defaulting to it would answer a request for a cloned voice with a stranger's.
 pub fn catalogue() -> Vec<Capabilities> {
     vec![
         qwen3tts::capabilities(),
+        kokoro::engine::capabilities(),
         audio8::engine::capabilities(),
         cosyvoice::capabilities(),
     ]
@@ -87,6 +91,7 @@ pub fn load(id: &str, config: &EngineConfig) -> Result<Box<dyn Engine>> {
         audio8::engine::ID => Ok(Box::new(audio8::engine::Audio8Engine::load(config)?)),
         cosyvoice::ID => Ok(Box::new(cosyvoice::CosyVoiceEngine::load(config)?)),
         qwen3tts::ID => Ok(Box::new(qwen3tts::Qwen3TtsEngine::load(config)?)),
+        kokoro::engine::ID => Ok(Box::new(kokoro::engine::KokoroEngine::load(config)?)),
         other => anyhow::bail!("unknown engine `{other}`; available: {}", ids().join(", ")),
     }
 }
@@ -114,7 +119,28 @@ pub fn default_voice(id: &str) -> &'static str {
         audio8::engine::ID => "voices/cosy-default",
         cosyvoice::ID => "voices/cosy-default-cosyvoice",
         qwen3tts::ID => "voices/cosy-default-qwen3tts",
+        // kokoro is Cloning::None: its voices are inside the checkpoint, so there is no
+        // asset to name. `every_id_has_conventions` skips it for that reason.
+        kokoro::engine::ID => "",
         _ => "",
+    }
+}
+
+/// The voices an engine carries inside its own checkpoint, for one that cannot clone.
+///
+/// Read from the asset rather than listed here: which voicepacks were installed is a fact
+/// about the disk, and a caller asking "what can I pass to `--set voice=`" wants the ones
+/// that are actually there. `Ok(vec![])` when the engine has none or the asset is absent.
+pub fn builtin_voices(id: &str, root: &std::path::Path) -> Result<Vec<String>> {
+    match id {
+        kokoro::engine::ID => {
+            let path = root.join("voices.safetensors");
+            if !path.exists() {
+                return Ok(Vec::new());
+            }
+            kokoro::model::Voices::names_in(&path)
+        }
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -125,6 +151,7 @@ pub fn default_root(id: &str) -> &'static str {
         audio8::engine::ID => "references/audio8/weights",
         cosyvoice::ID => "references/cosyvoice/weights",
         qwen3tts::ID => "references/qwen3tts/weights",
+        kokoro::engine::ID => "references/kokoro/weights",
         _ => ".",
     }
 }
@@ -138,13 +165,25 @@ mod tests {
         assert_eq!(default_id(), qwen3tts::ID);
     }
 
-    /// Every id must resolve to a shipped voice and a model root. A new engine that
-    /// forgets either one fails here rather than at a caller's first request.
+    /// Every id must resolve to a model root, and to a shipped voice exactly when it
+    /// clones from one. A new engine that forgets either fails here rather than at a
+    /// caller's first request.
     #[test]
     fn every_id_has_conventions() {
-        for id in ids() {
-            assert!(!default_voice(id).is_empty(), "{id} has no default voice");
-            assert_ne!(default_root(id), ".", "{id} has no default model root");
+        for caps in catalogue() {
+            let clones = caps.cloning != tts_core::Cloning::None;
+            assert_eq!(
+                clones,
+                !default_voice(caps.id).is_empty(),
+                "{} has a shipped voice iff it clones from one",
+                caps.id
+            );
+            assert_ne!(
+                default_root(caps.id),
+                ".",
+                "{} has no default model root",
+                caps.id
+            );
         }
     }
 

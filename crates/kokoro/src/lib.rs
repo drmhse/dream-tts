@@ -8,6 +8,7 @@ pub mod albert;
 pub mod blocks;
 pub mod cfg;
 pub mod decoder;
+pub mod engine;
 pub mod lstm;
 pub mod model;
 pub mod predictor;

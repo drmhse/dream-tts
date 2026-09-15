@@ -59,6 +59,8 @@ case "$BIN" in
   audio8-validate)    CRATE=audio8    ;;
   cosyvoice-validate) CRATE=cosyvoice ;;
   qwen3tts-validate)  CRATE=qwen3tts  ;;
+  kokoro-validate)    CRATE=kokoro    ;;
+  kokoro-render)      CRATE=kokoro    ;;
   narrate-diff)       CRATE=tts-narrate ;;
   *) printf 'error: unknown binary `%s`\n' "$BIN" >&2; exit 2 ;;
 esac

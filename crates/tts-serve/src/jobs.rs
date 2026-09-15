@@ -174,8 +174,15 @@ async fn run_one_chapter(app: &Arc<App>, mut job: Job) -> anyhow::Result<()> {
     let text = std::fs::read_to_string(&chapter.text_path)
         .map_err(|e| anyhow::anyhow!("reading {}: {e}", chapter.text_path))?;
 
-    let voice =
-        Voice::load(&job.voice).map_err(|e| anyhow::anyhow!("loading voice {}: {e}", job.voice))?;
+    // A job records the voice it was submitted with, which for an engine that cannot clone
+    // is the built-in name rather than a path — there is nothing to load.
+    let voice = app
+        .voice
+        .is_some()
+        .then(|| {
+            Voice::load(&job.voice).map_err(|e| anyhow::anyhow!("loading voice {}: {e}", job.voice))
+        })
+        .transpose()?;
 
     // The same permit one-off requests take: chapters queue behind them and each other.
     let _permit = app.gpu.acquire().await?;
@@ -190,8 +197,7 @@ async fn run_one_chapter(app: &Arc<App>, mut job: Job) -> anyhow::Result<()> {
     // discarded and redone on resume. The cost, stated, rather than a slow control.
     let stop = Arc::clone(&app.jobs.interrupt);
     let outcome = tokio::task::spawn_blocking(move || {
-        let mut request = SynthesisRequest::new(text)
-            .with_voice(voice)
+        let mut request = crate::with_optional_voice(SynthesisRequest::new(text), voice)
             .with_progress(Arc::new(move |event| progress.on(event)))
             .with_interrupt(Arc::new(move || {
                 stop.load(std::sync::atomic::Ordering::Relaxed)
