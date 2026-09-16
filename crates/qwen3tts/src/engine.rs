@@ -126,6 +126,7 @@ pub fn capabilities() -> Capabilities {
         // The architecture streams natively; the trait has no streaming method yet, so
         // claiming it would be a lie a client could act on. See the module docs.
         streaming: false,
+        word_timings: false,
         quantization: QUANT,
         languages: Some(cfg::talker::LANGUAGES),
         available: true,
@@ -669,6 +670,9 @@ impl Engine for Qwen3TtsEngine {
                 sample_rate: cfg::SAMPLE_RATE as u32,
             },
             stats,
+            // This engine does not predict per-phoneme durations, so it has no
+            // word clock to offer.
+            words: None,
         })
     }
 }

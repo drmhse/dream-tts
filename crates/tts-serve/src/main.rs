@@ -337,6 +337,7 @@ struct Rendered {
     seconds: f64,
     wall: f64,
     stages: Vec<(&'static str, f64)>,
+    words: Option<Vec<tts_core::WordTime>>,
 }
 
 /// The voice a request runs with: the one it named, else the process default. An engine
@@ -418,7 +419,38 @@ async fn render(app: &Arc<App>, req: TtsRequest) -> Result<Rendered, ApiError> {
         seconds,
         wall,
         stages: out.stats.stages,
+        words: out.words,
     })
+}
+
+/// The word clock as `text:start:end` triples, or empty when there is none.
+///
+/// Omitted above a size that a header should not carry. A client that gets no clock falls back
+/// to the whole render's duration, which is what it did before this existed — losing precision
+/// rather than being told something untrue.
+fn word_header(words: Option<&[tts_core::WordTime]>) -> String {
+    const CEILING: usize = 8 * 1024;
+    let Some(words) = words else {
+        return String::new();
+    };
+    let out = words
+        .iter()
+        // A word cannot contain a space, so space separates and a colon splits.
+        .map(|w| {
+            format!(
+                "{}:{:.3}:{:.3}",
+                w.text.replace([' ', ':'], ""),
+                w.start,
+                w.end
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if out.len() > CEILING {
+        String::new()
+    } else {
+        out
+    }
 }
 
 // ---------------------------------------------------------------- handlers
@@ -462,6 +494,11 @@ async fn post_tts(
                 .collect::<Vec<_>>()
                 .join(","),
         ),
+        // Additive: when each word is said, for an engine that knows. Compact triples rather
+        // than objects because this rides in a header, and a header is the right place for it
+        // — the body is the audio, and a client that wants the clock wants it with the audio
+        // rather than from a second request that would have to synthesise again.
+        hdr("x-words", word_header(r.words.as_deref())),
     ] {
         if let Ok(v) = value {
             out = out.header(name, v);
@@ -846,7 +883,15 @@ async fn get_capabilities(State(app): State<Arc<App>>) -> Json<serde_json::Value
         "streaming": caps.streaming,
         "cloning": format!("{:?}", caps.cloning),
         "jobs": {"durable": true, "route": "/v1/jobs"},
-        "alignment": {"available": false, "reason": "needs a separate whisper environment"},
+        "alignment": if caps.word_timings {
+            serde_json::json!({
+                "available": true,
+                "source": "the engine's own duration predictor",
+                "header": "x-words",
+            })
+        } else {
+            serde_json::json!({"available": false, "reason": "needs a separate whisper environment"})
+        },
         // No supervisor, no recycle budget, no reload: there is no MPSGraph cache to
         // reclaim, so the model stays resident for the process lifetime.
         "modelWorker": {"inProcess": true, "recycles": 0, "reason": "memory is flat by construction"},

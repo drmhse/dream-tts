@@ -70,6 +70,7 @@ pub fn capabilities() -> Capabilities {
         // the flow's chunked attention masks are both unimplemented on purpose — see
         // docs/reference.md#porting-traps.
         streaming: false,
+        word_timings: false,
         quantization: QUANT,
         languages: None,
         available: true,
@@ -594,6 +595,9 @@ impl Engine for CosyVoiceEngine {
                 sample_rate: cfg::SAMPLE_RATE as u32,
             },
             stats,
+            // This engine does not predict per-phoneme durations, so it has no
+            // word clock to offer.
+            words: None,
         })
     }
 }

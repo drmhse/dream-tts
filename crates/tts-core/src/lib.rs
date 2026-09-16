@@ -28,7 +28,7 @@ pub mod wav;
 pub use config::{Config, Settings};
 pub use engine::{
     Audio, Capabilities, Cloning, Engine, EngineConfig, Gaps, Interrupt, Interrupted, Progress,
-    ProgressEvent, Sampling, Stats, Synthesis, SynthesisRequest,
+    ProgressEvent, Sampling, Stats, Synthesis, SynthesisRequest, WordTime,
 };
 pub use lock::GpuLock;
 pub use voice::Voice;

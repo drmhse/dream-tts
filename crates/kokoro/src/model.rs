@@ -105,6 +105,24 @@ impl Model {
         speed: f32,
         draws: &mut (dyn Draws + Send),
     ) -> Result<(Vec<f32>, Vec<(&'static str, f64)>)> {
+        let (audio, timings, _) = self.synthesize_aligned(ids, style, speed, draws)?;
+        Ok((audio, timings))
+    }
+
+    /// The audio, the stage timings, and how many frames each id was given.
+    ///
+    /// The frame counts are the alignment, and they cost nothing: the model has to predict a
+    /// length for every phoneme before it can render any audio at all — on this machine that
+    /// is 1% of a synthesis — and until now it was computed and dropped. Returning it is the
+    /// difference between a word clock that is free and one that needs a second model and a
+    /// second pass over the audio.
+    pub fn synthesize_aligned(
+        &self,
+        ids: &[u32],
+        style: &Tensor,
+        speed: f32,
+        draws: &mut (dyn Draws + Send),
+    ) -> Result<(Vec<f32>, Vec<(&'static str, f64)>, Vec<usize>)> {
         let mut timings: Vec<(&'static str, f64)> = Vec::new();
         // Metal dispatch is asynchronous: a timer that stops when a stage returns measures
         // enqueue time and bills the work to whatever is timed next.
@@ -141,6 +159,6 @@ impl Model {
 
         let audio = self.decoder.forward(&asr, &f0, &energy, &s_dec, draws)?;
         lap("decoder", &mut timings, &mut mark, &self.device)?;
-        Ok((audio, timings))
+        Ok((audio, timings, durations))
     }
 }

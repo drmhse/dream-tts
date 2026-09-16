@@ -13,7 +13,7 @@ use candle_core::Device;
 use std::time::Instant;
 use tts_core::{
     text, wav, Audio, Capabilities, Cloning, Engine, EngineConfig, Stats, Synthesis,
-    SynthesisRequest,
+    SynthesisRequest, WordTime,
 };
 
 pub const ID: &str = crate::ID;
@@ -49,6 +49,9 @@ pub fn capabilities() -> Capabilities {
         frame_rate: Config::SAMPLE_RATE as f64 / HOP as f64,
         cloning: Cloning::None,
         streaming: false,
+        // The duration predictor already computes a length for every phoneme on the
+        // way to the audio; returning it is the whole cost.
+        word_timings: true,
         quantization: &["f32"],
         languages: Some(&["english"]),
         available: true,
@@ -114,18 +117,23 @@ impl Engine for KokoroEngine {
             .flat_map(|(pi, para)| para.iter().map(move |s| (pi, s)))
             .collect();
         anyhow::ensure!(!flat.is_empty(), "no text to speak");
-        request.notify(tts_core::ProgressEvent::Planned { segments: flat.len() });
+        request.notify(tts_core::ProgressEvent::Planned {
+            segments: flat.len(),
+        });
 
         let mut draws = SeededDraws::new(request.sampling.seed);
         let mut stats = Stats::default();
         let mut unknown: Vec<String> = Vec::new();
         let mut pieces: Vec<(usize, Vec<f32>)> = Vec::new();
+        // Word times relative to each piece, offset into the whole when the pieces are joined.
+        let mut piece_words: Vec<Vec<WordTime>> = Vec::new();
         let t0 = Instant::now();
 
         for (k, (pi, segment)) in flat.iter().enumerate() {
             let (phonemes, mut oov) = self.g2p.phonemize_report(segment);
             unknown.append(&mut oov);
-            let ids = self.model.cfg.encode(&phonemes);
+            let (_, spans) = self.g2p.phonemize_spans(segment);
+            let (ids, offsets) = self.model.cfg.encode_spans(&phonemes);
             anyhow::ensure!(
                 ids.len() <= MAX_TOKENS,
                 "segment {k} is {} tokens, over the {MAX_TOKENS} the position table holds; \
@@ -136,13 +144,25 @@ impl Engine for KokoroEngine {
                 continue;
             }
             let style = self.voices.style(&self.voice, ids.len() - 2)?;
-            let (samples, timings) =
-                self.model.synthesize_timed(&ids, &style, 1.0, &mut draws)?;
+            let (samples, timings, durations) = self
+                .model
+                .synthesize_aligned(&ids, &style, 1.0, &mut draws)?;
             for (stage, secs) in timings {
                 stats.add(stage, secs);
             }
             stats.frames += samples.len() / HOP;
             stats.segments += 1;
+            // Seconds per predictor frame, taken from the audio this render actually produced
+            // rather than from a constant. The decoder's upsampling is a property of the
+            // checkpoint, and a constant that is right for one and wrong for another would
+            // compress the whole clock silently — which is exactly what a wrong `HOP` did.
+            let frames: usize = durations.iter().sum();
+            let per_frame = if frames == 0 {
+                0.0
+            } else {
+                samples.len() as f64 / frames as f64 / Config::SAMPLE_RATE as f64
+            };
+            piece_words.push(word_times(&spans, &offsets, &durations, per_frame));
             pieces.push((*pi, samples));
             request.advanced("decoder", k + 1, flat.len());
             request.check_interrupt(k + 1)?;
@@ -166,19 +186,147 @@ impl Engine for KokoroEngine {
         let gap = wav::silence(rate, request.gaps.segment_ms);
         let para_gap = wav::silence(rate, request.gaps.paragraph_ms);
         let mut samples: Vec<f32> = Vec::new();
+        let mut words: Vec<WordTime> = Vec::new();
         let mut prev: Option<usize> = None;
-        for (pi, piece) in &pieces {
+        for ((pi, piece), piece_words) in pieces.iter().zip(&piece_words) {
             if let Some(p) = prev {
                 samples.extend_from_slice(if *pi != p { &para_gap } else { &gap });
             }
+            // Offset by where this piece landed, gaps included: a word's time is a time in
+            // the audio that is returned, not in the piece it was rendered from.
+            let at = samples.len() as f64 / rate as f64;
+            words.extend(piece_words.iter().map(|w| WordTime {
+                text: w.text.clone(),
+                start: w.start + at,
+                end: w.end + at,
+            }));
             samples.extend_from_slice(piece);
             prev = Some(*pi);
         }
         anyhow::ensure!(!samples.is_empty(), "engine {ID} produced no audio");
 
         Ok(Synthesis {
-            audio: Audio { samples, sample_rate: Config::SAMPLE_RATE },
+            audio: Audio {
+                samples,
+                sample_rate: Config::SAMPLE_RATE,
+            },
             stats,
+            words: Some(words),
         })
+    }
+}
+
+/// Frames per phoneme, into seconds per word.
+///
+/// `offsets[i]` is where in the phoneme string id `i` came from, and a span says which bytes of
+/// that string one source word produced — so the id belongs to the word whose span contains its
+/// offset. Both are in reading order, so one walk places every phoneme.
+///
+/// The pad ids at each end belong to no word and are given an offset past every span. Their
+/// frames still advance the clock, because they are real audio: a word's start is where it
+/// starts in the file, not where it starts among the words.
+fn word_times(
+    spans: &[tts_phoneme::g2p::WordSpan],
+    offsets: &[Option<usize>],
+    durations: &[usize],
+    per_frame: f64,
+) -> Vec<WordTime> {
+    let seconds = |frames: usize| frames as f64 * per_frame;
+    let mut bounds: Vec<Option<(usize, usize)>> = vec![None; spans.len()];
+    let mut frame = 0usize;
+    let mut at = 0usize;
+
+    for (id, length) in durations.iter().enumerate() {
+        // A pad belongs to no phoneme, so it moves the clock and not the cursor.
+        if let Some(offset) = offsets.get(id).copied().flatten() {
+            while at < spans.len() && spans[at].phonemes.end <= offset {
+                at += 1;
+            }
+            if at < spans.len() && spans[at].phonemes.contains(&offset) {
+                bounds[at] = Some(match bounds[at] {
+                    Some((start, _)) => (start, frame + length),
+                    None => (frame, frame + length),
+                });
+            }
+        }
+        frame += length;
+    }
+
+    spans
+        .iter()
+        .zip(bounds)
+        .filter_map(|(span, bound)| {
+            let (start, end) = bound?;
+            Some(WordTime {
+                text: span.text.clone(),
+                start: seconds(start),
+                end: seconds(end),
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tts_phoneme::g2p::WordSpan;
+
+    fn span(text: &str, phonemes: std::ops::Range<usize>) -> WordSpan {
+        WordSpan {
+            text: text.to_string(),
+            phonemes,
+        }
+    }
+
+    /// The pads carry real audio and no word, so the first word does not start at zero and the
+    /// last does not end at the file's end.
+    #[test]
+    fn a_word_is_timed_by_the_phonemes_it_owns() {
+        // "hi there": phonemes "hI DEr", two words either side of a space at byte 2.
+        let spans = vec![span("hi", 0..2), span("there", 3..6)];
+        //          pad  h  I  (space dropped)  D  E  r  pad
+        let offsets = vec![None, Some(0), Some(1), Some(3), Some(4), Some(5), None];
+        let durations = vec![4, 2, 6, 3, 5, 2, 4];
+        let frame = 0.0125;
+        let out = word_times(&spans, &offsets, &durations, frame);
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].text, "hi");
+        // Starts after the leading pad's 4 frames, runs for 2 + 6.
+        assert!((out[0].start - 4.0 * frame).abs() < 1e-9, "{:?}", out[0]);
+        assert!((out[0].end - 12.0 * frame).abs() < 1e-9, "{:?}", out[0]);
+        assert_eq!(out[1].text, "there");
+        assert!((out[1].start - 12.0 * frame).abs() < 1e-9, "{:?}", out[1]);
+        assert!((out[1].end - 22.0 * frame).abs() < 1e-9, "{:?}", out[1]);
+    }
+
+    /// A word whose phonemes were all dropped by the vocabulary has no time to report, and
+    /// inventing one would be the interpolation this whole path exists to avoid.
+    #[test]
+    fn a_word_with_no_phonemes_is_left_out_rather_than_guessed() {
+        let spans = vec![
+            span("hi", 0..2),
+            span("\u{1f600}", 2..2),
+            span("there", 3..6),
+        ];
+        let offsets = vec![None, Some(0), Some(1), Some(3), Some(4), Some(5), None];
+        let durations = vec![4, 2, 6, 3, 5, 2, 4];
+        let out = word_times(&spans, &offsets, &durations, 0.0125);
+        assert_eq!(
+            out.iter().map(|w| w.text.as_str()).collect::<Vec<_>>(),
+            ["hi", "there"]
+        );
+    }
+
+    #[test]
+    fn a_word_clock_never_runs_backwards() {
+        let spans = vec![span("a", 0..1), span("b", 2..3), span("c", 4..5)];
+        let offsets = vec![None, Some(0), Some(2), Some(4), None];
+        let durations = vec![1, 7, 3, 9, 1];
+        let out = word_times(&spans, &offsets, &durations, 0.0125);
+        for pair in out.windows(2) {
+            assert!(pair[0].end <= pair[1].start, "{pair:?}");
+            assert!(pair[0].start < pair[0].end, "{pair:?}");
+        }
     }
 }

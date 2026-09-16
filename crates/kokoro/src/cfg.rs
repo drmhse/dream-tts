@@ -59,9 +59,27 @@ impl Config {
     }
 
     pub fn encode(&self, phonemes: &str) -> Vec<u32> {
+        self.encode_spans(phonemes).0
+    }
+
+    /// The ids, and the byte offset in `phonemes` each one came from.
+    ///
+    /// The offsets are what let a per-phoneme duration be attributed to a word: the model
+    /// predicts one length per id, and an id means nothing without knowing which phoneme —
+    /// and so which word — it stands for. `None` is the pad at each end, which stands for no
+    /// phoneme at all; saying so beats giving it an offset past the string, which reads as a
+    /// position and would carry a cursor off the end.
+    pub fn encode_spans(&self, phonemes: &str) -> (Vec<u32>, Vec<Option<usize>>) {
         let mut ids = vec![0u32];
-        ids.extend(phonemes.chars().filter_map(|c| self.vocab.get(&c.to_string()).copied()));
+        let mut at = vec![None];
+        for (offset, c) in phonemes.char_indices() {
+            if let Some(id) = self.vocab.get(&c.to_string()).copied() {
+                ids.push(id);
+                at.push(Some(offset));
+            }
+        }
         ids.push(0);
-        ids
+        at.push(None);
+        (ids, at)
     }
 }

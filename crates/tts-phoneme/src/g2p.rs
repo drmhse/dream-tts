@@ -30,6 +30,13 @@ fn punct_tag_phoneme(tag: &str) -> Option<&'static str> {
     }
 }
 
+/// One source word, and the bytes of the phoneme string it produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WordSpan {
+    pub text: String,
+    pub phonemes: std::ops::Range<usize>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct MToken {
     pub text: String,
@@ -379,6 +386,17 @@ impl G2P {
         self.phonemize_report(text).0
     }
 
+    /// The phonemes, and which slice of them each source word produced.
+    ///
+    /// The spans are what makes alignment free. A duration-predicting model already computes
+    /// a length for every phoneme on the way to the audio; knowing which word each phoneme
+    /// belongs to turns that into a word clock without a second model, a second pass over the
+    /// audio, or a recogniser that has to be told what it is listening to.
+    pub fn phonemize_spans(&self, text: &str) -> (String, Vec<WordSpan>) {
+        let (phonemes, _, spans) = self.run(text, true);
+        (phonemes, spans)
+    }
+
     /// misaki exactly, with nothing derived — what the byte-identity gate compares.
     pub fn phonemize_strict(&self, text: &str) -> String {
         self.run(text, false).0
@@ -386,10 +404,11 @@ impl G2P {
 
     /// Also returns the words nothing could pronounce — the lint, rather than a guess.
     pub fn phonemize_report(&self, text: &str) -> (String, Vec<String>) {
-        self.run(text, true)
+        let (phonemes, unknown, _) = self.run(text, true);
+        (phonemes, unknown)
     }
 
-    fn run(&self, text: &str, derive_unknown: bool) -> (String, Vec<String>) {
+    fn run(&self, text: &str, derive_unknown: bool) -> (String, Vec<String>, Vec<WordSpan>) {
         let mut unknown: Vec<String> = Vec::new();
         let mut words = self.retokenize(self.tokenize(text.trim_start()));
         let mut ctx = TokenContext::default();
@@ -472,16 +491,30 @@ impl G2P {
             })
             .collect();
         let mut out = String::new();
+        let mut spans: Vec<WordSpan> = Vec::with_capacity(merged.len());
         for tk in &merged {
+            let start = out.len();
             match &tk.phonemes {
                 // The 1.0 vocabulary has no flap or glottal stop; both are spelled with
                 // the letters the model was trained on.
                 Some(p) => out.push_str(&p.replace('ɾ', "T").replace('ʔ', "t")),
                 None => out.push_str(UNK),
             }
+            // A part of a merged compound carries no phonemes of its own — the head took
+            // them all — so it joins the head rather than becoming a word that is said in no
+            // time at all.
+            match (out.len() == start, spans.last_mut()) {
+                (true, Some(last)) => {
+                    last.text.push_str(&tk.text);
+                }
+                _ => spans.push(WordSpan {
+                    text: tk.text.clone(),
+                    phonemes: start..out.len(),
+                }),
+            }
             out.push_str(&tk.whitespace);
         }
-        (out, unknown)
+        (out, unknown, spans)
     }
 
     /// The derivation stage, plus the lint. A word reported here is one the voice cannot

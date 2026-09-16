@@ -39,6 +39,13 @@ pub struct Capabilities {
     pub frame_rate: f64,
     pub cloning: Cloning,
     pub streaming: bool,
+    /// The engine reports when each word is said, in `Synthesis::words`.
+    ///
+    /// True only where it is free: a model that predicts a length per phoneme on the way to
+    /// the audio already knows. It is not a claim that alignment is possible — a recogniser
+    /// can align anything — but that it costs nothing, which is what makes it worth having on
+    /// by default.
+    pub word_timings: bool,
     /// Weight formats `EngineConfig::quant` accepts, most faithful first.
     pub quantization: &'static [&'static str],
     /// `Some` when the engine only speaks a closed set, lowercase English names.
@@ -271,9 +278,25 @@ impl Stats {
     }
 }
 
+/// One word, and when it is said, in seconds from the start of the audio.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WordTime {
+    pub text: String,
+    pub start: f64,
+    pub end: f64,
+}
+
 pub struct Synthesis {
     pub audio: Audio,
     pub stats: Stats,
+    /// When each word is spoken, for an engine that knows.
+    ///
+    /// `None` is not "this engine is inaccurate" but "this engine was never asked to say" —
+    /// a model that predicts a duration per phoneme on the way to the audio already holds the
+    /// answer, and the only reason it was ever unavailable is that nobody returned it. The
+    /// alternative is a recogniser listening to speech that was just generated from a script,
+    /// which costs a second model and a second pass to recover what the first one knew.
+    pub words: Option<Vec<WordTime>>,
 }
 
 /// How to load an engine. `model_root` plus conventional filenames covers the normal

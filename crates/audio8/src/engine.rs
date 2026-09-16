@@ -54,6 +54,7 @@ pub fn capabilities() -> Capabilities {
         frame_rate: cfg::frame_rate(),
         cloning: Cloning::PrecomputedAsset,
         streaming: false,
+        word_timings: false,
         quantization: QUANT,
         languages: None,
         available: true,
@@ -235,6 +236,9 @@ impl Engine for Audio8Engine {
                 sample_rate: cfg::SAMPLE_RATE as u32,
             },
             stats,
+            // This engine does not predict per-phoneme durations, so it has no
+            // word clock to offer.
+            words: None,
         })
     }
 }
