@@ -124,7 +124,7 @@ impl Engine for KokoroEngine {
         let mut draws = SeededDraws::new(request.sampling.seed);
         let mut stats = Stats::default();
         let mut unknown: Vec<String> = Vec::new();
-        let mut pieces: Vec<(usize, Vec<f32>)> = Vec::new();
+        let mut pieces: Vec<tts_core::Piece> = Vec::new();
         // Word times relative to each piece, offset into the whole when the pieces are joined.
         let mut piece_words: Vec<Vec<WordTime>> = Vec::new();
         let t0 = Instant::now();
@@ -163,7 +163,11 @@ impl Engine for KokoroEngine {
                 samples.len() as f64 / frames as f64 / Config::SAMPLE_RATE as f64
             };
             piece_words.push(word_times(&spans, &offsets, &durations, per_frame));
-            pieces.push((*pi, samples));
+            pieces.push(tts_core::Piece {
+                paragraph: *pi,
+                text: (*segment).clone(),
+                samples,
+            });
             request.advanced("decoder", k + 1, flat.len());
             request.check_interrupt(k + 1)?;
         }
@@ -183,26 +187,18 @@ impl Engine for KokoroEngine {
         }
 
         let rate = Config::SAMPLE_RATE as usize;
-        let gap = wav::silence(rate, request.gaps.segment_ms);
-        let para_gap = wav::silence(rate, request.gaps.paragraph_ms);
-        let mut samples: Vec<f32> = Vec::new();
+        // Where each piece lands is decided once, in `tts-core`, so the word clock's offsets
+        // and the segment times cannot disagree about where a gap went.
+        let (samples, segments) = tts_core::join_segments(pieces, request.gaps, rate);
         let mut words: Vec<WordTime> = Vec::new();
-        let mut prev: Option<usize> = None;
-        for ((pi, piece), piece_words) in pieces.iter().zip(&piece_words) {
-            if let Some(p) = prev {
-                samples.extend_from_slice(if *pi != p { &para_gap } else { &gap });
-            }
-            // Offset by where this piece landed, gaps included: a word's time is a time in
-            // the audio that is returned, not in the piece it was rendered from.
-            let at = samples.len() as f64 / rate as f64;
-            words.extend(piece_words.iter().map(|w| WordTime {
+        for (piece, said) in segments.iter().zip(&piece_words) {
+            words.extend(said.iter().map(|w| WordTime {
                 text: w.text.clone(),
-                start: w.start + at,
-                end: w.end + at,
+                start: w.start + piece.start,
+                end: w.end + piece.start,
             }));
-            samples.extend_from_slice(piece);
-            prev = Some(*pi);
         }
+
         anyhow::ensure!(!samples.is_empty(), "engine {ID} produced no audio");
 
         Ok(Synthesis {
@@ -211,6 +207,7 @@ impl Engine for KokoroEngine {
                 sample_rate: Config::SAMPLE_RATE,
             },
             stats,
+            segments: Some(segments),
             words: Some(words),
         })
     }

@@ -190,8 +190,8 @@ impl Engine for Audio8Engine {
             request.check_interrupt(ar_done)?;
         }
 
-        let mut pieces: Vec<(usize, Vec<f32>)> = Vec::new();
-        for (k, (pi, _)) in flat.iter().enumerate() {
+        let mut pieces: Vec<tts_core::Piece> = Vec::new();
+        for (k, (pi, segment)) in flat.iter().enumerate() {
             let codes = match codes_by_index[k].take() {
                 Some(c) => c,
                 None => continue,
@@ -207,7 +207,11 @@ impl Engine for Audio8Engine {
             let audio = self.codec.decode(&codes)?;
             let samples = audio.flatten_all()?.to_vec1::<f32>()?;
             stats.add("codec", t_voc.elapsed().as_secs_f64());
-            pieces.push((*pi, samples));
+            pieces.push(tts_core::Piece {
+                paragraph: *pi,
+                text: (*segment).clone(),
+                samples,
+            });
             request.advanced("codec", k + 1, flat.len());
         }
         stats.total_s = t0.elapsed().as_secs_f64();
@@ -217,17 +221,7 @@ impl Engine for Audio8Engine {
             let _ = shared.next_f32();
         }
 
-        let gap = wav::silence(cfg::SAMPLE_RATE, request.gaps.segment_ms);
-        let para_gap = wav::silence(cfg::SAMPLE_RATE, request.gaps.paragraph_ms);
-        let mut samples: Vec<f32> = Vec::new();
-        let mut prev: Option<usize> = None;
-        for (pi, piece) in &pieces {
-            if let Some(p) = prev {
-                samples.extend_from_slice(if *pi != p { &para_gap } else { &gap });
-            }
-            samples.extend_from_slice(piece);
-            prev = Some(*pi);
-        }
+        let (samples, segments) = tts_core::join_segments(pieces, request.gaps, cfg::SAMPLE_RATE);
         anyhow::ensure!(!samples.is_empty(), "engine {ID} produced no audio");
 
         Ok(Synthesis {
@@ -236,8 +230,9 @@ impl Engine for Audio8Engine {
                 sample_rate: cfg::SAMPLE_RATE as u32,
             },
             stats,
-            // This engine does not predict per-phoneme durations, so it has no
-            // word clock to offer.
+            segments: Some(segments),
+            // No duration predictor and no cross-attention to read, so no word clock — only
+            // the segment boundaries, which this engine does know exactly.
             words: None,
         })
     }

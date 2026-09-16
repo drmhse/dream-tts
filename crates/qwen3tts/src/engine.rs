@@ -583,16 +583,18 @@ impl Engine for Qwen3TtsEngine {
             request.check_interrupt(talker_done)?;
         }
 
-        let mut spans: Vec<(usize, Vec<Vec<u32>>)> = Vec::new();
+        let mut spans: Vec<(usize, String, Vec<Vec<u32>>)> = Vec::new();
         // (characters, frames, distinct codebook-0 values) per segment.
         let mut seg_stats: Vec<(usize, usize, usize)> = Vec::new();
-        for slot in out.into_iter() {
+        for (i, slot) in out.into_iter().enumerate() {
             let Some((pi, chars, frames)) = slot else {
                 continue;
             };
             if !frames.is_empty() {
                 seg_stats.push((chars, frames.len(), distinct_first(&frames)));
-                spans.push((pi, frames));
+                // `out` is indexed by the prepared segment, which is indexed by `flat`, so the
+                // text is the one at the same position.
+                spans.push((pi, flat[i].1.clone(), frames));
             }
         }
         // Metal dispatch is async: without this the stage time is enqueue time and the GPU
@@ -625,7 +627,7 @@ impl Engine for Qwen3TtsEngine {
         let t = Instant::now();
         let all_frames: Vec<Vec<u32>> = spans
             .iter()
-            .flat_map(|(_, frames)| frames.iter().cloned())
+            .flat_map(|(_, _, frames)| frames.iter().cloned())
             .collect();
         let frames_total = all_frames.len();
         let joined = self.codec.decode(&all_frames)?;
@@ -634,9 +636,9 @@ impl Engine for Qwen3TtsEngine {
         // One call for the whole utterance, so there is nothing to count through.
         request.advanced("codec", spans.len(), spans.len());
 
-        let mut pieces: Vec<(usize, Vec<f32>)> = Vec::with_capacity(spans.len());
+        let mut pieces: Vec<tts_core::Piece> = Vec::with_capacity(spans.len());
         let mut at = 0usize;
-        for (i, (pi, frames)) in spans.iter().enumerate() {
+        for (i, (pi, text, frames)) in spans.iter().enumerate() {
             // The last segment takes whatever remains, so rounding cannot drop samples.
             let end = if i + 1 == spans.len() {
                 joined.len()
@@ -644,22 +646,16 @@ impl Engine for Qwen3TtsEngine {
                 (at + frames.len() * cfg::SAMPLES_PER_FRAME).min(joined.len())
             };
             if end > at {
-                pieces.push((*pi, joined[at..end].to_vec()));
+                pieces.push(tts_core::Piece {
+                    paragraph: *pi,
+                    text: text.clone(),
+                    samples: joined[at..end].to_vec(),
+                });
             }
             at = end;
         }
 
-        let gap = wav::silence(cfg::SAMPLE_RATE, request.gaps.segment_ms);
-        let para_gap = wav::silence(cfg::SAMPLE_RATE, request.gaps.paragraph_ms);
-        let mut samples: Vec<f32> = Vec::new();
-        let mut prev: Option<usize> = None;
-        for (pi, piece) in &pieces {
-            if let Some(p) = prev {
-                samples.extend_from_slice(if *pi != p { &para_gap } else { &gap });
-            }
-            samples.extend_from_slice(piece);
-            prev = Some(*pi);
-        }
+        let (samples, segments) = tts_core::join_segments(pieces, request.gaps, cfg::SAMPLE_RATE);
         anyhow::ensure!(!samples.is_empty(), "engine {ID} produced no audio");
         stats.segments = spans.len();
         stats.frames = frames_total;
@@ -670,8 +666,9 @@ impl Engine for Qwen3TtsEngine {
                 sample_rate: cfg::SAMPLE_RATE as u32,
             },
             stats,
-            // This engine does not predict per-phoneme durations, so it has no
-            // word clock to offer.
+            segments: Some(segments),
+            // No duration predictor and no cross-attention to read, so no word clock — only
+            // the segment boundaries, which this engine does know exactly.
             words: None,
         })
     }

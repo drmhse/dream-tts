@@ -338,6 +338,7 @@ struct Rendered {
     wall: f64,
     stages: Vec<(&'static str, f64)>,
     words: Option<Vec<tts_core::WordTime>>,
+    segments: Option<Vec<tts_core::SegmentTime>>,
 }
 
 /// The voice a request runs with: the one it named, else the process default. An engine
@@ -420,6 +421,7 @@ async fn render(app: &Arc<App>, req: TtsRequest) -> Result<Rendered, ApiError> {
         wall,
         stages: out.stats.stages,
         words: out.words,
+        segments: out.segments,
     })
 }
 
@@ -451,6 +453,41 @@ fn word_header(words: Option<&[tts_core::WordTime]>) -> String {
     } else {
         out
     }
+}
+
+/// The segment clock as `text:start:end` triples, space separated.
+///
+/// The text is percent-encoded, because a segment is a sentence and contains the space and the
+/// colon this format separates on. Encoding is what makes the triple unambiguous rather than
+/// merely usually right.
+fn segment_header(segments: Option<&[tts_core::SegmentTime]>) -> String {
+    const CEILING: usize = 8 * 1024;
+    let Some(segments) = segments else {
+        return String::new();
+    };
+    let out = segments
+        .iter()
+        .map(|s| format!("{}:{:.3}:{:.3}", percent(&s.text), s.start, s.end))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if out.len() > CEILING {
+        String::new()
+    } else {
+        out
+    }
+}
+
+/// Unreserved characters as themselves, everything else as `%XX`.
+fn percent(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for b in text.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------- handlers
@@ -499,6 +536,9 @@ async fn post_tts(
         // — the body is the audio, and a client that wants the clock wants it with the audio
         // rather than from a second request that would have to synthesise again.
         hdr("x-words", word_header(r.words.as_deref())),
+        // Additive: where each segment of the request landed. Every engine can say this and
+        // none of them had to be asked to compute it — the join already decided it.
+        hdr("x-segments", segment_header(r.segments.as_deref())),
     ] {
         if let Ok(v) = value {
             out = out.header(name, v);

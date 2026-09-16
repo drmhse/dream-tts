@@ -441,10 +441,10 @@ impl Engine for CosyVoiceEngine {
         // fabricated ramp.
         request.advanced("llm", flat.len(), flat.len());
 
-        let mut spans: Vec<(usize, Vec<u32>)> = Vec::new();
-        for (pi, speech) in para_of.into_iter().zip(generated) {
+        let mut spans: Vec<(usize, String, Vec<u32>)> = Vec::new();
+        for ((pi, speech), (_, text)) in para_of.into_iter().zip(generated).zip(flat.iter()) {
             if !speech.is_empty() {
-                spans.push((pi, speech));
+                spans.push((pi, (*text).clone(), speech));
             }
         }
         anyhow::ensure!(!spans.is_empty(), "engine {ID} generated no speech tokens");
@@ -505,7 +505,7 @@ impl Engine for CosyVoiceEngine {
         // because splitting inside a segment would cut prosody mid-sentence.
         let mut groups: Vec<Vec<usize>> = Vec::new();
         let mut acc = 0usize;
-        for (i, (_, toks)) in spans.iter().enumerate() {
+        for (i, (_, _, toks)) in spans.iter().enumerate() {
             let n = toks.len();
             if groups.is_empty() || (acc + n > group_tokens && !groups.last().unwrap().is_empty()) {
                 groups.push(Vec::new());
@@ -515,12 +515,12 @@ impl Engine for CosyVoiceEngine {
             acc += n;
         }
 
-        let mut pieces: Vec<(usize, Vec<f32>)> = Vec::new();
+        let mut pieces: Vec<tts_core::Piece> = Vec::new();
         let per_token = cfg::TOKEN_MEL_RATIO * self.hift.samples_per_frame();
         for group in &groups {
             let tokens: Vec<u32> = group
                 .iter()
-                .flat_map(|&i| spans[i].1.iter().copied())
+                .flat_map(|&i| spans[i].2.iter().copied())
                 .collect();
             if tokens.is_empty() {
                 continue;
@@ -557,7 +557,7 @@ impl Engine for CosyVoiceEngine {
             let samples = wav_t.flatten_all()?.to_vec1::<f32>()?;
             let mut at = 0usize;
             for (j, &i) in group.iter().enumerate() {
-                let want = spans[i].1.len() * per_token;
+                let want = spans[i].2.len() * per_token;
                 // The last segment of a group takes whatever remains, so rounding cannot
                 // drop samples.
                 let end = if j + 1 == group.len() {
@@ -566,7 +566,11 @@ impl Engine for CosyVoiceEngine {
                     (at + want).min(samples.len())
                 };
                 if end > at {
-                    pieces.push((spans[i].0, samples[at..end].to_vec()));
+                    pieces.push(tts_core::Piece {
+                        paragraph: spans[i].0,
+                        text: spans[i].1.clone(),
+                        samples: samples[at..end].to_vec(),
+                    });
                 }
                 at = end;
             }
@@ -576,17 +580,7 @@ impl Engine for CosyVoiceEngine {
             let _ = shared.next_f32();
         }
 
-        let gap = wav::silence(cfg::SAMPLE_RATE, request.gaps.segment_ms);
-        let para_gap = wav::silence(cfg::SAMPLE_RATE, request.gaps.paragraph_ms);
-        let mut samples: Vec<f32> = Vec::new();
-        let mut prev: Option<usize> = None;
-        for (pi, piece) in &pieces {
-            if let Some(p) = prev {
-                samples.extend_from_slice(if *pi != p { &para_gap } else { &gap });
-            }
-            samples.extend_from_slice(piece);
-            prev = Some(*pi);
-        }
+        let (samples, segments) = tts_core::join_segments(pieces, request.gaps, cfg::SAMPLE_RATE);
         anyhow::ensure!(!samples.is_empty(), "engine {ID} produced no audio");
 
         Ok(Synthesis {
@@ -595,8 +589,9 @@ impl Engine for CosyVoiceEngine {
                 sample_rate: cfg::SAMPLE_RATE as u32,
             },
             stats,
-            // This engine does not predict per-phoneme durations, so it has no
-            // word clock to offer.
+            segments: Some(segments),
+            // No duration predictor and no cross-attention to read, so no word clock — only
+            // the segment boundaries, which this engine does know exactly.
             words: None,
         })
     }

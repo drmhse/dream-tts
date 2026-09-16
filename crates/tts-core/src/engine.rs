@@ -286,9 +286,64 @@ pub struct WordTime {
     pub end: f64,
 }
 
+/// One segment of the request, and when it is said.
+///
+/// Every engine can report these and they cost nothing: segmentation is where the text was cut,
+/// and the audio is joined from the pieces in order, so the engine already knows where each one
+/// landed. Coarser than a word and finer than the whole render — and, unlike a sweep inferred
+/// from a total duration, exact.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SegmentTime {
+    pub text: String,
+    pub start: f64,
+    pub end: f64,
+}
+
+/// One rendered segment, before the pieces are joined.
+pub struct Piece {
+    /// Which paragraph it came from; a change means the longer gap.
+    pub paragraph: usize,
+    pub text: String,
+    pub samples: Vec<f32>,
+}
+
+/// Join the rendered pieces with the gaps between them, and say where each one landed.
+///
+/// One implementation for every engine. The times are exact and free: this function is what
+/// decides where each piece goes, so it is the only place that has to be asked. Four copies of
+/// the join loop with the arithmetic repeated in each is how one of them ends up off by a gap.
+pub fn join_segments(pieces: Vec<Piece>, gaps: Gaps, rate: usize) -> (Vec<f32>, Vec<SegmentTime>) {
+    let gap = crate::wav::silence(rate, gaps.segment_ms);
+    let para_gap = crate::wav::silence(rate, gaps.paragraph_ms);
+    let mut samples: Vec<f32> = Vec::new();
+    let mut times: Vec<SegmentTime> = Vec::with_capacity(pieces.len());
+    let mut prev: Option<usize> = None;
+
+    for piece in pieces {
+        if let Some(p) = prev {
+            samples.extend_from_slice(if piece.paragraph != p {
+                &para_gap
+            } else {
+                &gap
+            });
+        }
+        let start = samples.len() as f64 / rate as f64;
+        samples.extend_from_slice(&piece.samples);
+        times.push(SegmentTime {
+            text: piece.text,
+            start,
+            end: samples.len() as f64 / rate as f64,
+        });
+        prev = Some(piece.paragraph);
+    }
+    (samples, times)
+}
+
 pub struct Synthesis {
     pub audio: Audio,
     pub stats: Stats,
+    /// Where each segment of the request landed in the audio.
+    pub segments: Option<Vec<SegmentTime>>,
     /// When each word is spoken, for an engine that knows.
     ///
     /// `None` is not "this engine is inaccurate" but "this engine was never asked to say" —
@@ -371,4 +426,49 @@ pub fn validate_against(caps: &Capabilities, request: &SynthesisRequest) -> Resu
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::*;
+
+    /// The gap belongs *between* two pieces, so it is inside neither one's span and the next
+    /// piece starts after it.
+    #[test]
+    fn a_segment_starts_after_the_gap_before_it() {
+        let rate = 1000;
+        let gaps = Gaps {
+            segment_ms: 100,
+            paragraph_ms: 500,
+        };
+        let piece = |paragraph, n| Piece {
+            paragraph,
+            text: format!("p{paragraph}"),
+            samples: vec![0.0; n],
+        };
+        let (samples, times) = join_segments(
+            vec![piece(0, 1000), piece(0, 500), piece(1, 250)],
+            gaps,
+            rate,
+        );
+
+        assert_eq!(times.len(), 3);
+        assert!((times[0].start - 0.0).abs() < 1e-9);
+        assert!((times[0].end - 1.0).abs() < 1e-9);
+        // 100 ms of segment gap, then half a second of audio.
+        assert!((times[1].start - 1.1).abs() < 1e-9, "{:?}", times[1]);
+        assert!((times[1].end - 1.6).abs() < 1e-9, "{:?}", times[1]);
+        // A new paragraph takes the longer gap.
+        assert!((times[2].start - 2.1).abs() < 1e-9, "{:?}", times[2]);
+        assert!(
+            (times[2].end - samples.len() as f64 / rate as f64).abs() < 1e-9,
+            "the last segment does not end where the audio does"
+        );
+    }
+
+    #[test]
+    fn nothing_to_join_is_no_audio_and_no_times() {
+        let (samples, times) = join_segments(Vec::new(), Gaps::default(), 24_000);
+        assert!(samples.is_empty() && times.is_empty());
+    }
 }
