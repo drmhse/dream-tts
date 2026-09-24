@@ -1,7 +1,7 @@
 # dream-tts
 
 Narrate anything in a cloned voice, on your own Mac, offline. A 1612-word chapter becomes
-11 minutes of speech in 1m 44s — or 12 minutes in 31 seconds, if a built-in voice will do.
+11 minutes of speech in about 1m 15s — or 12 minutes in 31 seconds, if a built-in voice will do.
 One binary, no service, no API key.
 
 ### ▶ [Hear it first: one chapter, four engines, two voices each](https://drmhse.github.io/dream-tts/)
@@ -96,12 +96,12 @@ eight in place.
 |---|---|---|---|---|
 | `audio8` | 0.527-0.536 | 5m 47s | 11:34 / 10:59 | you want 44.1 kHz, the highest-fidelity output here |
 | `cosyvoice` | 0.703-0.718 | 8m 15s | 12:48 / 11:44 | you want the widest language coverage |
-| `qwen3tts` | **0.148** | **1m 44s** | 11:44 / 10:34 | the default. Best quality here, and the only one of the three cloning engines that makes book-length text practical |
+| `qwen3tts` | **0.104–0.114** | **1m 12s–1m 19s** | 11:35 / — | the default. Best quality here, and the only one of the three cloning engines that makes book-length text practical |
 | `kokoro` | **0.041-0.043** | **31s** | 12:15 / 13:32 | English, no cloning, and you want it now — or you have 2 GB to spend rather than 12 |
 
 **Those two bottom rows are the point of the project.** A chapter becomes 11 minutes of
-speech in 1m 44s with a cloned voice, on a laptop — 6.8× faster than realtime, so a 16-hour
-book costs about 2.4 hours of compute rather than 11.5. Give up cloning and it is **31
+speech in about 1m 15s with a cloned voice, on a laptop — 9× faster than realtime, so a 16-hour
+book costs about 1.7 hours of compute rather than 11.5. Give up cloning and it is **31
 seconds**, 23× realtime, in 1.7 GB.
 
 Compare the wall-time column, not just RTF. The four do not produce the same duration from
@@ -113,27 +113,30 @@ divides by audio produced, so a slower-speaking engine flatters its own RTF.
 ```
 
 No flags: `qwen3tts` at f16 and 48 lanes is what you get by asking for nothing. It gets there
-by batching across sections, so it wants length — on a 7-segment passage it is 0.397, against
-0.148 on the chapter. The other three do not batch meaningfully and are steady at any length.
+by batching across sections, so it wants length — on a 7-segment passage it is 0.314, against
+0.104–0.114 on the chapter. The other three do not batch meaningfully and are steady at any length.
 `audio8` is **2.36× its PyTorch reference** like for like, with that reference running on MPS
 too.
 
 Short-passage figures, for comparison. `examples/senior.txt`, 132 words: `audio8` 0.544,
-`cosyvoice` 0.716, `qwen3tts` 0.397, `kokoro` 0.044.
+`cosyvoice` 0.716, `qwen3tts` 0.314, `kokoro` 0.044.
 
 ### What it needs to be this fast
 
-**16 GB.** `qwen3tts` peaks at 12.3 GB on a single short passage and 13.0 GB on a 203-segment
-article, and almost all of that is the codec decoder's activations rather than weights — one
-300-frame chunk alone is 5.5 GB. Below 16 GB the engine says so on load and keeps going, which
-is the honest option: it will swap, and swapping presents as the model being slow rather than
-as a mistake.
+**16 GB, with room to spare.** `qwen3tts` peaks at 6.7 GB on a short passage and 9.2 GB on a
+chapter: 3.4 GB of weights, the 48 lanes' KV cache, and the codec's activations, which are 3.0 GB
+at their widest. It was 12.0 and 12.5 before the load path moved to the host — see
+[below](#memory-is-candles-buffer-pool-not-the-lane-count). Below 16 GB the engine says so on
+load and keeps going, which is the honest option: it will swap, and swapping presents as the
+model being slow rather than as a mistake. So does a 16 GB machine running a browser and an
+editor beside a render — that is what the lower peak buys.
 
 **`--quant q8_0` is not the fix for a smaller machine**, though it looks like one. It halves the
 weight read, which matters only where nothing batches, and it does not touch the floor: on that
-132-word passage it peaks at 11.72 GB against f16's 12.30 — 0.58 GB — while running at 62% of
-f16's speed (RTF 0.642 against 0.397). On a chapter the gap is 4.5×. Reach for it to fit a single
-short render into a machine that misses by half a gigabyte, and for nothing else.
+132-word passage it peaked at 11.72 GB against f16's 12.30 — 0.58 GB — while running at 62% of
+f16's speed (RTF 0.642 against 0.397), both before the memory work below. On a chapter the gap
+is 4.5×. Reach for it to fit a single short render into a machine that misses by half a
+gigabyte, and for nothing else.
 
 What does help a smaller machine is a different engine. Same passage, same measurement:
 
@@ -142,22 +145,26 @@ What does help a smaller machine is a different engine. Same passage, same measu
 | `kokoro` | **1.3 GB** | 0.044 |
 | `cosyvoice` | 5.0 GB | 0.716 |
 | `audio8` | 9.7 GB | 0.544 |
-| `qwen3tts` | 12.3 GB | 0.397 |
+| `qwen3tts` | 6.7 GB | 0.314 |
 
 `kokoro` is an order of magnitude below the rest and faster than all of them, and the price is
 stated plainly: it cannot clone a voice, and it speaks English only. A chapter takes it to
 1.7 GB.
 
-`QWEN3TTS_MAX_BATCH` trades lanes for footprint if you want to stay on this engine, but it
-cannot go under the codec's own ~12 GB.
+`QWEN3TTS_MAX_BATCH` trades lanes for footprint if you want to stay on this engine: a lane is
+about 77 MB of KV cache.
 
-## What makes `qwen3tts` fast, and where the 6.9× comes from
+## What makes `qwen3tts` fast, and where the 9× comes from
 
 ![qwen3tts speedup components](docs/qwen3tts-speedup.png)
 
-Every green component above is measured; together they take this engine to **RTF 0.144-0.148 —
-6.8× to 6.9× realtime** on its default settings, across corpora between 1612 and 4838 words.
-Four of them carry most of it, and two are kernels:
+Every green component above is measured; together they took this engine to **RTF 0.144-0.148 —
+6.8× to 6.9× realtime** across corpora between 1612 and 4838 words. A second round, not in the
+diagram, took the chapter to **0.104–0.114, about 9×**: prefill done once per voice for the
+positions every segment shares, sampling moved to the device, a faster decode GEMM, fused decode
+attention and QK-norm/rope, and the codec's activations fused into its convs.
+[`docs/reference.md`](docs/reference.md#the-next-third-prefill-sampling-three-kernels-and-the-load-path)
+has each one's measurement. The first round's four that carry most of it, two of them kernels:
 
 - **f16 weights, and they are the default.** Only a dense GEMM shares one weight read across
   lanes; candle's quantized `mm_t` re-reads per row, so q8_0 amortises 1.1× against f16's 7.4×.
@@ -176,10 +183,10 @@ Four of them carry most of it, and two are kernels:
   lane-steps were useful before, 79-90% now. Only a contiguous *tail* can be dropped — a prefix
   narrow shares the caches' storage — which is why the sort order is what makes it work.
 
-| corpus | segments | was (24 lanes) | 48 lanes | shipped | |
-|---|---|---|---|---|---|
-| Pixel Watch article, 4838 words | 203 | | 0.193 | **0.144** | **6.9×** |
-| `examples/chapter.txt`, 1612 words | 100 | 0.260 | 0.186 | **0.148** | **6.8×** |
+| corpus | segments | was (24 lanes) | 48 lanes | first round | shipped | |
+|---|---|---|---|---|---|---|
+| Pixel Watch article, 4838 words | 203 | | 0.193 | 0.144 | — | 6.9× |
+| `examples/chapter.txt`, 1612 words | 100 | 0.260 | 0.186 | 0.148 | **0.104–0.114** | **9×** |
 
 **Shedding pays most where segment lengths vary most**, so these are a floor rather than a best
 case: the article's segment lengths have the narrower spread of the two and it gains the least.
@@ -195,11 +202,15 @@ across all 42,454,560 samples.
 
 ### Memory is candle's buffer pool, not the lane count
 
-Peak footprint is now **12.5-13.0 GB**, from 14.2-14.8. The lever is not obvious, so it is worth
+Peak footprint is now **9.2 GB** on a chapter and 6.7 on a short passage, from 12.5 and 12.0, and
+14.2-14.8 before that. The lever is not obvious, so it is worth
 stating plainly: `vmmap` attributes a render to GPU allocations far exceeding its ~4.5 GB of
-weights, because candle's Metal pool keys buffers by size and releases none. Every distinct
-tensor shape a run touches is therefore permanent, and most memory wins here are a *shape
-removed* rather than bytes shaved:
+weights. The mechanism, read from candle 0.10.2's source and confirmed by measurement: every
+op's output buffer goes into a pool candle never trims, rounded up to a power of two, while a
+buffer uploaded from host data is exact and is released when dropped. Loading a model and then
+dropping it left 6.64 GB allocated. So every tensor a device op ever produced at a given size is
+permanent, and most memory wins here are a *shape removed* — or work moved to the host —
+rather than bytes shaved:
 
 - **The codec decodes a uniform span, padded on the right.** The natural loop runs two lengths —
   300 frames for the first chunk, which has no history to spend, then 325 — and one 300-frame
@@ -210,6 +221,14 @@ removed* rather than bytes shaved:
 - **Weights are mmapped and fetched per tensor.** `safetensors::load` was uploading the whole
   3.86 GB checkpoint to the GPU beside the f16 copies. A one-sentence render's floor went 9.24 →
   8.09 GB and a chapter's RSS 7.79 → 4.32 GB, at no cost in throughput.
+- **Load-time work is done on the host.** A weight cast to f16 and transposed on the device left
+  both intermediates pooled for good: the talker allocated 6.76 GB for 3.37 GB of weights. Cast,
+  transposed and concatenated on the host and uploaded once, it allocates 3.37. The text
+  embedding table — 622 MB, a 1 GiB buffer after rounding, of which a request reads a few hundred
+  rows — is now read from the mapping row by row. Chapter peak 12.5 → 9.2 GB.
+- **The codec's activations fold into its convs.** A residual unit's second SnakeBeta and its
+  residual add ride inside the k=1 conv, so neither is a full-size tensor: the codec alone went
+  5.29 → 3.0 GB.
 - **Prefill runs in 8-lane windows and shed widths are multiples of 8.** Prefill attention is
   `b × heads × L²` — 748 MB of scores at 48 lanes — and narrowing 48 → 47 → 46 minted a new width,
   hence new buffer sizes, every step.
@@ -219,7 +238,11 @@ KV cache implies. So the 16 GB machine runs out because of the floor, not the la
 
 ![RTF by lane count](docs/qwen3tts-lanes-rtf.svg)
 
-**Past 48 lanes it swaps, and that is not one allocation anyone can move.** The obvious
+**Past 48 lanes it used to swap.** It no longer does — 64 lanes peaks at 12.4 GB — but it is not
+faster yet (0.107 against 0.100): `skinny`'s tile is 48 rows, and a 64-lane KV layer rounds up
+from 87.8 MB to 128 MiB. The history, for whoever takes that on:
+
+**Past 48 lanes it swapped, and that was not one allocation anyone could move.** The obvious
 suspect is that a 100-segment document splits 64 + 36, so the KV cache is allocated at two
 widths and the pool keeps both. It is not enough: four separate attempts at freeing 64 lanes
 are recorded in [what did not work](docs/reference.md#what-did-not-work), and the closest —
@@ -265,8 +288,8 @@ iSTFTNet decoder. What follows from that is most of what makes it worth having:
 
 - **RTF 0.041-0.043, and it does not depend on length.** 12m 15s of speech in 31 seconds, 23×
   realtime — and 0.044 on a 132-word passage, where `qwen3tts` needs a long document to reach
-  0.148. There is no batch to fill, so a single sentence runs at the same rate as a chapter.
-- **1.3 GB of peak footprint**, against 12.3 for the default. 82M parameters and no KV cache.
+  about 0.11. There is no batch to fill, so a single sentence runs at the same rate as a chapter.
+- **1.3 GB of peak footprint**, against 6.7 for the default. 82M parameters and no KV cache.
 - **No sampler, so no length drift.** Two renders of the same text are the same length; the
   only stochastic stage is the decoder's excitation noise, which is seeded.
 - **It cannot clone.** Its voices are 28 style tables of `[510, 256]` shipped inside the
@@ -332,7 +355,7 @@ software has to be. Three things follow, and they are why there is a client and 
 
 **The estimate is fitted, not averaged.** These engines have strong economies of scale —
 `qwen3tts` batches across segments, which only engages once a chapter has enough of them, so
-the same voice runs at RTF 0.397 on a 132-word passage and 0.148 on a 1612-word chapter. A
+the same voice runs at RTF 0.314 on a 132-word passage and about 0.11 on a 1612-word chapter. A
 flat words-per-second rate is therefore wrong by 2.7×, in whichever direction the sample
 happens to lean: on a real book, extrapolating from its 27-word title page predicted **2h
 09m against an actual hour**. So the model is `fixed + marginal × words`, fitted over the
@@ -372,7 +395,7 @@ before it starts rather than an hour in, and `--no-align` drops the only other o
 dependency. The `dream-tts` commands themselves need nothing but the binary.
 
 Resumable per *stage*: a section with a WAV master is never re-synthesised. Deterministic
-under a seed. A 16-hour document costs about **2.4 hours** of synthesis at `qwen3tts`'s 0.148,
+under a seed. A 16-hour document costs about **1.7 hours** of synthesis at `qwen3tts`'s ~0.11,
 against ~11.5 at `cosyvoice`'s 0.716. Recognition adds an hour either way.
 
 **Import is a stage in front, not a branch inside.** The pipeline takes its chapter
@@ -422,7 +445,7 @@ cannot drift apart.
 **`POST /tts/stream` is incremental.** Raw PCM as each segment lands, chunked, so first
 audio arrives after one segment rather than after the whole render — measured at **2.7s to
 first audio against 5.5s buffered** on the same text. Even unbatched `qwen3tts` stays well
-under realtime — 0.397 on the short-passage fixture — so the stream outpaces playback and a
+under realtime — 0.314 on the short-passage fixture — so the stream outpaces playback and a
 listener never runs dry after that first segment. It is *slower overall* on purpose: one
 segment at a time gives up the cross-segment batching worth 2.7× on book-length text, which
 is the right trade for a live listener and the wrong one for a book — so the job runner does

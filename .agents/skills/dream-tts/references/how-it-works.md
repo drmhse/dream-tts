@@ -55,7 +55,7 @@ expression pays five full round-trips to device memory. `tts-nn` ships fused Sna
 im2col gather, decode attention that reads the KV cache in place, a channels-last conv that
 gathers its taps inside the GEMM, and a GEMM tiled for the shape a decode step has.
 
-Current cost split on a 4838-word article: talker 74%, codec 26%, RTF 0.144.
+Current cost split on a 1612-word chapter: talker 70%, codec 30%, RTF 0.104–0.114, peak 9.2 GB.
 
 ## Why it is not faster
 

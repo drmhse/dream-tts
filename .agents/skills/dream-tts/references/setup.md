@@ -40,7 +40,7 @@ Each converts its checkpoint with PyTorch, so they want python >= 3.10 and a tor
 
 | engine | peak footprint | RTF on a short passage | reach for it when |
 |---|---|---|---|
-| `qwen3tts` | 12.3 GB | 0.397 | the default: best quality, and the only cloning engine practical for books |
+| `qwen3tts` | 6.7 GB | 0.314 | the default: best quality, and the only cloning engine practical for books |
 | `audio8` | 9.7 GB | 0.544 | 44.1 kHz output |
 | `cosyvoice` | 5.0 GB | 0.716 | widest language coverage |
 | `kokoro` | 1.3 GB | 0.044 | fastest and smallest by far, English only, cannot clone: `--set voice=<name>` |

@@ -87,7 +87,7 @@
     Local text-to-speech in Rust. Four speech models ported from PyTorch — three that clone
     a voice from a ten-second clip, one that does not — validated stage by stage against fp32
     activations dumped from their references. A 1612-word chapter becomes eleven minutes of
-    speech in 1m 44s with a cloned voice, or twelve minutes in 31 seconds without.
+    speech in about 1m 15s with a cloned voice, or twelve minutes in 31 seconds without.
     One process, no Python at runtime.
   </p>
   <p class="caveat">
@@ -122,14 +122,14 @@
       </audio>
     </div>
     <div class="stats">
-      <span>today <b>0.148</b> · 1m 44s → 11:44</span>
+      <span>today <b>0.104–0.114</b> · 1m 12s–1m 19s → 11:35</span>
       <span>these two files <b>0.261</b> and <b>0.252</b></span>
     </div>
     <p class="caveat">
       The files above were rendered at an earlier revision, before the Metal kernels
       described below; the engine and its settings are otherwise the same. A fresh render
-      of the same chapter now costs <strong>1m 44s</strong> rather than three minutes, and
-      word error rate against the reference text moved from 0.038 to 0.036 across it.
+      of the same chapter now costs <strong>about 1m 15s</strong> rather than three minutes, and
+      word error rate against the reference text has stayed at or below 0.038 throughout.
       A sampled model takes a different path through the same text each render, which is
       why the durations do not match to the second either.
     </p>
@@ -209,8 +209,8 @@
   </div>
 
   <p class="headline">
-    A chapter becomes <strong>11 minutes of speech in 1m 44s</strong> in a cloned voice, on a
-    laptop — 6.8× faster than realtime, so a 16-hour book is about <strong>2.4 hours</strong>
+    A chapter becomes <strong>11 minutes of speech in about 1m 15s</strong> in a cloned voice, on a
+    laptop — 9× faster than realtime, so a 16-hour book is about <strong>1.7 hours</strong>
     of compute rather than 11.5. Without cloning it is <strong>31 seconds</strong>.
   </p>
 
@@ -438,7 +438,7 @@ curl -X POST localhost:3003/v1/jobs/&lt;id&gt;/cancel    -H 'X-API-Key: secret'<
       <tr><th>engine</th><th>RTF (both voices)</th><th>wall, fastest</th><th>batches</th><th>reach for it when</th></tr>
     </thead>
     <tbody>
-      <tr><td class="mono">qwen3tts</td><td class="num">0.148</td><td class="num">1m 44s</td><td>yes, 48 lanes</td><td>the default. Best quality here, and the only one that makes a book practical</td></tr>
+      <tr><td class="mono">qwen3tts</td><td class="num">0.104–0.114</td><td class="num">1m 12s–1m 19s</td><td>yes, 48 lanes</td><td>the default. Best quality here, and the only one that makes a book practical</td></tr>
       <tr><td class="mono">cosyvoice</td><td class="num">0.703–0.718</td><td class="num">8m 15s</td><td>no</td><td>you want the widest language coverage</td></tr>
       <tr><td class="mono">audio8</td><td class="num">0.527–0.536</td><td class="num">5m 47s</td><td>no</td><td>you want 44.1 kHz, the highest-fidelity output here</td></tr>
       <tr><td class="mono">kokoro</td><td class="num">0.041–0.043</td><td class="num">31s</td><td>n/a, no loop</td><td>English, no cloning, and you want it now — or you have 2&nbsp;GB rather than 12</td></tr>
@@ -450,7 +450,7 @@ curl -X POST localhost:3003/v1/jobs/&lt;id&gt;/cancel    -H 'X-API-Key: secret'<
     text — <code>kokoro</code>&rsquo;s male voice speaks slowest, 13:32 against
     <code>audio8</code>&rsquo;s 11:34 — and RTF divides by audio produced, which flatters a
     slower-speaking engine. <code>qwen3tts</code> leads the cloning engines by this much only
-    because it batches across sections, so it wants length: on a 132-word passage it is 0.397,
+    because it batches across sections, so it wants length: on a 132-word passage it is 0.314,
     against 0.544 for <code>audio8</code> and 0.716 for <code>cosyvoice</code>. Never
     benchmark it on a paragraph. <code>kokoro</code> has nothing to batch and is steady at any
     length — 0.044 on that same passage.
@@ -458,8 +458,7 @@ curl -X POST localhost:3003/v1/jobs/&lt;id&gt;/cancel    -H 'X-API-Key: secret'<
   <p class="caveat">
     Memory is the other axis, and it runs the other way. On that short passage
     <code>kokoro</code> peaks at 1.3&nbsp;GB, <code>cosyvoice</code> at 5.0 and
-    <code>audio8</code> at 9.7, against <code>qwen3tts</code>&rsquo;s 12.3 — almost all of the
-    last one the codec decoder&rsquo;s activations rather than weights.
+    <code>audio8</code> at 9.7, against <code>qwen3tts</code>&rsquo;s 6.7 — and 9.2 on a chapter.
     <strong>16&nbsp;GB is what the default engine wants.</strong> A smaller machine is better
     served by a different engine than by a smaller weight format.
   </p>
@@ -469,8 +468,9 @@ curl -X POST localhost:3003/v1/jobs/&lt;id&gt;/cancel    -H 'X-API-Key: secret'<
     <img src="qwen3tts-speedup.png" alt="Speedup components for the qwen3tts engine, measured and open">
   </div>
   <p class="cap">
-    Every green component is measured. Together they take the engine to RTF 0.144–0.148 —
-    6.8× to 6.9× realtime — across corpora between 1612 and 4838 words.
+    Every green component is measured. Together they took the engine to RTF 0.144–0.148 —
+    6.8× to 6.9× realtime; a second round since, not drawn here, reached 0.104–0.114 on the
+    chapter, about 9×.
   </p>
   <p class="caveat">
     Four of them carry most of it, and two are Metal kernels written here. <strong>f16

@@ -111,11 +111,11 @@ word map a player consumes) and `.manifest.json`.
 
 ## What to expect it to cost
 
-A 16-hour document is about 2.4 hours of synthesis at `qwen3tts`'s 0.148, against roughly 11.5 at
+A 16-hour document is about 1.7 hours of synthesis at `qwen3tts`'s ~0.11, against roughly 11.5 at
 `cosyvoice`'s 0.716. Alignment adds about an hour either way.
 
-**Speed depends on length, because batching does.** The same voice is RTF 0.397 on a 132-word
-passage and 0.148 on a 1612-word chapter: 48 segments decode as one batch, and a short passage
+**Speed depends on length, because batching does.** The same voice is RTF 0.314 on a 132-word
+passage and about 0.11 on a 1612-word chapter: 48 segments decode as one batch, and a short passage
 has nothing to batch. Never benchmark this engine on a paragraph.
 
 ## When the output is wrong

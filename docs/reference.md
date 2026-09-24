@@ -294,7 +294,7 @@ Two fixtures, both tracked so any figure here can be reproduced:
 
 `examples/senior.txt`, M4 / 16 GB. Median of five samples with the cloning engines interleaved in
 one session, taken when `qwen3tts`'s default was `q8_0`; at today's `f16` default the same
-passage reads **0.397**, still the wrong case for it.
+passage reads **0.314**, still the wrong case for it.
 
 | engine | reference | this port | spread | |
 |---|---|---|---|---|
@@ -314,18 +314,62 @@ passage reads **0.397**, still the wrong case for it.
 | `qwen3tts` | `f16` | 48 | 0.218 | 0.147 | 0.069 |
 | `qwen3tts` | `f16` | 48 | 0.186 | 0.116 | 0.069 |
 | `qwen3tts` | `f16` | 48 | 0.158 | 0.117 | 0.040 |
-| `qwen3tts` | **`f16`** | **48, shipped** | **0.148** | **0.110** | 0.037 |
+| `qwen3tts` | `f16` | 48 | 0.148 | 0.110 | 0.037 |
+| `qwen3tts` | **`f16`** | **48, shipped** | **0.104–0.114** | **0.072–0.081** | 0.033–0.034 |
 
 The last row is the current default — `f16` is what `--quant` resolves to with nothing passed —
-and adds the fused channels-last conv on top of the talker's finished-tail shedding and the
+and [the section below](#the-next-third-prefill-sampling-three-kernels-and-the-load-path) says
+what it adds. The row before it adds the fused channels-last conv on top of the talker's finished-tail shedding and the
 codec's uniform decode span; `MAX_BATCH` was 24 when the first two rows were taken. The whole
 gain in that step is the codec (0.069 → 0.040) and the render is bit-identical. The last row
 adds the transposed convs rewritten as one conv and `tts_nn::skinny`, the decode-shaped GEMM;
 those two were measured interleaved against their own alternatives in one thermal state, at
 2.14x on the transposed convs and 0.162 → 0.148 end to end. On a 4838-word article the shipped
-configuration measures **0.144** against 0.193. Peak footprint is
-12.7–13.3 GB, and `README.md` has the memory analysis — it is candle's buffer pool, not the
-lane count.
+configuration measured **0.144** against 0.193. Peak footprint was 12.7–13.3 GB then and is
+9.2 GB now; `README.md` has the memory analysis — it is candle's buffer pool, not the lane
+count.
+
+### The next third: prefill, sampling, three kernels and the load path
+
+A render's stage split had been talker and codec, and the batched path never reported the
+talker's *prefill*: 25 s of an 88 s talker stage, a fifth of the render. Every change below was
+measured on its own before it went in, and the end-to-end rows are the committed build against
+this one, interleaved in one session, two seeds each.
+
+| change | measured | output |
+|---|---|---|
+| The voice's prompt positions (role, tags, reference transcript: 50 of 157) prefilled once and copied to every lane | a third of prefill | gate row `prefill.shared`, rel 7e-7 |
+| Prefill attention: GQA as a reshape of q, the new positions' own k/v, one mask per forward | 535 → 191 ms per 8-lane window | unchanged gate |
+| Top-50 by selection instead of a full sort of 2048 logits | 30 → 3 µs a row, 150k rows a chapter | identical picks, `talker::tests` |
+| The predictor samples on the device, draws taken up front in the host's order; one read per frame instead of fifteen | ~8 s a chapter | byte-identical WAV to host sampling at the same seed |
+| Codec convs with a short reduction through MPSGraph (`tts_nn::mpsnlc`) | codec chunk 899 → 770 ms; 96 → 1 output conv 2.72× | bit-identical in f32 |
+| Decode GEMM: split-K to fill the GPU, and 24x32 patches per simdgroup loaded straight from device memory | 1.60–2.52 → 2.42–2.83 TFLOP/s; talker step −9%, predictor −16% | rel ≤ 4e-4 against candle, as before |
+| Fused decode attention, K and V read once for both query heads | 26.3 → 15.2 ms per talker step at span 250, 91 GB/s of the bus's 120 | rel < 1e-5 against the CPU path |
+| QK-norm, rope and the KV write in one dispatch | talker step −8%, predictor −14%, prefill window −15% | rel < 1e-5 against candle's ops |
+| SnakeBeta and the residual folded into a residual unit's k=1 conv, up to 384 channels | residual units −9.5%; codec alone 5.29 → 3.0 GB | rel < 1e-5 |
+| Weights cast, transposed and concatenated on the host, uploaded once; text embeddings read from the mapping | talker allocation 6.76 → 3.37 GB, peak 12.5 → 9.2 GB | bit-identical weights |
+
+| `examples/chapter.txt` | seed 1 | seed 2 |
+|---|---|---|
+| committed | RTF 0.151 · 1m 45s · 12.49 GB | 0.147 · 1m 42s · 12.49 GB |
+| this build | **0.104 · 1m 12s · 9.22 GB** | **0.114 · 1m 19s · 9.21 GB** |
+
+**Quality**, on the audio because a sampled model takes a different path through the same text
+the moment a logit moves: WER 0.008 against the committed build's 0.013 on seed 1, and median F0 and LTAS cosine against the cloned clip
+179.8 Hz and 0.9973, against 177.8 Hz and 0.9973 — the clip itself is 179.8 Hz. `references/cosyvoice/wer.py` and `references/audio8/verify_voice.py`.
+
+**The memory finding that made the last row possible.** candle 0.10.2 keeps two buffer maps:
+every op's output goes into one it never trims, rounded up to a power of two, and a buffer
+uploaded from host data goes into the other, exact and released when dropped. So a cast on the
+device leaves its input and output resident for good. Loading the talker and dropping it again
+left 6.64 GB allocated; loading it through the host leaves 0.00. Anything computed once at load
+belongs on the host.
+
+**Still open.** 64 lanes now fits — 12.4 GB, where it used to thrash at 15.6 — but runs at 0.107
+against 48's 0.100, for two reasons worth fixing: `skinny`'s tile is 48 rows, so 64 falls back to
+candle's GEMM, and a 64-lane KV layer is 87.8 MB, which the pool rounds to 128 MiB, 2.2 GB of
+padding across the cache. The decode GEMMs reach 2.4–2.8 TFLOP/s of a ~3.6 ceiling and attention
+76% of the bus; prefill's projections are 2.5 against their GEMMs' 3.3.
 
 **`q8_0` gains nothing from 14× more segments** — 0.665 on seven, 0.661 on a hundred. That is
 candle's quantized `mm_t` padding to a large row tile, so batch 8 costs 8× batch 1, measured
@@ -1021,7 +1065,7 @@ half, in both directions.
 These engines have strong economies of scale. `qwen3tts` batches across segments and that
 only engages once a chapter has enough of them, so the figures are RTF **0.397** on
 `examples/senior.txt` (132 words) and **0.148** on `examples/chapter.txt` (1612 words) — a
-2.7× spread in seconds per word for the same voice on the same machine. A rate learned from a
+2.7× spread (0.314 and 0.109 today, the same shape) in seconds per word for the same voice on the same machine. A rate learned from a
 short chapter and applied to a long one is wrong by about that much.
 
 It goes the other way too, and that was the first bug: a book's front matter is 27 words of
@@ -1058,7 +1102,7 @@ it alongside anything already in flight and lets the user choose.
 `POST /tts/stream` used to be buffered, and said so in an `x-streaming: buffered` header. It
 is now genuinely incremental: raw PCM per segment, chunked, first audio after one segment
 instead of after all of them. Measured on the same text, **2.7s to first audio against 5.5s
-buffered**. Even unbatched the engine stays well under realtime — 0.397 on the short-passage
+buffered**. Even unbatched the engine stays well under realtime — 0.314 on the short-passage
 fixture — so the stream outpaces playback and a live listener never runs dry once it has
 started.
 
@@ -1087,8 +1131,16 @@ rather than let the server run a chapter ahead into memory.
 | **One cache shape for every group** | allocating at the batch width and narrowing, to stop a 64 + 36 split leaving two permanent caches: +0.4 GB at 48 lanes and 64 still thrashed |
 | **An int8 KV cache** | groups of 32 with inline scales: RTF 0.164 → 0.158 and **no memory saved at all** (13.32 → 13.36 GB peak), because the peak is the codec's activations. Fails the gate at `step1.hidden` — 4.52e-1 for K alone against a 5.0e-3 tolerance, since a key error moves a score before the softmax |
 | **One KV state for the whole render** | reused across groups instead of allocated per group: **17.10 GB peak against 13.33** at no change in RTF. A cache sized for the widest group is pinned while the codec runs, where per-group caches are buffers the pool hands on |
-| **Device-side sampling** | moved less than the transfer it saved |
-| **f16 codec decoder** | quality loss without a speed win |
+| **Device-side sampling, per step** | moved less than the transfer it saved, because the step still synchronised. Sampling all fifteen depth steps on the device with draws taken up front — one read per frame — is what shipped |
+| **f16 codec decoder** | quality loss. It is no longer "without a speed win": through MPSGraph an f16 residual unit is 2.66× today's f32 path, so quality alone is what rules it out |
+| **MPSGraph for every codec conv** | 1.02× in sum at f32. It wins while the reduction is short (96 → 1 at k=7 is 2.72×) and loses once it is long (0.84× at 768 → 1920, 0.50× on a 96-channel k=1); `tts_nn::mpsnlc::eligible` takes only the winners |
+| **64 lanes, retried after prefix sharing and device sampling** | 15.6 GB peak and RTF 0.790 — still the VM compressor. Peak at 48 fell 0.74 GB, not the 4 GB 64 needs |
+| **An unfilled KV cache** (`Tensor::empty` for `Tensor::zeros`) | identical audio, since attention reads only written positions — but peak footprint rose 11.74 → 13.84 GB. Skipping the fill does not leave a Metal buffer's pages uncommitted |
+| **KV sized to the group's frame budgets** | candle rounds every buffer up to a power of two, and a 48-lane layer cache stays in the 64 MiB class until capacity drops below ~340 positions |
+| **Staged variants of the decode GEMM** | double-buffered threadgroup tiles 5-8% slower, a 48x128 tile and 64-deep chunks slower too, any patch past 12 accumulators per simdgroup spills (0.42 TFLOP/s at 24, 1.4 with a 2x K unroll). What won was the opposite direction: no staging at all |
+| **Loading a conv's operands straight from device memory** | the move that won for the decode GEMM loses 3-12x on the codec: with `M` in the hundreds of thousands, every 32-position simdgroup re-reads the weights — ~4.8 GB per conv at 96 channels. Staging is what amortises them |
+| **Fusing residual add, RMS norm and the f16 cast** | one dispatch for four, and no measurable change in a decode step (69.8 against 69.5 ms). The QK-norm/rope fusion paid because it replaced slow 4-D norm and rope kernels, not because it removed dispatches |
+| **SnakeBeta fused into a 768-channel conv** | the kernel reloads its input once per 32 output channels, so the sin runs 24 times per element and the saved pass buys nothing; up to 384 channels it is a 9.5% win and shipped |
 | **Padded decode attention** | superseded by fused decode attention |
 
 The one that keeps paying: **candle is 1.70–2.23× slower than torch on this codec**, stable

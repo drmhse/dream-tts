@@ -54,7 +54,7 @@ references/qwen3tts/.venv/bin/python references/qwen3tts/export_voice.py \
   rules. A `.txt` file is spoken literally. Pass `--raw` only for text that is already narration
   output. When in doubt run `./dream-tts narrate --stats <file>` first and read what it will say.
 - **Judge speed on length, never on a paragraph.** `qwen3tts` batches across segments, so it is
-  RTF 0.397 on 132 words and 0.148 on a chapter. A slow-looking short render is the engine
+  RTF 0.314 on 132 words and about 0.11 on a chapter. A slow-looking short render is the engine
   working correctly.
 - **It wants 16 GB.** Peak is 12.3–13.0 GB and almost all of it is the codec's activations, so
   no weight format moves it. On a smaller machine use `--engine cosyvoice` (5.0 GB). Do not
