@@ -142,7 +142,11 @@ impl Model {
         let s_dec = style.narrow(1, 0, 128)?.contiguous()?;
 
         let hidden = self.bert.forward(ids, &self.device)?;
-        let d_en = self.bert_encoder.apply(&hidden)?.transpose(1, 2)?.contiguous()?;
+        let d_en = self
+            .bert_encoder
+            .apply(&hidden)?
+            .transpose(1, 2)?
+            .contiguous()?;
         lap("bert", &mut timings, &mut mark, &self.device)?;
 
         let d = self.predictor.text_encoder.forward(&d_en, &s_pred)?;

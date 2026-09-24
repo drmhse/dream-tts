@@ -37,7 +37,12 @@ impl TextEncoder {
     pub fn forward(&self, ids: &[u32], device: &Device) -> Result<Tensor> {
         let t = ids.len();
         let idx = Tensor::from_slice(ids, (t,), device)?;
-        let mut x = self.embedding.index_select(&idx, 0)?.unsqueeze(0)?.transpose(1, 2)?.contiguous()?;
+        let mut x = self
+            .embedding
+            .index_select(&idx, 0)?
+            .unsqueeze(0)?
+            .transpose(1, 2)?
+            .contiguous()?;
         for (conv, norm) in &self.convs {
             x = tts_nn::leaky_relu(&norm.apply(&conv.apply(&x)?)?, 0.2)?;
         }

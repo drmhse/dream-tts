@@ -17,8 +17,9 @@ use std::path::Path;
 use unicode_normalization::UnicodeNormalization;
 
 const UNK: &str = "❓";
-const PUNCT_TAGS: [&str; 11] =
-    [".", ",", "-LRB-", "-RRB-", "``", "\"\"", "''", ":", "$", "#", "NFP"];
+const PUNCT_TAGS: [&str; 11] = [
+    ".", ",", "-LRB-", "-RRB-", "``", "\"\"", "''", ":", "$", "#", "NFP",
+];
 
 fn punct_tag_phoneme(tag: &str) -> Option<&'static str> {
     match tag {
@@ -82,7 +83,11 @@ fn merge_tokens(tokens: &[MToken], unk: Option<&str>) -> MToken {
     }
     let currency = tokens.iter().filter_map(|t| t.currency.clone()).max();
     let any_missing_rating = tokens.iter().any(|t| t.rating.is_none());
-    let rating = if any_missing_rating { None } else { tokens.iter().filter_map(|t| t.rating).min() };
+    let rating = if any_missing_rating {
+        None
+    } else {
+        tokens.iter().filter_map(|t| t.rating).min()
+    };
 
     let phonemes = unk.map(|unk| {
         let mut out = String::new();
@@ -90,7 +95,11 @@ fn merge_tokens(tokens: &[MToken], unk: Option<&str>) -> MToken {
             if tk.prespace
                 && !out.is_empty()
                 && !out.chars().last().unwrap().is_whitespace()
-                && tk.phonemes.as_deref().map(|p| !p.is_empty()).unwrap_or(false)
+                && tk
+                    .phonemes
+                    .as_deref()
+                    .map(|p| !p.is_empty())
+                    .unwrap_or(false)
             {
                 out.push(' ');
             }
@@ -106,8 +115,17 @@ fn merge_tokens(tokens: &[MToken], unk: Option<&str>) -> MToken {
     let tag = tokens
         .iter()
         .map(|tk| {
-            let score: usize =
-                tk.text.chars().map(|c| if c.is_lowercase() || !c.is_alphabetic() { 1 } else { 2 }).sum();
+            let score: usize = tk
+                .text
+                .chars()
+                .map(|c| {
+                    if c.is_lowercase() || !c.is_alphabetic() {
+                        1
+                    } else {
+                        2
+                    }
+                })
+                .sum();
             (score, tk.tag.clone())
         })
         .enumerate()
@@ -122,11 +140,18 @@ fn merge_tokens(tokens: &[MToken], unk: Option<&str>) -> MToken {
     MToken {
         text: span_text(tokens),
         tag,
-        whitespace: tokens.last().map(|t| t.whitespace.clone()).unwrap_or_default(),
+        whitespace: tokens
+            .last()
+            .map(|t| t.whitespace.clone())
+            .unwrap_or_default(),
         phonemes,
         is_head: tokens[0].is_head,
         alias: None,
-        stress: if stresses.len() == 1 { Some(stresses[0]) } else { None },
+        stress: if stresses.len() == 1 {
+            Some(stresses[0])
+        } else {
+            None
+        },
         currency,
         num_flags: num_flags.into_iter().collect(),
         prespace: tokens[0].prespace,
@@ -227,7 +252,9 @@ impl G2P {
                     tks[j].phonemes = Some("—".into());
                     tks[j].rating = Some(3);
                 } else if PUNCT_TAGS.contains(&tag.as_str())
-                    && !text.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_uppercase())
+                    && !text
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_uppercase())
                 {
                     tks[j].phonemes = Some(match punct_tag_phoneme(&tag) {
                         Some(p) => p.to_string(),
@@ -237,16 +264,24 @@ impl G2P {
                 } else if currency.is_some() {
                     if tag != "CD" {
                         currency = None;
-                    } else if j + 1 == tks.len()
-                        && (i + 1 == n || tokens[i + 1].tag != "CD")
-                    {
+                    } else if j + 1 == tks.len() && (i + 1 == n || tokens[i + 1].tag != "CD") {
                         tks[j].currency = currency.clone();
                     }
                 } else if j > 0
                     && j + 1 < tks.len()
                     && text == "2"
-                    && tks[j - 1].text.chars().last().map(|c| c.is_alphabetic()).unwrap_or(false)
-                    && tks[j + 1].text.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false)
+                    && tks[j - 1]
+                        .text
+                        .chars()
+                        .last()
+                        .map(|c| c.is_alphabetic())
+                        .unwrap_or(false)
+                    && tks[j + 1]
+                        .text
+                        .chars()
+                        .next()
+                        .map(|c| c.is_alphabetic())
+                        .unwrap_or(false)
                 {
                     tks[j].alias = Some("to".into());
                 }
@@ -256,7 +291,9 @@ impl G2P {
                     words.push(Word::One(tk));
                 } else if matches!(words.last(), Some(Word::Many(g)) if g.last().unwrap().whitespace.is_empty())
                 {
-                    let Some(Word::Many(g)) = words.last_mut() else { unreachable!() };
+                    let Some(Word::Many(g)) = words.last_mut() else {
+                        unreachable!()
+                    };
                     let mut tk = tk;
                     tk.is_head = false;
                     g.push(tk);
@@ -283,7 +320,11 @@ impl G2P {
         if let Some(ps) = ps.filter(|p| !p.is_empty()) {
             for c in ps.chars() {
                 if is_vowel(c) || CONSONANTS.contains(c) || non_quote_punct(c) {
-                    future_vowel = if non_quote_punct(c) { None } else { Some(is_vowel(c)) };
+                    future_vowel = if non_quote_punct(c) {
+                        None
+                    } else {
+                        Some(is_vowel(c))
+                    };
                     break;
                 }
             }
@@ -291,7 +332,10 @@ impl G2P {
         let future_to = token.text == "to"
             || token.text == "To"
             || (token.text == "TO" && (token.tag == "TO" || token.tag == "IN"));
-        TokenContext { future_vowel, future_to }
+        TokenContext {
+            future_vowel,
+            future_to,
+        }
     }
 
     fn lexicon_lookup(&self, tk: &MToken, ctx: &TokenContext) -> Option<Hit> {
@@ -315,8 +359,12 @@ impl G2P {
             return Some((apply_stress(&ps, tk.stress), rating));
         }
         if Lexicon::is_number(&word, tk.is_head) {
-            let (ps, rating) =
-                self.lexicon.get_number(&word, tk.currency.as_deref(), tk.is_head, &tk.num_flags)?;
+            let (ps, rating) = self.lexicon.get_number(
+                &word,
+                tk.currency.as_deref(),
+                tk.is_head,
+                &tk.num_flags,
+            )?;
             return Some((apply_stress(&ps, tk.stress), rating));
         }
         None
@@ -329,7 +377,15 @@ impl G2P {
         let mut classes: Vec<u8> = text
             .chars()
             .filter(|c| !SUBTOKEN_JUNKS.contains(*c))
-            .map(|c| if c.is_alphabetic() { 0 } else if c.is_ascii_digit() { 1 } else { 2 })
+            .map(|c| {
+                if c.is_alphabetic() {
+                    0
+                } else if c.is_ascii_digit() {
+                    1
+                } else {
+                    2
+                }
+            })
             .collect();
         classes.sort_unstable();
         classes.dedup();
@@ -338,7 +394,8 @@ impl G2P {
         let n = tokens.len();
         for i in 0..n {
             if tokens[i].phonemes.is_none() {
-                if i == n - 1 && tokens[i].text.chars().count() == 1
+                if i == n - 1
+                    && tokens[i].text.chars().count() == 1
                     && tokens[i].text.chars().all(non_quote_punct)
                 {
                     tokens[i].phonemes = Some(tokens[i].text.clone());
@@ -360,9 +417,10 @@ impl G2P {
             .iter()
             .enumerate()
             .filter_map(|(i, tk)| {
-                tk.phonemes.as_deref().filter(|p| !p.is_empty()).map(|p| {
-                    (p.contains(PRIMARY_STRESS), stress_weight(p), i)
-                })
+                tk.phonemes
+                    .as_deref()
+                    .filter(|p| !p.is_empty())
+                    .map(|p| (p.contains(PRIMARY_STRESS), stress_weight(p), i))
             })
             .collect();
         if indices.len() == 2 && tokens[indices[0].2].text.chars().count() == 1 {
@@ -436,9 +494,14 @@ impl G2P {
                         let blocked = group[left..right]
                             .iter()
                             .any(|tk| tk.alias.is_some() || tk.phonemes.is_some());
-                        let candidate =
-                            if blocked { None } else { Some(merge_tokens(&group[left..right], None)) };
-                        let hit = candidate.as_ref().and_then(|tk| self.lexicon_lookup(tk, &ctx));
+                        let candidate = if blocked {
+                            None
+                        } else {
+                            Some(merge_tokens(&group[left..right], None))
+                        };
+                        let hit = candidate
+                            .as_ref()
+                            .and_then(|tk| self.lexicon_lookup(tk, &ctx));
                         if let Some((ps, rating)) = hit {
                             group[left].phonemes = Some(ps.clone());
                             group[left].rating = Some(rating);

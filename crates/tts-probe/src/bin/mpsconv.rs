@@ -42,7 +42,13 @@ fn dyn_shape(dims: &[usize], dynamic: bool) -> Retained<NSArray<NSNumber>> {
     let v: Vec<Retained<NSNumber>> = dims
         .iter()
         .enumerate()
-        .map(|(i, d)| if i == 3 { NSNumber::new_isize(-1) } else { NSNumber::new_usize(*d) })
+        .map(|(i, d)| {
+            if i == 3 {
+                NSNumber::new_isize(-1)
+            } else {
+                NSNumber::new_usize(*d)
+            }
+        })
         .collect();
     NSArray::from_retained_slice(&v)
 }
@@ -97,7 +103,18 @@ impl GraphConv {
                 &src, &wts, &desc, None,
             );
             let queue = dev.newCommandQueue().context("command queue")?;
-            Ok(Self { graph, src, wts, out, queue, cin, cout, len, k, dt })
+            Ok(Self {
+                graph,
+                src,
+                wts,
+                out,
+                queue,
+                cin,
+                cout,
+                len,
+                k,
+                dt,
+            })
         }
     }
 
@@ -121,12 +138,14 @@ impl GraphConv {
             );
             let feeds = NSDictionary::from_retained_objects(&[&*self.src, &*self.wts], &[xd, wd]);
             let targets = NSArray::from_retained_slice(&[self.out.clone()]);
-            let _ = self.graph.runWithMTLCommandQueue_feeds_targetTensors_targetOperations(
-                &self.queue,
-                &feeds,
-                &targets,
-                None,
-            );
+            let _ = self
+                .graph
+                .runWithMTLCommandQueue_feeds_targetTensors_targetOperations(
+                    &self.queue,
+                    &feeds,
+                    &targets,
+                    None,
+                );
         }
         Ok(())
     }
@@ -153,7 +172,10 @@ fn main() -> Result<()> {
     };
     let mut h = Harness::new(&dev, 7)?;
 
-    for (label, c, len) in [("stage0 256ch@8040", 256usize, 8040usize), ("stage1 128ch@48240", 128, 48240)] {
+    for (label, c, len) in [
+        ("stage0 256ch@8040", 256usize, 8040usize),
+        ("stage1 128ch@48240", 128, 48240),
+    ] {
         for k in [3usize, 7, 11] {
             let x = Tensor::randn(0f32, 1.0, (1, c, len), &dev)?.contiguous()?;
             let w = Tensor::randn(0f32, 0.02, (c, c, k), &dev)?.contiguous()?;
@@ -171,7 +193,10 @@ fn main() -> Result<()> {
             let xhb = buffer(&xh)?;
             let whb = buffer(&wh)?;
             let gh = GraphConv::new(&raw, c, c, len, k, 1, true, MPSDataType::Float16)?;
-            let mut bh = || { gh.run(&xhb, &whb).unwrap(); Ok(()) };
+            let mut bh = || {
+                gh.run(&xhb, &whb).unwrap();
+                Ok(())
+            };
             let gd = GraphConv::new(&raw, c, c, len, k, 1, true, MPSDataType::Float32)?;
             let t2 = std::time::Instant::now();
             gd.run(&xb, &wb)?;
@@ -179,7 +204,10 @@ fn main() -> Result<()> {
             println!(
                 "\n  build {built:.2} ms, first run {first:.1} ms (static) / {first_dyn:.1} ms (dynamic length)"
             );
-            let mut bd = || { gd.run(&xb, &wb).unwrap(); Ok(()) };
+            let mut bd = || {
+                gd.run(&xb, &wb).unwrap();
+                Ok(())
+            };
 
             let mut a = || {
                 tts_nn::centered_conv1d_gemm(&x, &w_tap, None, k, 1, (k - 1) / 2).unwrap();
@@ -189,13 +217,12 @@ fn main() -> Result<()> {
                 g.run(&xb, &wb).unwrap();
                 Ok(())
             };
-            let mut variants: Vec<(&str, &mut dyn FnMut() -> candle_core::Result<()>)> =
-                vec![
-                    ("gather + candle matmul", &mut a),
-                    ("MPSGraph convolution2D", &mut b),
-                    ("MPSGraph, dynamic length", &mut bd),
-                    ("MPSGraph f16", &mut bh),
-                ];
+            let mut variants: Vec<(&str, &mut dyn FnMut() -> candle_core::Result<()>)> = vec![
+                ("gather + candle matmul", &mut a),
+                ("MPSGraph convolution2D", &mut b),
+                ("MPSGraph, dynamic length", &mut bd),
+                ("MPSGraph f16", &mut bh),
+            ];
             h.ab(&format!("{label} k={k}"), &mut variants)?;
         }
     }

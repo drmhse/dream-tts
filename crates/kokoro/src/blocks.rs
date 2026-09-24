@@ -96,7 +96,13 @@ impl Conv1d {
                 self.padding,
             );
         }
-        let y = x.conv1d(&self.w, self.padding, self.stride, self.dilation, self.groups)?;
+        let y = x.conv1d(
+            &self.w,
+            self.padding,
+            self.stride,
+            self.dilation,
+            self.groups,
+        )?;
         Ok(match &self.b {
             Some(b) => y.broadcast_add(&b.reshape((1, b.dim(0)?, 1))?)?,
             None => y,
@@ -142,7 +148,12 @@ impl ChannelNorm {
     }
 
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
-        let y = tts_nn::layer_norm(&x.transpose(1, 2)?.contiguous()?, &self.gamma, &self.beta, NORM_EPS)?;
+        let y = tts_nn::layer_norm(
+            &x.transpose(1, 2)?.contiguous()?,
+            &self.gamma,
+            &self.beta,
+            NORM_EPS,
+        )?;
         Ok(y.transpose(1, 2)?.contiguous()?)
     }
 }
@@ -165,7 +176,10 @@ impl AdaIn {
             Some(weight) => Some((weight, w.get(&format!("{prefix}.norm.bias"))?)),
             None => None,
         };
-        Ok(Self { fc: Linear::load(w, &format!("{prefix}.fc"))?, affine })
+        Ok(Self {
+            fc: Linear::load(w, &format!("{prefix}.fc"))?,
+            affine,
+        })
     }
 
     /// The style-predicted `(gamma, beta)`, each `[C]`.
@@ -210,7 +224,9 @@ impl AdaIn {
             let (gamma, beta) = self.scale_shift(s, c)?;
             let m = tts_nn::fused::moments(x)?;
             let (mean, var) = (m.narrow(0, 0, 1)?, m.narrow(0, 1, 1)?);
-            return Ok(tts_nn::fused::adain_apply(x, &mean, &var, &gamma, &beta, NORM_EPS)?);
+            return Ok(tts_nn::fused::adain_apply(
+                x, &mean, &var, &gamma, &beta, NORM_EPS,
+            )?);
         }
         let h = self.fc.apply(s)?.reshape((1, 2 * c, 1))?;
         let gamma = h.narrow(1, 0, c)?;
@@ -236,7 +252,9 @@ pub struct AdaLayerNorm {
 
 impl AdaLayerNorm {
     pub fn load(w: &Weights, prefix: &str) -> Result<Self> {
-        Ok(Self { fc: Linear::load(w, &format!("{prefix}.fc"))? })
+        Ok(Self {
+            fc: Linear::load(w, &format!("{prefix}.fc"))?,
+        })
     }
 
     pub fn apply(&self, x: &Tensor, s: &Tensor) -> Result<Tensor> {
@@ -271,9 +289,7 @@ impl AdainResBlk {
             .then(|| Conv1d::load(w, &format!("{prefix}.conv1x1"), 1, 1))
             .transpose()?;
         let pool = upsample
-            .then(|| {
-                ConvTranspose1d::load(w, &format!("{prefix}.pool"), 2, 1, 1, dim_in)
-            })
+            .then(|| ConvTranspose1d::load(w, &format!("{prefix}.pool"), 2, 1, 1, dim_in))
             .transpose()?;
         Ok(Self {
             norm1: AdaIn::load(w, &format!("{prefix}.norm1"))?,

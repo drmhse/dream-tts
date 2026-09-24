@@ -90,7 +90,9 @@ pub struct Tagged<'a> {
 }
 
 fn f32s(t: &SafeTensors, name: &str) -> Result<Vec<f32>> {
-    let v = t.tensor(name).with_context(|| format!("missing tensor `{name}`"))?;
+    let v = t
+        .tensor(name)
+        .with_context(|| format!("missing tensor `{name}`"))?;
     Ok(v.data()
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
@@ -127,7 +129,12 @@ impl Tagger {
             .map(|a| f32s(&t, &format!("embed.{a}.E")))
             .collect::<Result<Vec<_>>>()?;
         let enc = (0..meta.depth)
-            .map(|i| Ok((maxout(&t, &format!("enc.{i}"))?, layernorm(&t, &format!("enc.{i}.ln"))?)))
+            .map(|i| {
+                Ok((
+                    maxout(&t, &format!("enc.{i}"))?,
+                    layernorm(&t, &format!("enc.{i}.ln"))?,
+                ))
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             embed,
@@ -150,7 +157,10 @@ impl Tagger {
     /// model that runs and is wrong on every token.
     fn keys(&self, tk: &Tagged, vocab: &Vocab) -> [u64; 6] {
         let text = tk.text;
-        let norm = tk.norm.map(str::to_string).unwrap_or_else(|| vocab.norm(text));
+        let norm = tk
+            .norm
+            .map(str::to_string)
+            .unwrap_or_else(|| vocab.norm(text));
         let prefix: String = text.chars().take(1).collect();
         let n = text.chars().count();
         let suffix: String = text.chars().skip(n.saturating_sub(3)).collect();

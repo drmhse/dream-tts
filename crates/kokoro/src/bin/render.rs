@@ -24,10 +24,17 @@ fn main() -> Result<()> {
     let seed: u64 = take("--seed", "1234").parse()?;
     let cpu = args.iter().any(|a| a == "--cpu");
     args.retain(|a| a != "--cpu");
-    let text = if args.is_empty() { "Hello from Rust.".to_string() } else { args.join(" ") };
+    let text = if args.is_empty() {
+        "Hello from Rust.".to_string()
+    } else {
+        args.join(" ")
+    };
 
-    let device =
-        if cpu { Device::Cpu } else { Device::new_metal(0).context("opening the Metal device")? };
+    let device = if cpu {
+        Device::Cpu
+    } else {
+        Device::new_metal(0).context("opening the Metal device")?
+    };
     let model = Model::load(&root, &device)?;
     let voices = Voices::load(&root.join("voices.safetensors"), &device)?;
     let g2p = tts_phoneme::g2p::G2P::load(&frontend, false)?;
@@ -38,10 +45,17 @@ fn main() -> Result<()> {
         eprintln!("unpronounceable: {}", unknown.join(", "));
     }
     let ids = model.cfg.encode(&phonemes);
-    anyhow::ensure!(ids.len() <= 510, "{} tokens; split the text first", ids.len());
+    anyhow::ensure!(
+        ids.len() <= 510,
+        "{} tokens; split the text first",
+        ids.len()
+    );
 
     let style = voices.style(&voice, ids.len() - 2)?;
-    let repeat: usize = std::env::var("KOKORO_REPEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let repeat: usize = std::env::var("KOKORO_REPEAT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
     let mut samples = Vec::new();
     let mut timings = Vec::new();
     let mut started = std::time::Instant::now();
@@ -69,7 +83,10 @@ fn main() -> Result<()> {
 
     tts_core::wav::write(
         &out,
-        &tts_core::Audio { samples, sample_rate: model.cfg.sample_rate() },
+        &tts_core::Audio {
+            samples,
+            sample_rate: model.cfg.sample_rate(),
+        },
     )
     .with_context(|| format!("writing {out}"))?;
     for (stage, secs) in &timings {

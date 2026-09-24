@@ -37,9 +37,13 @@ struct Counts {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let oracle = PathBuf::from(args.next().context("usage: phoneme-validate <oracle.jsonl> [frontend-dir]")?);
+    let oracle = PathBuf::from(
+        args.next()
+            .context("usage: phoneme-validate <oracle.jsonl> [frontend-dir]")?,
+    );
     let dir = PathBuf::from(
-        args.next().unwrap_or_else(|| "references/kokoro/weights/frontend".into()),
+        args.next()
+            .unwrap_or_else(|| "references/kokoro/weights/frontend".into()),
     );
 
     let tok = Tokenizer::load(&dir)?;
@@ -68,13 +72,22 @@ fn main() -> Result<()> {
         c.lines += 1;
 
         let split_matches = mine.len() == rec.spacy.len()
-            && mine.iter().zip(&rec.spacy).all(|(a, b)| a.text == b.t && a.whitespace == b.ws);
+            && mine
+                .iter()
+                .zip(&rec.spacy)
+                .all(|(a, b)| a.text == b.t && a.whitespace == b.ws);
         c.line_token_ok += split_matches as usize;
         if !split_matches && shown < 8 {
             shown += 1;
             eprintln!("split mismatch: {}", rec.text);
-            eprintln!("  ref  {:?}", rec.spacy.iter().map(|t| &t.t).collect::<Vec<_>>());
-            eprintln!("  mine {:?}", mine.iter().map(|t| &t.text).collect::<Vec<_>>());
+            eprintln!(
+                "  ref  {:?}",
+                rec.spacy.iter().map(|t| &t.t).collect::<Vec<_>>()
+            );
+            eprintln!(
+                "  mine {:?}",
+                mine.iter().map(|t| &t.text).collect::<Vec<_>>()
+            );
         }
         for (a, b) in mine.iter().zip(&rec.spacy) {
             c.tokens += 1;

@@ -22,8 +22,14 @@ impl Direction {
         let b_ih = w.get(&format!("{prefix}.bias_ih_l0{suffix}"))?;
         let b_hh = w.get(&format!("{prefix}.bias_hh_l0{suffix}"))?;
         Ok(Self {
-            w_ih: w.get(&format!("{prefix}.weight_ih_l0{suffix}"))?.t()?.contiguous()?,
-            w_hh: w.get(&format!("{prefix}.weight_hh_l0{suffix}"))?.t()?.contiguous()?,
+            w_ih: w
+                .get(&format!("{prefix}.weight_ih_l0{suffix}"))?
+                .t()?
+                .contiguous()?,
+            w_hh: w
+                .get(&format!("{prefix}.weight_hh_l0{suffix}"))?
+                .t()?
+                .contiguous()?,
             bias: (b_ih + b_hh)?,
         })
     }
@@ -44,11 +50,8 @@ impl Direction {
         let mut steps: Vec<Tensor> = Vec::with_capacity(t);
         for i in 0..t {
             let idx = if reverse { t - 1 - i } else { i };
-            let hc = tts_nn::fused::lstm_gates(
-                &h.matmul(&self.w_hh)?,
-                &pre.narrow(0, idx, 1)?,
-                &c,
-            )?;
+            let hc =
+                tts_nn::fused::lstm_gates(&h.matmul(&self.w_hh)?, &pre.narrow(0, idx, 1)?, &c)?;
             h = hc.narrow(0, 0, 1)?.contiguous()?;
             c = hc.narrow(0, 1, 1)?.contiguous()?;
             steps.push(h.clone());
@@ -71,7 +74,11 @@ impl BiLstm {
     pub fn load(w: &Weights, prefix: &str) -> Result<Self> {
         let forward = Direction::load(w, prefix, "")?;
         let hidden = forward.w_hh.dim(0)?;
-        Ok(Self { forward, backward: Direction::load(w, prefix, "_reverse")?, hidden })
+        Ok(Self {
+            forward,
+            backward: Direction::load(w, prefix, "_reverse")?,
+            hidden,
+        })
     }
 
     /// `x` is `[1, T, input]`; returns `[1, T, 2 * hidden]`.

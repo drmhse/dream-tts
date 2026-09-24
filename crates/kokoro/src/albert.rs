@@ -116,12 +116,16 @@ impl Albert {
             // ALBERT normalises after the residual, inside the attention block.
             let attended = self.attn_norm.apply(&(self.dense.apply(&ctx)? + &x)?)?;
             let ffn = tts_nn::gelu_tanh(&self.ffn.apply(&attended)?)?;
-            x = self.full_norm.apply(&(self.ffn_out.apply(&ffn)? + &attended)?)?;
+            x = self
+                .full_norm
+                .apply(&(self.ffn_out.apply(&ffn)? + &attended)?)?;
         }
         Ok(x)
     }
 
     fn split_heads(&self, x: &Tensor, t: usize) -> Result<Tensor> {
-        Ok(x.reshape((1, t, self.heads, self.head_dim))?.transpose(1, 2)?.contiguous()?)
+        Ok(x.reshape((1, t, self.heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?)
     }
 }

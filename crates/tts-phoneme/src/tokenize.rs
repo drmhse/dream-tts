@@ -60,7 +60,9 @@ fn translate(pattern: &str) -> String {
     let b = pattern.as_bytes();
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'\\' && i + 5 < b.len() && b[i + 1] == b'u'
+        if b[i] == b'\\'
+            && i + 5 < b.len()
+            && b[i + 1] == b'u'
             && b[i + 2..i + 6].iter().all(u8::is_ascii_hexdigit)
         {
             out.push_str("\\x{");
@@ -85,7 +87,11 @@ impl Tokenizer {
             prefix: Regex::new(&translate(&r.prefix_search))?,
             suffix: Regex::new(&translate(&r.suffix_search))?,
             infix: Regex::new(&translate(&r.infix_finditer))?,
-            url: r.url_match.as_deref().map(|p| Regex::new(&translate(p))).transpose()?,
+            url: r
+                .url_match
+                .as_deref()
+                .map(|p| Regex::new(&translate(p)))
+                .transpose()?,
             specials: r.exceptions,
             vocab: Vocab {
                 symbols: r.symbols,
@@ -121,25 +127,45 @@ impl Tokenizer {
             if orths.len() < 2 {
                 continue;
             }
-            self.rematch.entry(orths[0].clone()).or_default().push((orths, key));
+            self.rematch
+                .entry(orths[0].clone())
+                .or_default()
+                .push((orths, key));
         }
     }
 
     fn find_prefix(&self, s: &str) -> usize {
-        self.prefix.find(s).ok().flatten().map(|m| m.end()).unwrap_or(0)
+        self.prefix
+            .find(s)
+            .ok()
+            .flatten()
+            .map(|m| m.end())
+            .unwrap_or(0)
     }
 
     fn find_suffix(&self, s: &str) -> usize {
-        self.suffix.find(s).ok().flatten().map(|m| s.len() - m.start()).unwrap_or(0)
+        self.suffix
+            .find(s)
+            .ok()
+            .flatten()
+            .map(|m| s.len() - m.start())
+            .unwrap_or(0)
     }
 
     fn is_url(&self, s: &str) -> bool {
-        self.url.as_ref().map(|r| r.is_match(s).unwrap_or(false)).unwrap_or(false)
+        self.url
+            .as_ref()
+            .map(|r| r.is_match(s).unwrap_or(false))
+            .unwrap_or(false)
     }
 
     fn push_special(&self, out: &mut Vec<Token>, entries: &[Special]) {
         for e in entries {
-            out.push(Token { text: e.orth.clone(), whitespace: "", norm: e.norm.clone() });
+            out.push(Token {
+                text: e.orth.clone(),
+                whitespace: "",
+                norm: e.norm.clone(),
+            });
         }
     }
 
@@ -158,7 +184,8 @@ impl Tokenizer {
             let mut minus_pre = String::new();
             if pre != 0 {
                 minus_pre = s[pre..].to_string();
-                if with_specials && !minus_pre.is_empty() && self.specials.contains_key(&minus_pre) {
+                if with_specials && !minus_pre.is_empty() && self.specials.contains_key(&minus_pre)
+                {
                     prefixes.push(s[..pre].to_string());
                     s = minus_pre;
                     break;
@@ -168,7 +195,8 @@ impl Tokenizer {
             let mut minus_suf = String::new();
             if suf != 0 {
                 minus_suf = s[..s.len() - suf].to_string();
-                if with_specials && !minus_suf.is_empty() && self.specials.contains_key(&minus_suf) {
+                if with_specials && !minus_suf.is_empty() && self.specials.contains_key(&minus_suf)
+                {
                     suffixes.push(s[s.len() - suf..].to_string());
                     s = minus_suf;
                     break;
@@ -188,13 +216,21 @@ impl Tokenizer {
         }
 
         for p in &prefixes {
-            out.push(Token { text: p.clone(), whitespace: "", norm: None });
+            out.push(Token {
+                text: p.clone(),
+                whitespace: "",
+                norm: None,
+            });
         }
         if !s.is_empty() {
             if let Some(entries) = self.specials.get(&s).filter(|_| with_specials) {
                 self.push_special(out, entries);
             } else if self.is_url(&s) {
-                out.push(Token { text: s.clone(), whitespace: "", norm: None });
+                out.push(Token {
+                    text: s.clone(),
+                    whitespace: "",
+                    norm: None,
+                });
             } else {
                 let matches: Vec<(usize, usize)> = self
                     .infix
@@ -203,7 +239,11 @@ impl Tokenizer {
                     .map(|m| (m.start(), m.end()))
                     .collect();
                 if matches.is_empty() {
-                    out.push(Token { text: s.clone(), whitespace: "", norm: None });
+                    out.push(Token {
+                        text: s.clone(),
+                        whitespace: "",
+                        norm: None,
+                    });
                 } else {
                     let mut start = 0usize;
                     for (a, b) in matches {
@@ -211,21 +251,37 @@ impl Tokenizer {
                             continue;
                         }
                         if a != start {
-                            out.push(Token { text: s[start..a].into(), whitespace: "", norm: None });
+                            out.push(Token {
+                                text: s[start..a].into(),
+                                whitespace: "",
+                                norm: None,
+                            });
                         }
                         if a != b {
-                            out.push(Token { text: s[a..b].into(), whitespace: "", norm: None });
+                            out.push(Token {
+                                text: s[a..b].into(),
+                                whitespace: "",
+                                norm: None,
+                            });
                         }
                         start = b;
                     }
                     if start < s.len() {
-                        out.push(Token { text: s[start..].into(), whitespace: "", norm: None });
+                        out.push(Token {
+                            text: s[start..].into(),
+                            whitespace: "",
+                            norm: None,
+                        });
                     }
                 }
             }
         }
         for suffix in suffixes.iter().rev() {
-            out.push(Token { text: suffix.clone(), whitespace: "", norm: None });
+            out.push(Token {
+                text: suffix.clone(),
+                whitespace: "",
+                norm: None,
+            });
         }
     }
 
@@ -242,7 +298,9 @@ impl Tokenizer {
     fn apply_special_cases(&self, tokens: Vec<Token>) -> Vec<Token> {
         let mut spans: Vec<(usize, usize, &str)> = Vec::new();
         for i in 0..tokens.len() {
-            let Some(cands) = self.rematch.get(&tokens[i].text) else { continue };
+            let Some(cands) = self.rematch.get(&tokens[i].text) else {
+                continue;
+            };
             for (seq, key) in cands {
                 if i + seq.len() <= tokens.len()
                     && seq.iter().zip(&tokens[i..]).all(|(a, b)| *a == b.text)
@@ -254,9 +312,7 @@ impl Tokenizer {
         if spans.is_empty() {
             return tokens;
         }
-        spans.sort_by(|a, b| {
-            (b.1 - b.0).cmp(&(a.1 - a.0)).then(a.0.cmp(&b.0))
-        });
+        spans.sort_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0)).then(a.0.cmp(&b.0)));
         let mut seen = vec![false; tokens.len()];
         let mut kept: Vec<(usize, usize, &str)> = Vec::new();
         for s in spans {
@@ -323,7 +379,11 @@ impl Tokenizer {
         if start < text.len() {
             self.emit(&mut out, &text[start..]);
             if let Some(t) = out.last_mut() {
-                t.whitespace = if text.ends_with(' ') && !in_ws { " " } else { "" };
+                t.whitespace = if text.ends_with(' ') && !in_ws {
+                    " "
+                } else {
+                    ""
+                };
             }
         }
         self.apply_special_cases(out)

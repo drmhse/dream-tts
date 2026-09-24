@@ -44,14 +44,20 @@ impl SnakeResBlock {
             alpha1.push(alpha_pair(w, &format!("{prefix}.alpha1.{i}"))?);
             alpha2.push(alpha_pair(w, &format!("{prefix}.alpha2.{i}"))?);
         }
-        Ok(Self { convs1, convs2, adain1, adain2, alpha1, alpha2 })
+        Ok(Self {
+            convs1,
+            convs2,
+            adain1,
+            adain2,
+            alpha1,
+            alpha2,
+        })
     }
 
     fn apply(&self, x: &Tensor, s: &Tensor) -> Result<Tensor> {
         let mut x = x.clone();
         for i in 0..self.convs1.len() {
-            let mut t =
-                self.adain1[i].apply_snake(&x, s, &self.alpha1[i].0, &self.alpha1[i].1)?;
+            let mut t = self.adain1[i].apply_snake(&x, s, &self.alpha1[i].0, &self.alpha1[i].1)?;
             t = self.convs1[i].apply(&t)?;
             t = self.adain2[i].apply_snake(&t, s, &self.alpha2[i].0, &self.alpha2[i].1)?;
             t = self.convs2[i].apply(&t)?;
@@ -79,8 +85,11 @@ impl Generator {
         let g = &cfg.istftnet;
         let p = "decoder.generator";
         let mut ups = Vec::new();
-        for (i, (rate, kernel)) in
-            g.upsample_rates.iter().zip(&g.upsample_kernel_sizes).enumerate()
+        for (i, (rate, kernel)) in g
+            .upsample_rates
+            .iter()
+            .zip(&g.upsample_kernel_sizes)
+            .enumerate()
         {
             ups.push(ConvTranspose1d::load(
                 w,
@@ -120,8 +129,13 @@ impl Generator {
                 &[1, 3, 5],
             )?);
         }
-        let source_w: Vec<f32> = w.get(&format!("{p}.m_source.l_linear.weight"))?.flatten_all()?.to_vec1()?;
-        let source_b = w.get(&format!("{p}.m_source.l_linear.bias"))?.to_vec1::<f32>()?[0];
+        let source_w: Vec<f32> = w
+            .get(&format!("{p}.m_source.l_linear.weight"))?
+            .flatten_all()?
+            .to_vec1()?;
+        let source_b = w
+            .get(&format!("{p}.m_source.l_linear.bias"))?
+            .to_vec1::<f32>()?[0];
         Ok(Self {
             ups,
             noise_convs,
@@ -157,7 +171,6 @@ impl Generator {
             draws,
         )
     }
-
 
     /// `excitation` is the merged harmonic waveform, computed by [`Self::excitation`] —
     /// on another thread, while the decoder's own blocks were running.
@@ -287,7 +300,9 @@ impl Decoder {
             for block in &self.decode {
                 x = block.apply(&Tensor::cat(&[&x, &asr_res, &f0, &n], 1)?, s)?;
             }
-            let excitation = side.join().map_err(|_| anyhow::anyhow!("excitation panicked"))?;
+            let excitation = side
+                .join()
+                .map_err(|_| anyhow::anyhow!("excitation panicked"))?;
             Ok((x, excitation))
         })?;
         self.generator.forward(&x, s, &excitation)

@@ -1165,8 +1165,16 @@ impl CustomOp1 for Moments {
         // dispatch stays uniform and `threadgroup_position_in_grid.y` is the channel.
         let w = mtl::group_width(&p, self.len);
         encoder.dispatch_threads(
-            MTLSize { width: w, height: self.channels, depth: 1 },
-            MTLSize { width: w, height: 1, depth: 1 },
+            MTLSize {
+                width: w,
+                height: self.channels,
+                depth: 1,
+            },
+            MTLSize {
+                width: w,
+                height: 1,
+                depth: 1,
+            },
         );
         drop(encoder);
 
@@ -1186,7 +1194,8 @@ pub fn moments(x: &Tensor) -> Result<Tensor> {
     if b != 1 {
         candle_core::bail!("channel_moments: batch must be 1, got {b}");
     }
-    x.contiguous()?.apply_op1_no_bwd(&Moments { channels: c, len })
+    x.contiguous()?
+        .apply_op1_no_bwd(&Moments { channels: c, len })
 }
 
 /// [`adain_apply`] with SnakeBeta folded into its epilogue.
@@ -1272,8 +1281,16 @@ impl candle_core::CustomOp2 for AdainSnake {
         encoder.use_resource(dst.as_ref(), MTLResourceUsage::Write);
         let w = mtl::group_width(&p, self.len);
         encoder.dispatch_threads(
-            MTLSize { width: self.len, height: self.channels, depth: 1 },
-            MTLSize { width: w, height: 1, depth: 1 },
+            MTLSize {
+                width: self.len,
+                height: self.channels,
+                depth: 1,
+            },
+            MTLSize {
+                width: w,
+                height: 1,
+                depth: 1,
+            },
         );
         drop(encoder);
 
@@ -1312,13 +1329,19 @@ pub fn adain_snake(
             &parts.iter().map(|t| flat(t)).collect::<Result<Vec<_>>>()?,
             0,
         )?;
-        let op = AdainSnake { channels: c, len, eps: eps as f32 };
-        return x
-            .contiguous()?
-            .apply_op2_no_bwd(&packed, &op);
+        let op = AdainSnake {
+            channels: c,
+            len,
+            eps: eps as f32,
+        };
+        return x.contiguous()?.apply_op2_no_bwd(&packed, &op);
     }
     let y = adain_apply(x, mean, var, gamma, beta, eps)?;
-    snake_beta(&y, &alpha.reshape((1, c, 1))?, &beta_recip.reshape((1, c, 1))?)
+    snake_beta(
+        &y,
+        &alpha.reshape((1, c, 1))?,
+        &beta_recip.reshape((1, c, 1))?,
+    )
 }
 
 /// An LSTM step's gates, cell update and output, in one pass.
@@ -1401,8 +1424,16 @@ impl candle_core::CustomOp3 for LstmGates {
         encoder.use_resource(dst.as_ref(), MTLResourceUsage::Write);
         let w = mtl::group_width(&p, self.hidden);
         encoder.dispatch_threads(
-            MTLSize { width: self.hidden, height: 1, depth: 1 },
-            MTLSize { width: w, height: 1, depth: 1 },
+            MTLSize {
+                width: self.hidden,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: w,
+                height: 1,
+                depth: 1,
+            },
         );
         drop(encoder);
 
@@ -1422,9 +1453,11 @@ pub fn lstm_gates(gates: &Tensor, pre: &Tensor, c: &Tensor) -> Result<Tensor> {
     if gates.elem_count() != 4 * hidden || pre.elem_count() != 4 * hidden {
         candle_core::bail!("lstm_gates: gate vectors must be 4 x hidden");
     }
-    gates
-        .contiguous()?
-        .apply_op3_no_bwd(&pre.contiguous()?, &c.contiguous()?, &LstmGates { hidden })
+    gates.contiguous()?.apply_op3_no_bwd(
+        &pre.contiguous()?,
+        &c.contiguous()?,
+        &LstmGates { hidden },
+    )
 }
 
 #[cfg(test)]
@@ -1459,14 +1492,20 @@ mod tests {
                 for (i, want) in [hw, cw].iter().enumerate() {
                     let (abs, rel) =
                         crate::abs_and_rel(&got.narrow(0, i, 1)?.reshape((1, h))?, want)?;
-                    assert!(rel < 1e-6, "row {i} {d:?} h={h}: abs {abs:.3e} rel {rel:.3e}");
+                    assert!(
+                        rel < 1e-6,
+                        "row {i} {d:?} h={h}: abs {abs:.3e} rel {rel:.3e}"
+                    );
                 }
                 // Offset inputs: every step after the first feeds narrowed rows in.
                 let stacked = Tensor::cat(&[&c, &c.affine(2.0, 1.0)?], 0)?;
                 let got = lstm_gates(&g, &p, &stacked.narrow(0, 1, 1)?)?;
                 let want = lstm_gates(&g, &p, &stacked.narrow(0, 1, 1)?.contiguous()?)?;
                 let (abs, rel) = crate::abs_and_rel(&got, &want)?;
-                assert!(rel < 1e-6, "offset {d:?} h={h}: abs {abs:.3e} rel {rel:.3e}");
+                assert!(
+                    rel < 1e-6,
+                    "offset {d:?} h={h}: abs {abs:.3e} rel {rel:.3e}"
+                );
             }
         }
         Ok(())
@@ -1493,7 +1532,9 @@ mod tests {
         // saturated nor centred, which is where a fast transcendental costs the most.
         let h = 256usize;
         let span = |lo: f64, hi: f64| -> Vec<f32> {
-            (0..h).map(|j| (lo + (hi - lo) * j as f64 / (h - 1) as f64) as f32).collect()
+            (0..h)
+                .map(|j| (lo + (hi - lo) * j as f64 / (h - 1) as f64) as f32)
+                .collect()
         };
         let mut g = Vec::new();
         for (lo, hi) in [(-12.0, 12.0), (-6.0, 6.0), (-3.0, 3.0), (-1.0, 1.0)] {
@@ -1520,7 +1561,10 @@ mod tests {
                 }
             }
         }
-        assert!(worst < 1e-6, "worst relative error {worst:.3e} at channel {at}");
+        assert!(
+            worst < 1e-6,
+            "worst relative error {worst:.3e} at channel {at}"
+        );
         Ok(())
     }
 
@@ -1544,10 +1588,14 @@ mod tests {
         };
         let (c, len) = (8usize, 4096usize);
         let sweep = |lo: f64, hi: f64, n: usize| -> Vec<f32> {
-            (0..n).map(|i| (lo + (hi - lo) * (i % len) as f64 / (len - 1) as f64) as f32).collect()
+            (0..n)
+                .map(|i| (lo + (hi - lo) * (i % len) as f64 / (len - 1) as f64) as f32)
+                .collect()
         };
         let xs = sweep(-30.0, 30.0, c * len);
-        let al: Vec<f32> = (0..c).map(|j| 0.05 + 2.5 * j as f32 / (c - 1) as f32).collect();
+        let al: Vec<f32> = (0..c)
+            .map(|j| 0.05 + 2.5 * j as f32 / (c - 1) as f32)
+            .collect();
         let br: Vec<f32> = (0..c).map(|j| 0.5 + j as f32).collect();
         let x = Tensor::from_vec(xs.clone(), (1, c, len), &d)?;
         let a3 = Tensor::from_vec(al.clone(), (1, c, 1), &d)?;
@@ -1556,36 +1604,54 @@ mod tests {
         // Scaled by the operands: every one of these can cancel near zero, and dividing by
         // the result there reports the cancellation as kernel error.
         let mut worst: Vec<(&str, f64)> = Vec::new();
-        let mut check = |name: &'static str, got: Vec<f32>, want: &dyn Fn(usize, usize) -> (f64, f64)| {
-            let mut w = 0f64;
-            for j in 0..c {
-                for i in 0..len {
-                    let (v, scale) = want(j, i);
-                    w = w.max((got[j * len + i] as f64 - v).abs() / scale.max(1.0));
+        let mut check =
+            |name: &'static str, got: Vec<f32>, want: &dyn Fn(usize, usize) -> (f64, f64)| {
+                let mut w = 0f64;
+                for j in 0..c {
+                    for i in 0..len {
+                        let (v, scale) = want(j, i);
+                        w = w.max((got[j * len + i] as f64 - v).abs() / scale.max(1.0));
+                    }
                 }
-            }
-            worst.push((name, w));
-        };
+                worst.push((name, w));
+            };
 
-        check("snake_folded", crate::fused::snake_folded(&x)?.flatten_all()?.to_vec1()?, &|j, i| {
-            let xv = xs[j * len + i] as f64;
-            (xv + xv.sin().powi(2), xv.abs())
-        });
-        check("snake (alpha)", crate::snake(&x, &a3)?.flatten_all()?.to_vec1()?, &|j, i| {
-            let u = al[j] as f64 * xs[j * len + i] as f64;
-            (u + u.sin().powi(2), u.abs())
-        });
-        check("snake_full", crate::snake_full(&x, &a3, &b3)?.flatten_all()?.to_vec1()?, &|j, i| {
-            let xv = xs[j * len + i] as f64;
-            let u = al[j] as f64 * xv;
-            (xv + br[j] as f64 * u.sin().powi(2), xv.abs().max(br[j] as f64))
-        });
+        check(
+            "snake_folded",
+            crate::fused::snake_folded(&x)?.flatten_all()?.to_vec1()?,
+            &|j, i| {
+                let xv = xs[j * len + i] as f64;
+                (xv + xv.sin().powi(2), xv.abs())
+            },
+        );
+        check(
+            "snake (alpha)",
+            crate::snake(&x, &a3)?.flatten_all()?.to_vec1()?,
+            &|j, i| {
+                let u = al[j] as f64 * xs[j * len + i] as f64;
+                (u + u.sin().powi(2), u.abs())
+            },
+        );
+        check(
+            "snake_full",
+            crate::snake_full(&x, &a3, &b3)?.flatten_all()?.to_vec1()?,
+            &|j, i| {
+                let xv = xs[j * len + i] as f64;
+                let u = al[j] as f64 * xv;
+                (
+                    xv + br[j] as f64 * u.sin().powi(2),
+                    xv.abs().max(br[j] as f64),
+                )
+            },
+        );
 
         // The channels-last sibling, f32 and f16, as qwen3tts's codec calls it.
         let xn = Tensor::from_vec(xs.clone(), (1, len, c), &d)?;
         let a1 = Tensor::from_vec(al.clone(), c, &d)?;
         let b1 = Tensor::from_vec(br.clone(), c, &d)?;
-        let nlc = snake_beta_nlc(&xn, &a1, &b1)?.flatten_all()?.to_vec1::<f32>()?;
+        let nlc = snake_beta_nlc(&xn, &a1, &b1)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
         let mut w = 0f64;
         for i in 0..len {
             for j in 0..c {
@@ -1654,7 +1720,9 @@ mod tests {
         let xs: Vec<f32> = (0..c * len)
             .map(|i| (-12.0 + 24.0 * (i % len) as f64 / (len - 1) as f64) as f32)
             .collect();
-        let al: Vec<f32> = (0..c).map(|j| 0.03 + 2.3 * j as f32 / (c - 1) as f32).collect();
+        let al: Vec<f32> = (0..c)
+            .map(|j| 0.03 + 2.3 * j as f32 / (c - 1) as f32)
+            .collect();
         let br: Vec<f32> = (0..c).map(|j| 0.5 + j as f32).collect();
         let x = Tensor::from_vec(xs.clone(), (1, c, len), &d)?;
         let a = Tensor::from_vec(al.clone(), (1, c, 1), &d)?;
@@ -1698,10 +1766,8 @@ mod tests {
                 let var = crate::fused::sub_sqr(&x, &mean)?.mean_keepdim(2)?;
                 let got = moments(&x)?;
                 for (i, want) in [mean, var].iter().enumerate() {
-                    let (abs, rel) = crate::abs_and_rel(
-                        &got.narrow(0, i, 1)?.reshape((1, c, 1))?,
-                        want,
-                    )?;
+                    let (abs, rel) =
+                        crate::abs_and_rel(&got.narrow(0, i, 1)?.reshape((1, c, 1))?, want)?;
                     assert!(
                         rel < 1e-4,
                         "moments[{i}] {d:?} at {c}x{len}: abs {abs:.3e} rel {rel:.3e}"
@@ -1819,8 +1885,7 @@ mod tests {
                     Tensor::randn(0f32, 1., c, &d)?.abs()?,
                 );
                 let want = snake_beta(&want, &r(&alpha)?, &r(&brecip)?)?;
-                let got =
-                    adain_snake(&x, &mean, &var, &gamma, &beta, &alpha, &brecip, 1e-5)?;
+                let got = adain_snake(&x, &mean, &var, &gamma, &beta, &alpha, &brecip, 1e-5)?;
                 let (abs, rel) = crate::abs_and_rel(&want, &got)?;
                 assert!(
                     rel < 1e-5,

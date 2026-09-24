@@ -86,7 +86,10 @@ pub struct Lexicon {
 fn capitalize(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
-        Some(f) => f.to_uppercase().chain(c.flat_map(char::to_lowercase)).collect(),
+        Some(f) => f
+            .to_uppercase()
+            .chain(c.flat_map(char::to_lowercase))
+            .collect(),
         None => String::new(),
     }
 }
@@ -132,7 +135,9 @@ fn restress(ps: &str) -> String {
 }
 
 pub fn apply_stress(ps: &str, stress: Option<f64>) -> String {
-    let Some(stress) = stress else { return ps.to_string() };
+    let Some(stress) = stress else {
+        return ps.to_string();
+    };
     let has_primary = ps.contains(PRIMARY_STRESS);
     let has_secondary = ps.contains(SECONDARY_STRESS);
     let has_any = has_primary || has_secondary;
@@ -145,7 +150,13 @@ pub fn apply_stress(ps: &str, stress: Option<f64>) -> String {
         return ps
             .chars()
             .filter(|c| *c != SECONDARY_STRESS)
-            .map(|c| if c == PRIMARY_STRESS { SECONDARY_STRESS } else { c })
+            .map(|c| {
+                if c == PRIMARY_STRESS {
+                    SECONDARY_STRESS
+                } else {
+                    c
+                }
+            })
             .collect();
     }
     if (stress == 0.0 || stress == 0.5 || stress == 1.0) && !has_any {
@@ -167,7 +178,9 @@ pub fn apply_stress(ps: &str, stress: Option<f64>) -> String {
 }
 
 pub fn stress_weight(ps: &str) -> usize {
-    ps.chars().map(|c| if DIPHTHONGS.contains(c) { 2 } else { 1 }).sum()
+    ps.chars()
+        .map(|c| if DIPHTHONGS.contains(c) { 2 } else { 1 })
+        .sum()
 }
 
 fn is_digits(s: &str) -> bool {
@@ -183,11 +196,19 @@ pub type Hit = (String, u8);
 
 impl Lexicon {
     pub fn load(dir: &Path, british: bool) -> Result<Self> {
-        let name = if british { "lexicon-gb.json" } else { "lexicon-us.json" };
+        let name = if british {
+            "lexicon-gb.json"
+        } else {
+            "lexicon-us.json"
+        };
         let raw = std::fs::read(dir.join(name))
             .with_context(|| format!("reading {name} from {}", dir.display()))?;
         let r: RawLexicon = serde_json::from_slice(&raw)?;
-        Ok(Self { british, golds: grow(r.gold), silvers: grow(r.silver) })
+        Ok(Self {
+            british,
+            golds: grow(r.gold),
+            silvers: grow(r.silver),
+        })
     }
 
     fn parent_tag(tag: &str) -> &str {
@@ -219,18 +240,23 @@ impl Lexicon {
             ps.push_str(self.gold_str(&up)?);
         }
         let ps = apply_stress(&ps, Some(0.0));
-        Some((match ps.rfind(SECONDARY_STRESS) {
-            Some(i) => format!(
-                "{}{PRIMARY_STRESS}{}",
-                &ps[..i],
-                &ps[i + SECONDARY_STRESS.len_utf8()..]
-            ),
-            None => ps,
-        }, 3))
+        Some((
+            match ps.rfind(SECONDARY_STRESS) {
+                Some(i) => format!(
+                    "{}{PRIMARY_STRESS}{}",
+                    &ps[..i],
+                    &ps[i + SECONDARY_STRESS.len_utf8()..]
+                ),
+                None => ps,
+            },
+            3,
+        ))
     }
 
     fn is_known(&self, word: &str, _tag: &str) -> bool {
-        if self.golds.contains_key(word) || symbol(word).is_some() || self.silvers.contains_key(word)
+        if self.golds.contains_key(word)
+            || symbol(word).is_some()
+            || self.silvers.contains_key(word)
         {
             return true;
         }
@@ -272,13 +298,16 @@ impl Lexicon {
             Some(Entry::Word(w)) => Some(w),
             Some(Entry::Tagged(map)) => {
                 let mut key = tag.to_string();
-                if ctx.map(|c| c.future_vowel.is_none()).unwrap_or(false) && map.contains_key("None")
+                if ctx.map(|c| c.future_vowel.is_none()).unwrap_or(false)
+                    && map.contains_key("None")
                 {
                     key = "None".into();
                 } else if !map.contains_key(&key) {
                     key = Self::parent_tag(tag).to_string();
                 }
-                map.get(&key).cloned().unwrap_or_else(|| map["DEFAULT"].clone())
+                map.get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| map["DEFAULT"].clone())
             }
             None => None,
         };
@@ -339,7 +368,13 @@ impl Lexicon {
         Some(format!("{stem}ɪŋ"))
     }
 
-    fn stem_s(&self, word: &str, tag: &str, stress: Option<f64>, ctx: Option<&TokenContext>) -> Option<Hit> {
+    fn stem_s(
+        &self,
+        word: &str,
+        tag: &str,
+        stress: Option<f64>,
+        ctx: Option<&TokenContext>,
+    ) -> Option<Hit> {
         if word.chars().count() < 3 || !word.ends_with('s') {
             return None;
         }
@@ -363,7 +398,13 @@ impl Lexicon {
         Some((self.suffix_s(&stem)?, rating))
     }
 
-    fn stem_ed(&self, word: &str, tag: &str, stress: Option<f64>, ctx: Option<&TokenContext>) -> Option<Hit> {
+    fn stem_ed(
+        &self,
+        word: &str,
+        tag: &str,
+        stress: Option<f64>,
+        ctx: Option<&TokenContext>,
+    ) -> Option<Hit> {
         if word.chars().count() < 4 || !word.ends_with('d') {
             return None;
         }
@@ -383,7 +424,13 @@ impl Lexicon {
         Some((self.suffix_ed(&stem)?, rating))
     }
 
-    fn stem_ing(&self, word: &str, tag: &str, stress: Option<f64>, ctx: Option<&TokenContext>) -> Option<Hit> {
+    fn stem_ing(
+        &self,
+        word: &str,
+        tag: &str,
+        stress: Option<f64>,
+        ctx: Option<&TokenContext>,
+    ) -> Option<Hit> {
         let count = word.chars().count();
         if count < 5 || !word.ends_with("ing") {
             return None;
@@ -420,7 +467,6 @@ pub fn is_ordinal_suffix(s: &str) -> bool {
     ORDINAL_SUFFIXES.contains(&s)
 }
 
-
 impl Lexicon {
     /// The hand-written exceptions, in misaki's order — several depend on the token to the
     /// right, which is why the driver walks the sentence backwards.
@@ -443,7 +489,12 @@ impl Lexicon {
         if stripped.contains('.')
             && word.replace('.', "").chars().all(char::is_alphabetic)
             && !word.replace('.', "").is_empty()
-            && word.split('.').map(|p| p.chars().count()).max().unwrap_or(0) < 3
+            && word
+                .split('.')
+                .map(|p| p.chars().count())
+                .max()
+                .unwrap_or(0)
+                < 3
         {
             return self.get_nnp(word);
         }
@@ -468,21 +519,39 @@ impl Lexicon {
                 return Some(("ɐn".into(), 4));
             }
             "I" if tag == "PRP" => return Some((format!("{SECONDARY_STRESS}I"), 4)),
-            "by" | "By" | "BY" if Self::parent_tag(tag) == "ADV" => {
-                return Some(("bˈI".into(), 4))
-            }
+            "by" | "By" | "BY" if Self::parent_tag(tag) == "ADV" => return Some(("bˈI".into(), 4)),
             "to" | "To" => return Some((self.to_phonemes(ctx)?, 4)),
             "TO" if tag == "TO" || tag == "IN" => return Some((self.to_phonemes(ctx)?, 4)),
             "in" | "In" => return Some((self.in_phonemes(tag, ctx), 4)),
             "IN" if tag != "NNP" => return Some((self.in_phonemes(tag, ctx), 4)),
             "the" | "The" => {
-                return Some(((if ctx.future_vowel == Some(true) { "ði" } else { "ðə" }).into(), 4))
+                return Some((
+                    (if ctx.future_vowel == Some(true) {
+                        "ði"
+                    } else {
+                        "ðə"
+                    })
+                    .into(),
+                    4,
+                ))
             }
             "THE" if tag == "DT" => {
-                return Some(((if ctx.future_vowel == Some(true) { "ði" } else { "ðə" }).into(), 4))
+                return Some((
+                    (if ctx.future_vowel == Some(true) {
+                        "ði"
+                    } else {
+                        "ðə"
+                    })
+                    .into(),
+                    4,
+                ))
             }
             "used" | "Used" | "USED" => {
-                let key = if (tag == "VBD" || tag == "JJ") && ctx.future_to { "VBD" } else { "DEFAULT" };
+                let key = if (tag == "VBD" || tag == "JJ") && ctx.future_to {
+                    "VBD"
+                } else {
+                    "DEFAULT"
+                };
                 if let Some(Entry::Tagged(map)) = self.golds.get("used") {
                     return Some((map.get(key)?.clone()?, 4));
                 }
@@ -508,7 +577,11 @@ impl Lexicon {
     }
 
     fn in_phonemes(&self, tag: &str, ctx: &TokenContext) -> String {
-        let lead = if ctx.future_vowel.is_none() || tag != "IN" { PRIMARY_STRESS.to_string() } else { String::new() };
+        let lead = if ctx.future_vowel.is_none() || tag != "IN" {
+            PRIMARY_STRESS.to_string()
+        } else {
+            String::new()
+        };
         format!("{lead}ɪn")
     }
 
@@ -573,13 +646,7 @@ impl Lexicon {
         cents.chars().count() < 3 || cents.chars().all(|c| c == '0')
     }
 
-    fn extend_num(
-        &self,
-        result: &mut Vec<Hit>,
-        words: &str,
-        first: bool,
-        num_flags: &str,
-    ) {
+    fn extend_num(&self, result: &mut Vec<Hit>, words: &str, first: bool, num_flags: &str) {
         let splits: Vec<&str> = split_non_lower(words);
         for (i, w) in splits.iter().enumerate() {
             if *w != "and" || num_flags.contains('&') {
@@ -619,7 +686,11 @@ impl Lexicon {
                 .into_iter()
                 .rev()
                 .collect();
-            if tail.is_empty() { None } else { Some(tail) }
+            if tail.is_empty() {
+                None
+            } else {
+                Some(tail)
+            }
         };
         let mut word = match &suffix {
             Some(s) => word[..word.len() - s.len()].to_string(),
@@ -682,8 +753,9 @@ impl Lexicon {
                 }
                 first = false;
             }
-        } else if let Some((major, minor)) =
-            currency.and_then(currency_units).filter(|_| Self::is_currency_amount(&word))
+        } else if let Some((major, minor)) = currency
+            .and_then(currency_units)
+            .filter(|_| Self::is_currency_amount(&word))
         {
             let parts: Vec<&str> = plain.split('.').collect();
             let mut pairs: Vec<(i64, &str)> = parts
@@ -719,7 +791,11 @@ impl Lexicon {
                 num2words::cardinal(word.parse().ok()?)
             } else if !word.contains('.') {
                 let v: i64 = plain.parse().ok()?;
-                if is_ordinal { num2words::ordinal(v) } else { num2words::cardinal(v) }
+                if is_ordinal {
+                    num2words::ordinal(v)
+                } else {
+                    num2words::cardinal(v)
+                }
             } else if plain.starts_with('.') {
                 let mut s = String::from("point");
                 for c in plain[1..].chars() {
@@ -737,7 +813,11 @@ impl Lexicon {
             return None;
         }
         let rating = result.iter().map(|(_, r)| *r).min().unwrap();
-        let joined = result.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>().join(" ");
+        let joined = result
+            .iter()
+            .map(|(p, _)| p.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
         Some((
             match suffix.as_deref() {
                 Some("s") | Some("'s") => self.suffix_s(&joined)?,
@@ -750,7 +830,9 @@ impl Lexicon {
     }
 
     fn append_currency(&self, ps: &str, currency: Option<&str>) -> String {
-        let Some((major, _)) = currency.and_then(currency_units) else { return ps.to_string() };
+        let Some((major, _)) = currency.and_then(currency_units) else {
+            return ps.to_string();
+        };
         match self.stem_s(&format!("{major}s"), "", None, None) {
             Some((c, _)) => format!("{ps} {c}"),
             None => ps.to_string(),
@@ -889,10 +971,17 @@ impl Lexicon {
                 return Some((self.suffix_ed(&ps)?, 2));
             }
         }
-        if let Some(stem) = lower.strip_suffix("ier").or_else(|| lower.strip_suffix("iest")) {
+        if let Some(stem) = lower
+            .strip_suffix("ier")
+            .or_else(|| lower.strip_suffix("iest"))
+        {
             if self.known_word(&format!("{stem}y")) {
                 let ps = self.known_phonemes(&format!("{stem}y"))?;
-                let tail = if lower.ends_with("iest") { "ᵻst" } else { "əɹ" };
+                let tail = if lower.ends_with("iest") {
+                    "ᵻst"
+                } else {
+                    "əɹ"
+                };
                 return Some((format!("{ps}{tail}"), 2));
             }
         }
@@ -910,7 +999,9 @@ impl Lexicon {
             "un", "re", "non", "multi", "over", "under", "pre", "de", "mis", "sub", "inter",
             "anti", "auto", "co", "micro", "mono",
         ] {
-            let Some(rest) = lower.strip_prefix(prefix) else { continue };
+            let Some(rest) = lower.strip_prefix(prefix) else {
+                continue;
+            };
             if rest.chars().count() < 3 || !self.known_word(rest) {
                 continue;
             }
@@ -923,13 +1014,10 @@ impl Lexicon {
         // Inflection sits outside the compound, not inside it: "namespaces" is
         // name+space+s, and splitting the inflected form directly finds names+paces, which
         // is two real words and the wrong two.
-        for (suffix, inflect) in [
-            ("s", 0u8),
-            ("es", 0),
-            ("ed", 1),
-            ("ing", 2),
-        ] {
-            let Some(stem) = lower.strip_suffix(suffix) else { continue };
+        for (suffix, inflect) in [("s", 0u8), ("es", 0), ("ed", 1), ("ing", 2)] {
+            let Some(stem) = lower.strip_suffix(suffix) else {
+                continue;
+            };
             if stem.chars().count() < 4 || lower.ends_with("ss") {
                 continue;
             }
@@ -937,7 +1025,9 @@ impl Lexicon {
                 if candidate == lower {
                     continue;
                 }
-                let Some((ps, _)) = self.derive(&candidate) else { continue };
+                let Some((ps, _)) = self.derive(&candidate) else {
+                    continue;
+                };
                 let out = match inflect {
                     0 => self.suffix_s(&ps),
                     1 => self.suffix_ed(&ps),
@@ -959,7 +1049,12 @@ impl Lexicon {
                 let tail: String = chars[*split..].iter().collect();
                 self.known_word(&head) && self.known_word(&tail)
             })
-            .max_by_key(|split| (split.min(&(chars.len() - split)).to_owned(), chars.len() - split))?;
+            .max_by_key(|split| {
+                (
+                    split.min(&(chars.len() - split)).to_owned(),
+                    chars.len() - split,
+                )
+            })?;
         let head: String = chars[..best].iter().collect();
         let tail: String = chars[best..].iter().collect();
         Some((

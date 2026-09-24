@@ -27,7 +27,9 @@
 
 use anyhow::{Context, Result};
 use candle_core::backend::BackendStorage;
-use candle_core::{CpuStorage, CustomOp2, DType, Layout, MetalDevice, Result as CResult, Shape, Tensor};
+use candle_core::{
+    CpuStorage, CustomOp2, DType, Layout, MetalDevice, Result as CResult, Shape, Tensor,
+};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::AnyThread;
@@ -86,7 +88,12 @@ impl Graph {
                 None,
             );
             let wts = graph.placeholderWithShape_dataType_name(
-                Some(&shape(&[key.cout as isize, key.cin as isize, 1, key.k as isize])),
+                Some(&shape(&[
+                    key.cout as isize,
+                    key.cin as isize,
+                    1,
+                    key.k as isize,
+                ])),
                 MPSDataType::Float32,
                 None,
             );
@@ -115,7 +122,14 @@ impl Graph {
                 .as_ref()
                 .newCommandQueue()
                 .context("MPSGraph command queue")?;
-            Ok(Self { graph, src, wts, bias, out, queue })
+            Ok(Self {
+                graph,
+                src,
+                wts,
+                bias,
+                out,
+                queue,
+            })
         }
     }
 }
@@ -123,7 +137,9 @@ impl Graph {
 fn cached(dev: &MetalDevice, key: Key) -> Result<Arc<Graph>> {
     static CACHE: OnceLock<Mutex<HashMap<Key, Arc<Graph>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().map_err(|e| anyhow::anyhow!("graph cache poisoned: {e}"))?;
+    let mut guard = cache
+        .lock()
+        .map_err(|e| anyhow::anyhow!("graph cache poisoned: {e}"))?;
     if let Some(g) = guard.get(&key) {
         return Ok(g.clone());
     }
@@ -229,7 +245,10 @@ impl CustomOp2 for MpsConv {
             let mut keys: Vec<&MPSGraphTensor> = vec![&g.src, &g.wts];
             let mut vals = vec![
                 td(s1.buffer().as_ref(), &[1, cin as isize, 1, len as isize]),
-                td(s2.buffer().as_ref(), &[cout as isize, cin as isize, 1, k as isize]),
+                td(
+                    s2.buffer().as_ref(),
+                    &[cout as isize, cin as isize, 1, k as isize],
+                ),
             ];
             let held;
             if let (Some(bt), Some(bten)) = (&self.bias, &g.bias) {
@@ -243,16 +262,23 @@ impl CustomOp2 for MpsConv {
                 }
                 held = bb;
                 keys.push(bten);
-                vals.push(td(AsRef::<ProtocolObject<dyn MTLBuffer>>::as_ref(held.as_ref()), &[1, cout as isize, 1, 1]));
+                vals.push(td(
+                    AsRef::<ProtocolObject<dyn MTLBuffer>>::as_ref(held.as_ref()),
+                    &[1, cout as isize, 1, 1],
+                ));
             }
             let feeds = NSDictionary::from_retained_objects(&keys, &vals);
             let results = NSDictionary::from_retained_objects(
                 &[&*g.out],
-                &[td(AsRef::<ProtocolObject<dyn MTLBuffer>>::as_ref(out.as_ref()), &[1, cout as isize, 1, len as isize])],
+                &[td(
+                    AsRef::<ProtocolObject<dyn MTLBuffer>>::as_ref(out.as_ref()),
+                    &[1, cout as isize, 1, len as isize],
+                )],
             );
-            g.graph.runWithMTLCommandQueue_feeds_targetOperations_resultsDictionary(
-                &g.queue, &feeds, None, &results,
-            );
+            g.graph
+                .runWithMTLCommandQueue_feeds_targetOperations_resultsDictionary(
+                    &g.queue, &feeds, None, &results,
+                );
         }
 
         crate::stats::record(
@@ -300,7 +326,11 @@ mod tests {
         let Some(d) = crate::usable_metal() else {
             return Ok(());
         };
-        for (cin, cout, len) in [(128usize, 128usize, 4441usize), (256, 256, 8040), (22, 128, 511)] {
+        for (cin, cout, len) in [
+            (128usize, 128usize, 4441usize),
+            (256, 256, 8040),
+            (22, 128, 511),
+        ] {
             for (k, dil) in [(1usize, 1usize), (3, 1), (3, 5), (7, 3), (11, 1), (11, 5)] {
                 let x = Tensor::randn(0f32, 1., (1, cin, len), &d)?;
                 let w = Tensor::randn(0f32, 0.02, (cout, cin, k), &d)?;

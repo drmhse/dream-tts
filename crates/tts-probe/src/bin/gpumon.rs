@@ -41,7 +41,10 @@ fn main() -> Result<()> {
     let sampler = tts_core::gpumon::Sampler::open().context("no accelerator node to sample")?;
     let period = Duration::from_secs_f64(1.0 / hz);
     let t0 = Instant::now();
-    println!("{:>7} {:>4} {:>4} {:>4} {:>8} {:>8}", "t", "gpu", "ren", "til", "alloc", "inuse");
+    println!(
+        "{:>7} {:>4} {:>4} {:>4} {:>8} {:>8}",
+        "t", "gpu", "ren", "til", "alloc", "inuse"
+    );
     for _ in 0..count {
         let dt = t0.elapsed();
         match sampler.sample() {

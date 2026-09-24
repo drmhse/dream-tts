@@ -67,7 +67,10 @@ impl KokoroEngine {
             Device::new_metal(0).context("opening the Metal device")?
         };
         let voice = match config.overrides.get("voice") {
-            Some(p) => p.to_str().context("--set voice=<name> is not utf-8")?.to_string(),
+            Some(p) => p
+                .to_str()
+                .context("--set voice=<name> is not utf-8")?
+                .to_string(),
             None => DEFAULT_VOICE.to_string(),
         };
         // `bf_`/`bm_` are the British voicepacks, and the lexicon is the half of the
@@ -87,7 +90,12 @@ impl KokoroEngine {
             voices.names().join(", ")
         );
         let g2p = tts_phoneme::g2p::G2P::load(&config.path("frontend", "frontend"), british)?;
-        Ok(Self { model, voices, g2p, voice })
+        Ok(Self {
+            model,
+            voices,
+            g2p,
+            voice,
+        })
     }
 }
 

@@ -112,10 +112,22 @@ impl CustomOp2 for TapConv {
         encoder.use_resource(s2.buffer(), MTLResourceUsage::Read);
         encoder.use_resource(&bias_buf, MTLResourceUsage::Read);
         encoder.use_resource(dst.as_ref(), MTLResourceUsage::Write);
-        let nt = if self.kernel == "conv1d_tap_reg_f32" { 128 } else { 64 };
+        let nt = if self.kernel == "conv1d_tap_reg_f32" {
+            128
+        } else {
+            64
+        };
         encoder.dispatch_thread_groups(
-            MTLSize { width: len.div_ceil(nt), height: cout / 128, depth: 1 },
-            MTLSize { width: 256, height: 1, depth: 1 },
+            MTLSize {
+                width: len.div_ceil(nt),
+                height: cout / 128,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
         );
         drop(encoder);
 
@@ -184,7 +196,12 @@ mod tests {
         let Some(d) = crate::usable_metal() else {
             return Ok(());
         };
-        for (cin, cout, len) in [(128usize, 128usize, 4441usize), (128, 128, 48240), (256, 256, 8040), (128, 256, 511)] {
+        for (cin, cout, len) in [
+            (128usize, 128usize, 4441usize),
+            (128, 128, 48240),
+            (256, 256, 8040),
+            (128, 256, 511),
+        ] {
             for (k, dil) in [(1usize, 1usize), (3, 1), (3, 5), (7, 3), (11, 1), (11, 5)] {
                 let x = Tensor::randn(0f32, 1., (1, cin, len), &d)?;
                 let w = Tensor::randn(0f32, 0.02, (cout, cin, k), &d)?;
@@ -193,21 +210,24 @@ mod tests {
                 let pad = (k - 1) * dil / 2;
                 let want = crate::centered_conv1d_gemm(&x, &w_tap, Some(&b), k, dil, pad)?;
                 for kern in ["conv1d_tap_gemm_f32", "conv1d_tap_reg_f32"] {
-                let got = centered_conv1d_fused_with(&x, &w_tap, Some(&b), k, dil, pad, kern)?;
-                assert_eq!(want.dims(), got.dims());
-                let (abs, rel) = crate::abs_and_rel(&want, &got)?;
-                // Looser than the biasless bound below on purpose: the bias seeds the
-                // accumulator here rather than being added to a finished sum.
-                assert!(
-                    rel < 1e-5,
-                    "{kern} {cin}->{cout} @ {len} k={k} d={dil}: abs {abs:.3e} rel {rel:.3e}"
-                );
+                    let got = centered_conv1d_fused_with(&x, &w_tap, Some(&b), k, dil, pad, kern)?;
+                    assert_eq!(want.dims(), got.dims());
+                    let (abs, rel) = crate::abs_and_rel(&want, &got)?;
+                    // Looser than the biasless bound below on purpose: the bias seeds the
+                    // accumulator here rather than being added to a finished sum.
+                    assert!(
+                        rel < 1e-5,
+                        "{kern} {cin}->{cout} @ {len} k={k} d={dil}: abs {abs:.3e} rel {rel:.3e}"
+                    );
                 }
 
                 let want = crate::centered_conv1d_gemm(&x, &w_tap, None, k, dil, pad)?;
                 let got = centered_conv1d_fused(&x, &w_tap, None, k, dil, pad)?;
                 let (abs, rel) = crate::abs_and_rel(&want, &got)?;
-                assert!(rel < 1e-5, "biasless {k}/{dil}: abs {abs:.3e} rel {rel:.3e}");
+                assert!(
+                    rel < 1e-5,
+                    "biasless {k}/{dil}: abs {abs:.3e} rel {rel:.3e}"
+                );
             }
         }
         Ok(())

@@ -21,8 +21,14 @@ impl DurationEncoder {
         let mut lstms = Vec::new();
         let mut norms = Vec::new();
         for i in 0..cfg.n_layer {
-            lstms.push(BiLstm::load(w, &format!("predictor.text_encoder.lstms.{}", i * 2))?);
-            norms.push(AdaLayerNorm::load(w, &format!("predictor.text_encoder.lstms.{}", i * 2 + 1))?);
+            lstms.push(BiLstm::load(
+                w,
+                &format!("predictor.text_encoder.lstms.{}", i * 2),
+            )?);
+            norms.push(AdaLayerNorm::load(
+                w,
+                &format!("predictor.text_encoder.lstms.{}", i * 2 + 1),
+            )?);
         }
         Ok(Self { lstms, norms })
     }
@@ -33,10 +39,16 @@ impl DurationEncoder {
     /// norm, so each layer sees the voice rather than only the first.
     pub fn forward(&self, d_en: &Tensor, s: &Tensor) -> Result<Tensor> {
         let t = d_en.dim(2)?;
-        let style = s.reshape((1, s.dim(1)?, 1))?.broadcast_as((1, s.dim(1)?, t))?.contiguous()?;
+        let style = s
+            .reshape((1, s.dim(1)?, 1))?
+            .broadcast_as((1, s.dim(1)?, t))?
+            .contiguous()?;
         let mut x = Tensor::cat(&[d_en, &style], 1)?;
         for (lstm, norm) in self.lstms.iter().zip(&self.norms) {
-            x = lstm.forward(&x.transpose(1, 2)?.contiguous()?)?.transpose(1, 2)?.contiguous()?;
+            x = lstm
+                .forward(&x.transpose(1, 2)?.contiguous()?)?
+                .transpose(1, 2)?
+                .contiguous()?;
             x = norm.apply(&x, s)?;
             x = Tensor::cat(&[&x, &style], 1)?;
         }
@@ -85,7 +97,10 @@ impl Predictor {
         let raw: Vec<f32> = (total / speed as f64)?.to_vec1()?;
         // torch.round is half-to-even. A phoneme landing on exactly x.5 is rare and the
         // difference is one frame, but a frame here shifts every later frame.
-        Ok(raw.iter().map(|v| (round_half_even(*v) as usize).max(1)).collect())
+        Ok(raw
+            .iter()
+            .map(|v| (round_half_even(*v) as usize).max(1))
+            .collect())
     }
 
     /// The `[T, frames]` matrix that stretches one column per phoneme into its duration.
@@ -99,7 +114,11 @@ impl Predictor {
             }
             at += d;
         }
-        Ok(Tensor::from_vec(data, (1, durations.len(), frames), device)?)
+        Ok(Tensor::from_vec(
+            data,
+            (1, durations.len(), frames),
+            device,
+        )?)
     }
 
     /// Pitch and energy curves, at twice the frame rate — the middle block upsamples.
@@ -114,7 +133,10 @@ impl Predictor {
         for block in &self.n {
             n = block.apply(&n, s)?;
         }
-        Ok((self.f0_proj.apply(&f0)?.squeeze(1)?, self.n_proj.apply(&n)?.squeeze(1)?))
+        Ok((
+            self.f0_proj.apply(&f0)?.squeeze(1)?,
+            self.n_proj.apply(&n)?.squeeze(1)?,
+        ))
     }
 }
 

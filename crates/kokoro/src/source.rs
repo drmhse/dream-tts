@@ -115,12 +115,19 @@ pub fn excitation(
         let frac = src - lo as f64;
         for c in 0..dim {
             let base = wrapped[c * coarse_len + lo];
-            let delta = if hi > lo { increment[c * coarse_len + hi] } else { 0.0 };
+            let delta = if hi > lo {
+                increment[c * coarse_len + hi]
+            } else {
+                0.0
+            };
             phase[c * n + i] = (base + frac * delta) as f32;
         }
     }
 
-    let uv: Vec<f32> = f0.iter().map(|v| (*v > VOICED_THRESHOLD) as u8 as f32).collect();
+    let uv: Vec<f32> = f0
+        .iter()
+        .map(|v| (*v > VOICED_THRESHOLD) as u8 as f32)
+        .collect();
     // The draw is torch-ordered `[time, channel]` while the phase is channel-major, so the
     // two are indexed differently on purpose. Reading the noise channel-major gives a
     // waveform that is statistically identical and sample-for-sample wrong.
@@ -129,8 +136,7 @@ pub fn excitation(
     for c in 0..dim {
         for i in 0..n {
             let amp = uv[i] * NOISE_STD + (1.0 - uv[i]) * SINE_AMP / 3.0;
-            sines[c * n + i] =
-                phase[c * n + i].sin() * SINE_AMP * uv[i] + amp * noise[i * dim + c];
+            sines[c * n + i] = phase[c * n + i].sin() * SINE_AMP * uv[i] + amp * noise[i * dim + c];
         }
     }
 
@@ -154,7 +160,9 @@ pub struct Stft {
 
 impl Stft {
     pub fn new(n_fft: usize, hop: usize) -> Self {
-        Self { tables: tts_nn::stft::Tables::new(n_fft, hop) }
+        Self {
+            tables: tts_nn::stft::Tables::new(n_fft, hop),
+        }
     }
 
     pub fn bins(&self) -> usize {
@@ -171,6 +179,10 @@ impl Stft {
 
     /// Overlap-add to samples. One download out; the trig stays on the device.
     pub fn inverse_stacked(&self, stacked: &Tensor, frames: usize) -> Result<Tensor> {
-        Ok(tts_nn::stft::inverse(&stacked.squeeze(0)?.contiguous()?, frames, &self.tables)?)
+        Ok(tts_nn::stft::inverse(
+            &stacked.squeeze(0)?.contiguous()?,
+            frames,
+            &self.tables,
+        )?)
     }
 }

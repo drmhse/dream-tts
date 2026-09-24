@@ -29,7 +29,13 @@ impl ReplayDraws {
     fn next(&mut self, n: usize) -> Vec<f32> {
         let v = self.values[self.at].clone();
         self.at += 1;
-        assert_eq!(v.len(), n, "draw {} has {} values, wanted {n}", self.at - 1, v.len());
+        assert_eq!(
+            v.len(),
+            n,
+            "draw {} has {} values, wanted {n}",
+            self.at - 1,
+            v.len()
+        );
         v
     }
 }
@@ -104,41 +110,62 @@ fn har_reference(fx: &Weights, generator: &kokoro::decoder::Generator) -> Result
 
 fn shape_audit(w: &Weights, cfg: &Config) -> Result<usize> {
     let mut problems = 0;
-    let mut expect = |name: &str, dims: Vec<usize>| {
-        match w.file_shape(name) {
-            Some(actual) if actual == dims => {}
-            Some(actual) => {
-                problems += 1;
-                println!("  {name:<58} {actual:?} != {dims:?}");
-            }
-            None => {
-                problems += 1;
-                println!("  {name:<58} missing");
-            }
+    let mut expect = |name: &str, dims: Vec<usize>| match w.file_shape(name) {
+        Some(actual) if actual == dims => {}
+        Some(actual) => {
+            problems += 1;
+            println!("  {name:<58} {actual:?} != {dims:?}");
+        }
+        None => {
+            problems += 1;
+            println!("  {name:<58} missing");
         }
     };
     let h = cfg.plbert.hidden_size;
-    expect("bert.embeddings.word_embeddings.weight", vec![cfg.n_token, Config::EMBEDDING_SIZE]);
-    expect("bert.encoder.embedding_hidden_mapping_in.weight", vec![h, Config::EMBEDDING_SIZE]);
+    expect(
+        "bert.embeddings.word_embeddings.weight",
+        vec![cfg.n_token, Config::EMBEDDING_SIZE],
+    );
+    expect(
+        "bert.encoder.embedding_hidden_mapping_in.weight",
+        vec![h, Config::EMBEDDING_SIZE],
+    );
     expect("bert_encoder.weight", vec![cfg.hidden_dim, h]);
-    expect("predictor.duration_proj.linear_layer.weight", vec![cfg.max_dur, cfg.hidden_dim]);
-    expect("text_encoder.embedding.weight", vec![cfg.n_token, cfg.hidden_dim]);
+    expect(
+        "predictor.duration_proj.linear_layer.weight",
+        vec![cfg.max_dur, cfg.hidden_dim],
+    );
+    expect(
+        "text_encoder.embedding.weight",
+        vec![cfg.n_token, cfg.hidden_dim],
+    );
     expect(
         "decoder.generator.conv_post.weight",
-        vec![cfg.istftnet.gen_istft_n_fft + 2, cfg.istftnet.upsample_initial_channel / 4, 7],
+        vec![
+            cfg.istftnet.gen_istft_n_fft + 2,
+            cfg.istftnet.upsample_initial_channel / 4,
+            7,
+        ],
     );
     Ok(problems)
 }
 
 fn main() -> Result<()> {
     let root = PathBuf::from(
-        std::env::args().nth(1).unwrap_or_else(|| "references/kokoro/weights".into()),
+        std::env::args()
+            .nth(1)
+            .unwrap_or_else(|| "references/kokoro/weights".into()),
     );
     let fixtures = PathBuf::from(
-        std::env::args().nth(2).unwrap_or_else(|| "fixtures/kokoro".into()),
+        std::env::args()
+            .nth(2)
+            .unwrap_or_else(|| "fixtures/kokoro".into()),
     );
     let cfg = Config::load(&root.join("config.json"))?;
-    let w = Weights::load(root.join("kokoro.safetensors").to_str().unwrap(), &Device::Cpu)?;
+    let w = Weights::load(
+        root.join("kokoro.safetensors").to_str().unwrap(),
+        &Device::Cpu,
+    )?;
 
     println!("shape audit ({} tensors)", w.len());
     let problems = shape_audit(&w, &cfg)?;
@@ -146,7 +173,10 @@ fn main() -> Result<()> {
 
     let fx_path = fixtures.join("forward.safetensors");
     if !fx_path.exists() {
-        println!("\nno activation fixtures at {} — run references/kokoro/dump_fixtures.py", fx_path.display());
+        println!(
+            "\nno activation fixtures at {} — run references/kokoro/dump_fixtures.py",
+            fx_path.display()
+        );
         std::process::exit(if problems == 0 { 0 } else { 1 });
     }
     let fx = Weights::load(fx_path.to_str().unwrap(), &Device::Cpu)
@@ -161,7 +191,10 @@ fn main() -> Result<()> {
         .collect();
 
     println!("\nstages ({} phonemes)", ids.len());
-    let mut r = Report { rows: 0, failures: 0 };
+    let mut r = Report {
+        rows: 0,
+        failures: 0,
+    };
     let device = Device::Cpu;
 
     let bert = kokoro::albert::Albert::load(&w, &cfg)?;
@@ -182,14 +215,27 @@ fn main() -> Result<()> {
     r.check("dur_enc", &d, &fx.get("dur_enc")?, 5e-4);
 
     let durations = predictor.durations(&d, 1.0)?;
-    let want_dur: Vec<usize> =
-        fx.get("pred_dur")?.to_vec1::<f32>()?.iter().map(|v| *v as usize).collect();
+    let want_dur: Vec<usize> = fx
+        .get("pred_dur")?
+        .to_vec1::<f32>()?
+        .iter()
+        .map(|v| *v as usize)
+        .collect();
     r.rows += 1;
     if durations == want_dur {
-        println!("  {:<22} ok    {} frames", "pred_dur", durations.iter().sum::<usize>());
+        println!(
+            "  {:<22} ok    {} frames",
+            "pred_dur",
+            durations.iter().sum::<usize>()
+        );
     } else {
         r.failures += 1;
-        println!("  {:<22} FAIL  {:?} != {:?}", "pred_dur", &durations[..8.min(durations.len())], &want_dur[..8.min(want_dur.len())]);
+        println!(
+            "  {:<22} FAIL  {:?} != {:?}",
+            "pred_dur",
+            &durations[..8.min(durations.len())],
+            &want_dur[..8.min(want_dur.len())]
+        );
     }
 
     let aln = kokoro::predictor::Predictor::alignment(&durations, &device)?;
@@ -206,7 +252,6 @@ fn main() -> Result<()> {
     let decoder = kokoro::decoder::Decoder::load(&w, &cfg)?;
     let draw_count = meta["draws"].as_u64().unwrap() as usize;
 
-
     // The excitation first: it is the only stochastic stage, and a mismatch here would
     // otherwise surface as a wrong waveform with every deterministic stage passing.
     // Driven by the reference's F0, not this port's: `uv = f0 > 10` is a threshold, and a
@@ -222,7 +267,9 @@ fn main() -> Result<()> {
     // measured 25.2 dB SNR here against 19.7 and 20.7 dB for two upstream re-runs, and
     // 1.54 dB log-spectral distance against 2.09 and 2.18.
     let ref_curve: Vec<f32> = fx.get("F0_proj")?.flatten_all()?.to_vec1()?;
-    let mine = decoder.generator.excitation(&ref_curve, &mut ReplayDraws::new(&fx, draw_count)?);
+    let mine = decoder
+        .generator
+        .excitation(&ref_curve, &mut ReplayDraws::new(&fx, draw_count)?);
     let want = fx.get("gen_source.0")?.flatten_all()?;
     r.check(
         "excitation",
@@ -242,28 +289,51 @@ fn main() -> Result<()> {
     let complex = |t: &Tensor| -> Result<Tensor> {
         let mag = t.narrow(1, 0, bins)?;
         let phase = t.narrow(1, bins, bins)?;
-        Ok(Tensor::cat(&[&(&mag * phase.cos()?)?, &(&mag * phase.sin()?)?], 1)?)
+        Ok(Tensor::cat(
+            &[&(&mag * phase.cos()?)?, &(&mag * phase.sin()?)?],
+            1,
+        )?)
     };
     r.check_rel("har_spectrum", &complex(&har)?, &complex(&want_har)?, 1e-2);
 
-    let audio =
-        decoder.forward(&asr, &f0, &energy, &style_dec, &mut ReplayDraws::new(&fx, draw_count)?)?;
+    let audio = decoder.forward(
+        &asr,
+        &f0,
+        &energy,
+        &style_dec,
+        &mut ReplayDraws::new(&fx, draw_count)?,
+    )?;
     let want_audio: Vec<f32> = fx.get("audio")?.to_vec1()?;
     r.rows += 1;
     if audio.len() != want_audio.len() {
         r.failures += 1;
-        println!("  {:<22} FAIL  {} samples != {}", "audio", audio.len(), want_audio.len());
+        println!(
+            "  {:<22} FAIL  {} samples != {}",
+            "audio",
+            audio.len(),
+            want_audio.len()
+        );
     } else {
         let signal: f64 = want_audio.iter().map(|v| (*v as f64).powi(2)).sum();
-        let error: f64 =
-            audio.iter().zip(&want_audio).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
+        let error: f64 = audio
+            .iter()
+            .zip(&want_audio)
+            .map(|(a, b)| ((a - b) as f64).powi(2))
+            .sum();
         let snr = 10.0 * (signal / error.max(1e-30)).log10();
         // 19.7 dB is what an upstream re-run with a different noise draw scores.
         if snr >= 24.0 {
-            println!("  {:<22} ok    SNR {snr:.1} dB  {} samples", "audio", audio.len());
+            println!(
+                "  {:<22} ok    SNR {snr:.1} dB  {} samples",
+                "audio",
+                audio.len()
+            );
         } else {
             r.failures += 1;
-            println!("  {:<22} FAIL  SNR {snr:.1} dB (upstream re-run scores 19.7)", "audio");
+            println!(
+                "  {:<22} FAIL  SNR {snr:.1} dB (upstream re-run scores 19.7)",
+                "audio"
+            );
         }
     }
 

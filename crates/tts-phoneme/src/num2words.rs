@@ -7,15 +7,38 @@
 //! wrong and impossible to hear.
 
 const ONES: [&str; 20] = [
-    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
-    "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
     "nineteen",
 ];
 const TENS: [&str; 10] = [
     "", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
 ];
 const SCALES: [&str; 7] = [
-    "", "thousand", "million", "billion", "trillion", "quadrillion", "quintillion",
+    "",
+    "thousand",
+    "million",
+    "billion",
+    "trillion",
+    "quadrillion",
+    "quintillion",
 ];
 
 fn under_100(v: u64) -> String {
@@ -78,7 +101,11 @@ pub fn cardinal(n: i64) -> String {
     // The final group joins with "and" when it is a bare tens-or-units — "one thousand and
     // one" — and with a comma once it reaches a hundred.
     let last = groups.last().unwrap();
-    let sep = if last.1 == 0 && last.0 < 100 { " and " } else { ", " };
+    let sep = if last.1 == 0 && last.0 < 100 {
+        " and "
+    } else {
+        ", "
+    };
     let head = parts[..parts.len() - 1].join(", ");
     format!("{head}{sep}{}", parts[parts.len() - 1])
 }
@@ -133,7 +160,11 @@ pub fn decimal(s: &str) -> Option<String> {
     };
     let negative = int_part.starts_with('-');
     let digits = int_part.trim_start_matches('-');
-    let whole: i64 = if digits.is_empty() { 0 } else { digits.parse().ok()? };
+    let whole: i64 = if digits.is_empty() {
+        0
+    } else {
+        digits.parse().ok()?
+    };
     let head = cardinal(if negative { -whole } else { whole });
     if frac.is_empty() {
         return Some(head);
@@ -156,14 +187,22 @@ mod tests {
         // The committed fixture samples the sweep so this runs without the venv;
         // `scripts/check-phonemes.sh` points this at the exhaustive one.
         let path = std::env::var("DREAM_TTS_NUMBERS").unwrap_or_else(|_| {
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/kokoro/numbers.json").into()
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../fixtures/kokoro/numbers.json"
+            )
+            .into()
         });
         let text = std::fs::read_to_string(&path).expect("numbers fixture");
         let records: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
         let mut checked = 0;
         for v in records {
             if let Some(s) = v.get("s").and_then(|s| s.as_str()) {
-                assert_eq!(decimal(s).unwrap(), v["dec"].as_str().unwrap(), "decimal {s}");
+                assert_eq!(
+                    decimal(s).unwrap(),
+                    v["dec"].as_str().unwrap(),
+                    "decimal {s}"
+                );
                 checked += 1;
                 continue;
             }
