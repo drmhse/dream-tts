@@ -207,6 +207,45 @@ fn numerics(report: &mut Report) -> Result<()> {
     report.tensor("talker.hidden", &hidden, &get("talker.hidden")?, 5e-3)?;
     report.tensor("talker.logits", &logits, &get("talker.logits")?, 5e-2)?;
 
+    // The batched prefill runs the voice's positions once and copies them into every lane. A
+    // second lane with other text proves the copy lands per lane and not only in lane 0.
+    let (_, _, shared) = talker.build_prompt_shared(
+        &text,
+        &ref_text,
+        &ref_codes,
+        Some(&spk),
+        cfg::talker::language_id("english"),
+    )?;
+    let other: Vec<u32> = text.iter().rev().copied().collect();
+    let (prompt2, _) = talker.build_prompt(
+        &other,
+        &ref_text,
+        &ref_codes,
+        Some(&spk),
+        cfg::talker::language_id("english"),
+    )?;
+    let pair = candle_core::Tensor::cat(&[&prompt, &prompt2], 0)?;
+    let span = pair.dim(1)? + 1;
+    let (whole, _) = talker.prefill_batch(&pair, 0, span)?;
+    let (split, _) = talker.prefill_batch(&pair, shared, span)?;
+    report.claim(
+        "prefill.shared positions",
+        shared > 1 && shared < pair.dim(1)?,
+        &format!("{shared} of {}", pair.dim(1)?),
+    );
+    report.tensor(
+        "prefill.shared lane 0",
+        &split.narrow(0, 0, 1)?,
+        &get("talker.hidden")?,
+        5e-3,
+    )?;
+    report.tensor(
+        "prefill.shared lane 1",
+        &split.narrow(0, 1, 1)?,
+        &whole.narrow(0, 1, 1)?,
+        1e-4,
+    )?;
+
     // The argmax is what actually drives generation, so it gets its own row.
     let want_code0 = get("talker.logits")?
         .flatten_all()?

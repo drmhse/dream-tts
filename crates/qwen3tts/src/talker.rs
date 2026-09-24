@@ -9,7 +9,7 @@
 //! 3. all 16 embeddings sum, plus the next text token, become the talker's next input (trap 3)
 
 use crate::cfg::{self, predictor as pk, talker as tk};
-use crate::qwen3::{Geometry, Stack};
+use crate::qwen3::{Geometry, Stack, State};
 use anyhow::{bail, Result};
 use candle_core::{DType, Device, Tensor};
 use std::time::Instant;
@@ -61,11 +61,11 @@ const CAPACITY: usize = 1536;
 /// Lanes prefilled at once, independent of how wide the batch is.
 ///
 /// Prefill attention is `b * heads * L^2`: at 48 lanes and a 156-position ICL prompt the scores
-/// alone are 748 MB, and softmax doubles it. candle's Metal pool never releases, so each distinct
-/// group width leaves that behind for the life of the process — a chapter render held 12.6 GB
-/// across 1515 GPU allocations. Windowing makes prefill one shape at an eighth the size, and it
-/// is free: one pass per group against ~150 decode steps, and the arithmetic is identical since
-/// lanes never read each other's cache.
+/// alone are 748 MB, and softmax doubles it. candle pools every op output for good, so each
+/// distinct group width leaves that behind for the life of the process — a chapter render held
+/// 12.6 GB across 1515 GPU allocations. Windowing makes prefill one shape at an eighth the size,
+/// and it is free: one pass per group against ~150 decode steps, and the arithmetic is
+/// identical since lanes never read each other's cache.
 const PREFILL_LANES: usize = 8;
 
 /// Batch widths are rounded up to a multiple of this when shedding.
@@ -172,11 +172,15 @@ fn sample_with_u(
             .unwrap_or(0);
     }
 
+    // Selecting before sorting: a full sort of 2048 was 30 us a row, run 150k times a chapter
+    // while the GPU waited. The index tie-break keeps the order total, so the pick is too.
+    let desc = |&a: &usize, &b: &usize| l[b].total_cmp(&l[a]).then(a.cmp(&b));
     let mut order: Vec<usize> = (0..l.len()).filter(|&i| l[i].is_finite()).collect();
-    order.sort_unstable_by(|&a, &b| l[b].partial_cmp(&l[a]).unwrap());
     if s.top_k > 0 && order.len() > s.top_k {
+        order.select_nth_unstable_by(s.top_k - 1, desc);
         order.truncate(s.top_k);
     }
+    order.sort_unstable_by(desc);
 
     let t = if s.temperature > 0.0 {
         s.temperature
@@ -212,6 +216,20 @@ fn sample_with_u(
         }
     }
     order[keep - 1]
+}
+
+/// Whether the depth predictor can sample on the device: the kernel has no nucleus cut and no
+/// penalty. `QWEN3TTS_HOST_SAMPLING=1` keeps the host path, for A/B.
+fn device_sampling(s: &Sampling, device: &Device) -> bool {
+    static HOST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let host = *HOST.get_or_init(|| std::env::var_os("QWEN3TTS_HOST_SAMPLING").is_some());
+    !host
+        && device.is_metal()
+        && !s.greedy
+        && s.top_p >= 1.0
+        && s.repetition_penalty == 1.0
+        && (1..=tts_nn::topk::MAX_K).contains(&s.top_k)
+        && pk::VOCAB <= tts_nn::topk::MAX_N
 }
 
 /// Per-lane frames, per-lane unconsumed trailing text, and the timing.
@@ -273,20 +291,26 @@ impl Predictor {
                 device,
             )?);
             // Raw dtype: 15 x [2048, 2048] is 503 MB as f32, and each use selects one row.
-            tables.push(w.raw(&format!(
+            tables.push(w.cpu(&format!(
                 "talker.code_predictor.model.codec_embedding.{i}.weight"
             ))?);
         }
-        let resize = Linear::load(w, "talker.code_predictor.small_to_mtp_projection", true)?;
+        let prefix = "talker.code_predictor.small_to_mtp_projection";
+        let resize = Linear::load(w, prefix, true)?;
+        // On the host, like everything else computed once at load: see `Weights::get`.
+        let host = Linear::new(
+            &w.cpu(&format!("{prefix}.weight"))?.to_dtype(DType::F32)?,
+            Some(w.cpu(&format!("{prefix}.bias"))?.to_dtype(DType::F32)?),
+        )?;
         let resized = tables
             .iter()
-            .map(|t| resize.forward(&t.to_dtype(DType::F32)?))
+            .map(|t| Ok(host.forward(&t.to_dtype(DType::F32)?)?.to_device(device)?))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             stack,
             resize,
             heads,
-            tables: Tensor::cat(&tables, 0)?.contiguous()?,
+            tables: Tensor::cat(&tables, 0)?.to_device(device)?,
             resized,
         })
     }
@@ -379,6 +403,10 @@ impl Predictor {
             .stack
             .forward(&self.resize.forward(&prefill)?, &mut state)?;
 
+        if device_sampling(sub, self.stack.device()) {
+            return self.depth_on_device(h, state, code0_embed, sub, rng, timing);
+        }
+
         let mut codes = vec![Vec::with_capacity(pk::HEADS_OUT); b];
         // Same both-ends-synchronised split as `frame`; off unless `QWEN3TTS_TIMING`.
         let split = timing_on();
@@ -431,6 +459,52 @@ impl Predictor {
         Ok((codes, sum))
     }
 
+    /// [`Self::frame_batch`]'s 15 depth steps with the sampling on the device: one read per
+    /// frame instead of fifteen, each of which idled the GPU while the host sorted.
+    ///
+    /// The draws are taken up front in the host loop's order, step-major over every lane.
+    fn depth_on_device(
+        &self,
+        mut h: Tensor,
+        mut state: State,
+        code0_embed: &Tensor,
+        sub: &Sampling,
+        rng: &mut Rng,
+        timing: &mut Timing,
+    ) -> Result<(Vec<Vec<u32>>, Tensor)> {
+        let b = h.dim(0)?;
+        let device = self.stack.device();
+        let draws: Vec<f32> = (0..pk::HEADS_OUT * b).map(|_| rng.next_f32()).collect();
+        let draws = Tensor::from_vec(draws, (pk::HEADS_OUT, b), device)?;
+        let split = timing_on();
+        let mut picked = Vec::with_capacity(pk::HEADS_OUT);
+        for step in 0..pk::HEADS_OUT {
+            let last = h.narrow(1, h.dim(1)? - 1, 1)?.reshape((b, pk::DIM))?;
+            let logits = self.heads[step].forward(&last)?;
+            let code =
+                tts_nn::topk::sample(&logits, &draws.get(step)?, sub.top_k, sub.temperature)?;
+            if step + 1 < pk::HEADS_OUT {
+                let t = Instant::now();
+                let projected =
+                    self.resized[step]
+                        .index_select(&code, 0)?
+                        .reshape((b, 1, pk::DIM))?;
+                h = self.stack.forward(&projected, &mut state)?;
+                if split {
+                    device.synchronize()?;
+                    timing.depth_stack_s += t.elapsed().as_secs_f64();
+                }
+            }
+            picked.push(code);
+        }
+        let t = Instant::now();
+        let codes = Tensor::stack(&picked, 1)?.to_vec2::<u32>()?;
+        timing.sample_s += t.elapsed().as_secs_f64();
+        let lanes: Vec<&Vec<u32>> = codes.iter().collect();
+        let sum = (code0_embed + self.gather_sum(&lanes, b)?)?;
+        Ok((codes, sum))
+    }
+
     /// Codebooks 1..15 embedded at talker width and summed, `[b, 1, EMBED_DIM]`.
     ///
     /// `codes[lane][step]` indexes the concatenated table at `step * CODES + code`, so the
@@ -464,11 +538,10 @@ pub struct Talker {
     stack: Stack,
     /// `[VOCAB, DIM]` — codec-side embeddings, and *not* tied to `codec_head`.
     codec_embed: Tensor,
-    /// `[TEXT_VOCAB, TEXT_DIM]`, kept in the checkpoint's dtype.
-    ///
-    /// 151936 x 2048 is 1.24 GB as f32 and 622 MB as bf16, and every use selects a handful of
-    /// rows — so it stays raw and only the selected rows are cast.
-    text_embed: Tensor,
+    /// The checkpoint's mapping, kept for `text_embedding`: `[TEXT_VOCAB, TEXT_DIM]` is 622 MB
+    /// as bf16 — a 1 GiB buffer once candle's pool rounds it — and every use reads a handful of
+    /// rows, so they are read from the file as asked.
+    weights: Weights,
     /// `codec_head`. Quantized with the trunk — it is 25 MB as f32 and read once a frame.
     head: Proj,
     /// `linear_fc1` -> SiLU -> `linear_fc2`, both biased (trap 9).
@@ -497,21 +570,20 @@ impl Talker {
         Ok(Self {
             stack: Stack::load(&w, "talker.model.", geo, how, CAPACITY, device)?,
             codec_embed: w.get("talker.model.codec_embedding.weight")?,
-            text_embed: w.raw("talker.model.text_embedding.weight")?,
             head: Proj::load_as(&w, "talker.codec_head.weight", how, device)?,
             text_fc1: Linear::load(&w, "talker.text_projection.linear_fc1", true)?,
             text_fc2: Linear::load(&w, "talker.text_projection.linear_fc2", true)?,
             predictor: Predictor::load(&w, how, device)?,
             device: device.clone(),
+            weights: w,
         })
     }
 
     /// `text_projection`: embed text ids and project into the talker's width.
     fn text_hidden(&self, ids: &[u32]) -> Result<Tensor> {
-        let idx = Tensor::from_vec(ids.to_vec(), ids.len(), &self.device)?;
         let e = self
-            .text_embed
-            .index_select(&idx, 0)?
+            .weights
+            .rows("talker.model.text_embedding.weight", ids)?
             .to_dtype(DType::F32)?
             .reshape((1, ids.len(), tk::TEXT_DIM))?;
         let h = candle_nn::ops::silu(&self.text_fc1.forward(&e)?)?;
@@ -550,6 +622,22 @@ impl Talker {
         spk: Option<&Tensor>,
         language: Option<u32>,
     ) -> Result<(Tensor, Tensor)> {
+        let (prompt, trailing, _) =
+            self.build_prompt_shared(text, ref_text, ref_codes, spk, language)?;
+        Ok((prompt, trailing))
+    }
+
+    /// [`Self::build_prompt`], plus how many leading positions depend on the voice alone and so
+    /// are the same for every segment: the role, the codec tags and, under ICL, the reference
+    /// transcript riding on the reference frames.
+    pub fn build_prompt_shared(
+        &self,
+        text: &[u32],
+        ref_text: &[u32],
+        ref_codes: &[Vec<u32>],
+        spk: Option<&Tensor>,
+        language: Option<u32>,
+    ) -> Result<(Tensor, Tensor, usize)> {
         let pad = self.text_hidden(&[tk::TTS_PAD])?;
         let bos = self.text_hidden(&[tk::TTS_BOS])?;
         let eos = self.text_hidden(&[tk::TTS_EOS])?;
@@ -585,6 +673,7 @@ impl Talker {
         let prefix = (text_side + codec.narrow(1, 0, l - 1)?)?;
 
         let role = self.text_hidden(&[tk::IM_START, tk::ASSISTANT, 198])?;
+        let mut shared = role.dim(1)? + prefix.dim(1)?;
         let mut parts = vec![role, prefix];
 
         let trailing;
@@ -604,6 +693,7 @@ impl Talker {
 
             let text_len = text_embed.dim(1)?;
             let codec_len = codec_embed.dim(1)?;
+            shared += ref_text.len().min(codec_len);
             if text_len > codec_len {
                 parts.push((text_embed.narrow(1, 0, codec_len)? + &codec_embed)?);
                 trailing = text_embed.narrow(1, codec_len, text_len - codec_len)?;
@@ -628,7 +718,7 @@ impl Talker {
                 eos.clone()
             };
         }
-        Ok((Tensor::cat(&parts, 1)?.contiguous()?, trailing))
+        Ok((Tensor::cat(&parts, 1)?.contiguous()?, trailing, shared))
     }
 
     /// Decode one segment. Returns `[frames][16]` codes and how many trailing text
@@ -743,6 +833,7 @@ impl Talker {
     /// than the wasted steps for the segment lengths this sees.
     ///
     /// Returns per-lane frames and per-lane unconsumed trailing positions.
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_batch(
         &self,
         prompt: &Tensor,
@@ -751,6 +842,7 @@ impl Talker {
         s: &Sampling,
         rng: &mut Rng,
         budgets: &[usize],
+        shared: usize,
     ) -> Result<BatchOutput> {
         let b = prompt.dim(0)?;
         if budgets.len() != b {
@@ -763,26 +855,10 @@ impl Talker {
         // 1536 would be 2.8 GB for eight lanes, which on a 16 GB machine is the difference
         // between batching and swapping.
         let need = prompt.dim(1)? + max_new + 1;
-        let mut state = self.stack.new_state_with(b, need)?;
         let mut timing = Timing::default();
         let clock = timing_on();
         let t_pre = Instant::now();
-        // Prefill in windows of `PREFILL_LANES` rather than all `b` at once, and keep only each
-        // window's last position: that is all the decode loop reads, and the full `[b, L, DIM]`
-        // hidden state is another buffer the pool would keep.
-        let mut lasts = Vec::with_capacity(b.div_ceil(PREFILL_LANES));
-        let mut off = 0;
-        while off < b {
-            let w = PREFILL_LANES.min(b - off);
-            let mut window = state.lane_window(off, w)?;
-            let x = prompt.narrow(0, off, w)?.contiguous()?;
-            let hw = self.stack.forward(&x, &mut window)?;
-            lasts.push(hw.narrow(1, hw.dim(1)? - 1, 1)?);
-            off += w;
-        }
-        // Every window wrote the same positions, so the parent advances once.
-        state.width = prompt.dim(1)?;
-        let mut h = Tensor::cat(&lasts, 0)?.contiguous()?;
+        let (mut h, mut state) = self.prefill_batch(prompt, shared, need)?;
         if clock {
             self.stack.device().synchronize()?;
         }
@@ -926,6 +1002,45 @@ impl Talker {
         Ok((frames, left, timing))
     }
 
+    /// Prefill `b` lanes into `state`, returning each lane's last hidden state `[b, 1, DIM]`.
+    pub fn prefill_batch(
+        &self,
+        prompt: &Tensor,
+        shared: usize,
+        capacity: usize,
+    ) -> Result<(Tensor, State)> {
+        let b = prompt.dim(0)?;
+        let mut state = self.stack.new_state_with(b, capacity)?;
+        // In windows of `PREFILL_LANES` rather than all `b` at once, and keep only each
+        // window's last position: that is all the decode loop reads, and the full `[b, L, DIM]`
+        // hidden state is another buffer the pool would keep.
+        //
+        // The first `shared` positions are the voice's, identical in every lane, so they are run
+        // once and copied: a third of an ICL prompt on the shipped voice.
+        let len = prompt.dim(1)?;
+        let shared = shared.min(len - 1);
+        if shared > 1 {
+            let mut one = self.stack.new_state_with(1, shared)?;
+            let head = prompt.narrow(0, 0, 1)?.narrow(1, 0, shared)?.contiguous()?;
+            self.stack.forward(&head, &mut one)?;
+            state.fill_prefix(&one)?;
+        }
+        let rest = prompt.narrow(1, state.width, len - state.width)?;
+        let mut lasts = Vec::with_capacity(b.div_ceil(PREFILL_LANES));
+        let mut off = 0;
+        while off < b {
+            let w = PREFILL_LANES.min(b - off);
+            let mut window = state.lane_window(off, w)?;
+            let x = rest.narrow(0, off, w)?.contiguous()?;
+            let hw = self.stack.forward(&x, &mut window)?;
+            lasts.push(hw.narrow(1, hw.dim(1)? - 1, 1)?);
+            off += w;
+        }
+        // Every window wrote the same positions, so the parent advances once.
+        state.width = len;
+        Ok((Tensor::cat(&lasts, 0)?.contiguous()?, state))
+    }
+
     pub fn device(&self) -> &Device {
         &self.device
     }
@@ -981,5 +1096,51 @@ impl Talker {
             bail!("x-vector is {n}-wide, expected {} — 0.6B asset?", tk::DIM);
         }
         Ok(t.reshape((1, tk::DIM))?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pre-selection form: full sort, then truncate.
+    fn sample_by_full_sort(logits: &[f32], s: &Sampling, u_draw: f32) -> usize {
+        let mut order: Vec<usize> = (0..logits.len()).collect();
+        order.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+        order.truncate(s.top_k);
+        let t = s.temperature;
+        let max = logits[order[0]];
+        let probs: Vec<f32> = order
+            .iter()
+            .map(|&i| ((logits[i] - max) / t).exp())
+            .collect();
+        let total: f32 = probs.iter().sum();
+        let mut u = u_draw * probs.iter().map(|p| p / total).sum::<f32>();
+        for (i, p) in probs.iter().enumerate() {
+            u -= p / total;
+            if u <= 0.0 {
+                return order[i];
+            }
+        }
+        order[order.len() - 1]
+    }
+
+    #[test]
+    fn selecting_top_k_picks_what_a_full_sort_picks() {
+        let s = Sampling::subtalker(false);
+        let mut rng = Rng::new(7);
+        for _ in 0..400 {
+            // Distinct values, so the old sort's unspecified tie order cannot matter.
+            let logits: Vec<f32> = (0..pk::VOCAB)
+                .map(|i| rng.next_f32() * 12.0 - 6.0 + i as f32 * 1e-6)
+                .collect();
+            for _ in 0..8 {
+                let u = rng.next_f32();
+                assert_eq!(
+                    sample_with_u(&logits, &[], &|_| false, &s, u),
+                    sample_by_full_sort(&logits, &s, u)
+                );
+            }
+        }
     }
 }

@@ -30,6 +30,17 @@ use tts_nn::Weight;
 
 pub const ID: &str = "qwen3tts";
 
+/// Footprint and Metal allocation, for `QWEN3TTS_TIMING`. They differ by the mapped
+/// checkpoint, which Metal counts and the footprint does not.
+fn mem_line(when: &str, device: &Device) {
+    let gb = |b: Option<u64>| b.map_or("?".into(), |b| format!("{:.2} GB", b as f64 / 1e9));
+    eprintln!(
+        "engine {ID}: {when}: footprint {}, Metal allocated {}",
+        gb(tts_core::system::footprint()),
+        gb(tts_nn::allocated_bytes(device)),
+    );
+}
+
 /// Below this many characters a segment's frames-per-character ratio is too noisy to judge.
 const SEGMENT_MIN_CHARS: usize = 40;
 /// Frames per character above this multiple of the request's median means the talker kept
@@ -57,7 +68,7 @@ const SEGMENT_MIN_VARIETY: f64 = 0.35;
 const QUANT: &[&str] = &["f16", "q8_0", "f32", "q5_0", "q4_1", "q4_0"];
 
 /// What this engine needs before it starts swapping, from `/usr/bin/time -l` peak footprint:
-/// 12.3 GB for one short passage and 13.3 GB for a 203-segment article at 48 lanes.
+/// 6.7 GB for one short passage and 9.2 GB for a chapter at 48 lanes, plus what else is running.
 const WANTS_MEMORY: u64 = 16 << 30;
 
 /// One segment's decoded frames, with the paragraph index and character count it came from.
@@ -322,21 +333,27 @@ impl Qwen3TtsEngine {
         if let Some(total) = tts_core::system::total_memory() {
             if total < WANTS_MEMORY {
                 eprintln!(
-                    "note: engine `{ID}` peaks at 12.3-13.3 GB and this machine has {}. It will \
-                     swap, which reads as the model being slow rather than as a mistake. \
-                     `--engine cosyvoice` peaks at 5.0 GB (RTF 0.716 against this engine's 0.397 \
-                     on the same short passage); `--engine audio8` at 9.7 GB. Lowering \
-                     QWEN3TTS_MAX_BATCH below {} trades speed for footprint but cannot go under \
-                     the codec's own ~12 GB.",
+                    "note: engine `{ID}` peaks at 6.7 GB on a short passage and 9.2 GB on a \
+                     chapter, and this machine has {}. It will swap, which reads as the model being \
+                     slow rather than as a mistake. `--engine kokoro` peaks at 1.3 GB, without \
+                     cloning. Lowering QWEN3TTS_MAX_BATCH below {} saves about 77 MB a lane.",
                     tts_core::system::human_bytes(total),
                     max_batch(),
                 );
             }
         }
 
+        let talker = Talker::load(&s(&paths.talker)?, quant, &device)?;
+        if std::env::var_os("QWEN3TTS_TIMING").is_some() {
+            mem_line("talker loaded", &device);
+        }
+        let codec = Codec::load(&s(&paths.codec)?, &device)?;
+        if std::env::var_os("QWEN3TTS_TIMING").is_some() {
+            mem_line("codec loaded", &device);
+        }
         Ok(Self {
-            talker: Talker::load(&s(&paths.talker)?, quant, &device)?,
-            codec: Codec::load(&s(&paths.codec)?, &device)?,
+            talker,
+            codec,
             tokenizer,
             device,
             language,
@@ -427,6 +444,9 @@ impl Engine for Qwen3TtsEngine {
         let mut rng = Rng::new(request.sampling.seed);
         let mut stats = Stats::default();
         let t0 = Instant::now();
+        if std::env::var_os("QWEN3TTS_TIMING").is_some() {
+            mem_line("before synthesis", &self.device);
+        }
 
         // Stage 1: the talker, batching every segment whose prompt is the same length.
         //
@@ -440,14 +460,20 @@ impl Engine for Qwen3TtsEngine {
         // Grouping by length is what makes this cheap. See `Talker::generate_batch`.
         let budget = request.max_new_tokens.clamp(1, cfg::talker::MAX_NEW_TOKENS);
         let mut prepared: Vec<(usize, usize, Tensor, Tensor)> = Vec::new();
+        let mut shared = usize::MAX;
         for (pi, seg) in &flat {
             let ids = self.tokenize(seg)?;
             if ids.is_empty() {
                 continue;
             }
-            let (prompt, trailing) =
-                self.talker
-                    .build_prompt(&ids, &ref_text, &ref_codes, Some(&spk), self.language)?;
+            let (prompt, trailing, common) = self.talker.build_prompt_shared(
+                &ids,
+                &ref_text,
+                &ref_codes,
+                Some(&spk),
+                self.language,
+            )?;
+            shared = shared.min(common);
             prepared.push((*pi, seg.chars().count(), prompt, trailing));
         }
 
@@ -516,20 +542,28 @@ impl Engine for Qwen3TtsEngine {
                         None => cap,
                     })
                     .collect();
-                let (frames, left, timing) = self
-                    .talker
-                    .generate_batch(&prompt, &trailing, cap, &sampling, &mut rng, &budgets)?;
+                let (frames, left, timing) = self.talker.generate_batch(
+                    &prompt, &trailing, cap, &sampling, &mut rng, &budgets, shared,
+                )?;
                 if std::env::var_os("QWEN3TTS_TIMING").is_some() {
                     eprintln!(
                         "engine {ID}: batch {} — {} steps, {} lane-steps ({} without shedding), \
-                         {} frames, {:.0}% of lane-steps useful",
+                         {} frames, {:.0}% of lane-steps useful; prefill {:.2}s, talker {:.2}s, \
+                         predictor {:.2}s (stack {:.2}s, heads {:.2}s, read {:.2}s)",
                         group.len(),
                         timing.steps,
                         timing.lane_steps,
                         timing.steps * timing.lanes,
                         timing.frames,
                         timing.frames as f64 / timing.lane_steps.max(1) as f64 * 100.0,
+                        timing.prefill_s,
+                        timing.talker_s,
+                        timing.predictor_s,
+                        timing.depth_stack_s,
+                        timing.depth_gemm_s,
+                        timing.depth_read_s,
                     );
+                    mem_line("after the group", &self.device);
                 }
                 // A lane that filled the cap may have been cut off mid-sentence. Redo the group
                 // one segment at a time with the real budget rather than ship truncated audio.
@@ -633,6 +667,9 @@ impl Engine for Qwen3TtsEngine {
         let joined = self.codec.decode(&all_frames)?;
         self.device.synchronize()?;
         stats.add("codec", t.elapsed().as_secs_f64());
+        if std::env::var_os("QWEN3TTS_TIMING").is_some() {
+            mem_line("after the codec", &self.device);
+        }
         // One call for the whole utterance, so there is nothing to count through.
         request.advanced("codec", spans.len(), spans.len());
 

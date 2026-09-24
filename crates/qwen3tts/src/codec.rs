@@ -72,6 +72,15 @@ impl SnakeBeta {
     }
 }
 
+/// MPSGraph where it measures faster, `nlc`'s fused kernel elsewhere; bit-identical in f32.
+fn causal_conv(x: &Tensor, w: &Tensor, b: &Tensor, dilation: usize) -> Result<Tensor> {
+    if tts_nn::mpsnlc::eligible(x, w) {
+        tts_nn::mpsnlc::causal_conv1d(x, w, b, dilation)
+    } else {
+        nlc::causal_conv1d(x, w, Some(b), dilation)
+    }
+}
+
 /// A causal conv with its own weight and bias. Stride is always 1 here; the reference's
 /// extra-padding arithmetic collapses to a left pad of `(k-1)*dilation` at stride 1.
 ///
@@ -92,13 +101,19 @@ impl Conv {
     /// GEMM needs no cast. See [`Codec::forward`] for why the waveform stack is f16.
     fn load_as(w: &Weights, prefix: &str, dilation: usize, dt: DType) -> Result<Self> {
         Ok(Self {
-            w: nlc::tap_weight(&w.get(&format!("{prefix}.conv.weight"))?)?.to_dtype(dt)?,
+            // Rearranged on the host so only the result is uploaded; see `Weights::get`.
+            w: nlc::tap_weight(
+                &w.cpu(&format!("{prefix}.conv.weight"))?
+                    .to_dtype(DType::F32)?,
+            )?
+            .to_dtype(dt)?
+            .to_device(w.device())?,
             b: w.get(&format!("{prefix}.conv.bias"))?.to_dtype(dt)?,
             dilation,
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        nlc::causal_conv1d(x, &self.w, Some(&self.b), self.dilation)
+        causal_conv(x, &self.w, &self.b, self.dilation)
     }
 }
 
@@ -120,8 +135,12 @@ impl TransConv {
     }
 
     fn load_as(w: &Weights, prefix: &str, stride: usize, dt: DType) -> Result<Self> {
-        let tapped = nlc::transpose_tap_weight(&w.get(&format!("{prefix}.conv.weight"))?, stride)?
-            .to_dtype(dt)?;
+        let raw = w
+            .cpu(&format!("{prefix}.conv.weight"))?
+            .to_dtype(DType::F32)?;
+        let tapped = nlc::transpose_tap_weight(&raw, stride)?
+            .to_dtype(dt)?
+            .to_device(w.device())?;
         Ok(Self {
             w: tapped,
             b: nlc::transpose_bias(&w.get(&format!("{prefix}.conv.bias"))?, stride)?
@@ -133,7 +152,7 @@ impl TransConv {
     /// interleaved on the channel axis, which is the layout the reshape wants — no copy.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (b, len, _) = x.dims3()?;
-        let y = nlc::causal_conv1d(x, &self.w, Some(&self.b), 1)?;
+        let y = causal_conv(x, &self.w, &self.b, 1)?;
         let wide = y.dim(2)?;
         Ok(y.reshape((b, len * self.stride, wide / self.stride))?)
     }
@@ -195,7 +214,17 @@ impl ResidualUnit {
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let h = self.conv1.forward(&self.act1.forward(x)?)?;
-        let h = self.conv2.forward(&self.act2.forward(&h)?)?;
+        let (c, a) = (&self.conv2, &self.act2);
+        // The kernel reloads its input once per 32 output channels, so the fused sin runs
+        // `cout / 32` times per element: a 9.5% win on the residual units up to 384 channels,
+        // nothing at 768.
+        if h.dim(2)? <= 384 {
+            let snake = (&a.alpha, &a.beta_recip);
+            if let Some(y) = nlc::snake_conv_residual(&h, &c.w, &c.b, c.dilation, snake, x)? {
+                return Ok(y);
+            }
+        }
+        let h = c.forward(&a.forward(&h)?)?;
         Ok((x + h)?)
     }
 }

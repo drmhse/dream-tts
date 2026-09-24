@@ -51,6 +51,8 @@ struct Layer {
     /// `[head_dim]` each, applied per-head before RoPE.
     q_norm: Option<Tensor>,
     k_norm: Option<Tensor>,
+    /// `[q_norm; k_norm]`, for `tts_nn::qkrope`.
+    qk_norms: Option<Tensor>,
     attn_scale: Option<Tensor>,
     mlp_scale: Option<Tensor>,
 }
@@ -64,15 +66,34 @@ impl Layer {
         device: &Device,
     ) -> Result<Self> {
         let a = format!("{prefix}.self_attn");
+        // On the host: a device-side cat would leave its three inputs pooled for good.
         let wqkv = Tensor::cat(
             &[
-                w.get(&format!("{a}.q_proj.weight"))?,
-                w.get(&format!("{a}.k_proj.weight"))?,
-                w.get(&format!("{a}.v_proj.weight"))?,
+                w.cpu(&format!("{a}.q_proj.weight"))?,
+                w.cpu(&format!("{a}.k_proj.weight"))?,
+                w.cpu(&format!("{a}.v_proj.weight"))?,
             ],
             0,
-        )?
-        .contiguous()?;
+        )?;
+        // `1/sqrt(head_dim)` folded in. QK-norm rescales q to unit RMS and then multiplies by
+        // this weight, and RoPE is a rotation, so scaling the weight is exactly scaling the
+        // scores — one fewer dispatch per layer per step. Layers without QK-norm scale
+        // explicitly.
+        let q_norm = if geo.qk_norm {
+            let s = (geo.head_dim as f64).sqrt().recip();
+            Some((w.get(&format!("{a}.q_norm.weight"))? * s)?)
+        } else {
+            None
+        };
+        let k_norm = if geo.qk_norm {
+            Some(w.get(&format!("{a}.k_norm.weight"))?)
+        } else {
+            None
+        };
+        let qk_norms = match (&q_norm, &k_norm) {
+            (Some(q), Some(k)) => Some(Tensor::stack(&[q, k], 0)?.contiguous()?),
+            _ => None,
+        };
         Ok(Self {
             attn_norm: w.get(&format!("{prefix}.input_layernorm.weight"))?,
             ffn_norm: w.get(&format!("{prefix}.post_attention_layernorm.weight"))?,
@@ -81,21 +102,9 @@ impl Layer {
             gate: Proj::load_as(w, &format!("{prefix}.mlp.gate_proj.weight"), how, device)?,
             up: Proj::load_as(w, &format!("{prefix}.mlp.up_proj.weight"), how, device)?,
             down: Proj::load_as(w, &format!("{prefix}.mlp.down_proj.weight"), how, device)?,
-            // `1/sqrt(head_dim)` folded in. QK-norm rescales q to unit RMS and then multiplies
-            // by this weight, and RoPE is a rotation, so scaling the weight is exactly scaling
-            // the scores — one fewer dispatch per layer per step, which is what a batch-1
-            // decode is actually short of. Layers without QK-norm still scale explicitly.
-            q_norm: if geo.qk_norm {
-                let s = (geo.head_dim as f64).sqrt().recip();
-                Some((w.get(&format!("{a}.q_norm.weight"))? * s)?)
-            } else {
-                None
-            },
-            k_norm: if geo.qk_norm {
-                Some(w.get(&format!("{a}.k_norm.weight"))?)
-            } else {
-                None
-            },
+            q_norm,
+            k_norm,
+            qk_norms,
             attn_scale: if geo.layer_scale {
                 Some(w.get(&format!("{prefix}.self_attn_layer_scale.scale"))?)
             } else {
@@ -164,6 +173,26 @@ impl State {
             batch: width,
             capacity: self.capacity,
         })
+    }
+
+    /// Copy a one-lane state's positions into every lane, and advance to its width.
+    pub fn fill_prefix(&mut self, from: &State) -> Result<()> {
+        if from.batch != 1 || from.width > self.capacity || from.caches.len() != self.caches.len() {
+            bail!("cannot fill a {}-lane state from this prefix", self.batch);
+        }
+        let n = from.width;
+        for (dst, src) in self.caches.iter_mut().zip(&from.caches) {
+            for (d, s) in [(&mut dst.k, &src.k), (&mut dst.v, &src.v)] {
+                let (_, h, _, hd) = s.dims4()?;
+                let s = s
+                    .narrow(2, 0, n)?
+                    .broadcast_as((self.batch, h, n, hd))?
+                    .contiguous()?;
+                d.slice_set(&s, 2, 0)?;
+            }
+        }
+        self.width = n;
+        Ok(())
     }
 
     pub fn narrow_to(&mut self, live: usize) -> Result<()> {
@@ -296,51 +325,76 @@ impl Stack {
             }
         };
         let mut h = x.clone();
+        // Prefill's mask, tiled over the query heads that share a kv head (see the prefill
+        // branch). Built once: per layer it was 28 host builds and uploads.
+        let mask = if t > 1 {
+            let block = tts_nn::causal_window_mask(start + t, g.window, &self.device)?
+                .narrow(0, start, t)?;
+            Some(Tensor::cat(&vec![&block; g.gqa()], 0)?)
+        } else {
+            None
+        };
 
         for (li, layer) in self.layers.iter().enumerate() {
             let normed = rms_norm(&h, &layer.attn_norm, g.eps)?;
             let qkv = layer.wqkv.forward(&normed)?;
-            let q = qkv.narrow(candle_core::D::Minus1, 0, g.q_width())?;
-            let kk = qkv.narrow(candle_core::D::Minus1, g.q_width(), g.kv_width())?;
-            let v = qkv.narrow(
-                candle_core::D::Minus1,
-                g.q_width() + g.kv_width(),
-                g.kv_width(),
-            )?;
-
-            // QK-norm is over the head dim, so it must happen on the [.., heads, head_dim]
-            // view and before the transpose — normalising the flat projection is a
-            // different, still-running model.
-            let q = q.reshape((b, t, g.heads, g.head_dim))?;
-            let kk = kk.reshape((b, t, g.n_kv, g.head_dim))?;
-            let q = match &layer.q_norm {
-                Some(n) => rms_norm(&q, n, g.eps)?,
-                None => q,
-            };
-            let kk = match &layer.k_norm {
-                Some(n) => rms_norm(&kk, n, g.eps)?,
-                None => kk,
-            };
-            let q = heads_first(&q, g.heads)?;
-            let kk = heads_first(&kk, g.n_kv)?;
-            let v = heads_first(&v.reshape((b, t, g.n_kv, g.head_dim))?, g.n_kv)?;
-
-            let cos = self.cos.narrow(0, start, t)?;
-            let sin = self.sin.narrow(0, start, t)?;
-            let q = candle_nn::rotary_emb::rope(&q, &cos, &sin)?;
-            let kk = candle_nn::rotary_emb::rope(&kk, &cos, &sin)?;
-
+            // `fresh` is the new positions' k and v at f32, which only prefill reads back.
             let cache = &mut state.caches[li];
-            // In place. `slice_assign` reallocates the whole cache per token and cost 2.0x
-            // on CosyVoice's LLM stage.
-            cache.k.slice_set(&kk.to_dtype(self.kv)?, 2, start)?;
-            cache.v.slice_set(&v.to_dtype(self.kv)?, 2, start)?;
+            let (q, fresh) = match &layer.qk_norms {
+                Some(norms) if tts_nn::qkrope::eligible(&qkv, &cache.k, g.head_dim) => {
+                    tts_nn::qkrope::apply(
+                        &qkv,
+                        norms,
+                        &self.cos,
+                        &self.sin,
+                        &cache.k,
+                        &cache.v,
+                        g.heads,
+                        start,
+                        g.eps,
+                        t > 1,
+                    )?
+                }
+                _ => {
+                    let q = qkv.narrow(candle_core::D::Minus1, 0, g.q_width())?;
+                    let kk = qkv.narrow(candle_core::D::Minus1, g.q_width(), g.kv_width())?;
+                    let v = qkv.narrow(
+                        candle_core::D::Minus1,
+                        g.q_width() + g.kv_width(),
+                        g.kv_width(),
+                    )?;
+
+                    // QK-norm is over the head dim, so it must happen on the [.., heads,
+                    // head_dim] view and before the transpose — normalising the flat
+                    // projection is a different, still-running model.
+                    let q = q.reshape((b, t, g.heads, g.head_dim))?;
+                    let kk = kk.reshape((b, t, g.n_kv, g.head_dim))?;
+                    let q = match &layer.q_norm {
+                        Some(n) => rms_norm(&q, n, g.eps)?,
+                        None => q,
+                    };
+                    let kk = match &layer.k_norm {
+                        Some(n) => rms_norm(&kk, n, g.eps)?,
+                        None => kk,
+                    };
+                    let q = heads_first(&q, g.heads)?;
+                    let kk = heads_first(&kk, g.n_kv)?;
+                    let v = heads_first(&v.reshape((b, t, g.n_kv, g.head_dim))?, g.n_kv)?;
+
+                    let cos = self.cos.narrow(0, start, t)?;
+                    let sin = self.sin.narrow(0, start, t)?;
+                    let q = candle_nn::rotary_emb::rope(&q, &cos, &sin)?;
+                    let kk = candle_nn::rotary_emb::rope(&kk, &cos, &sin)?;
+
+                    // In place. `slice_assign` reallocates the whole cache per token and cost
+                    // 2.0x on CosyVoice's LLM stage.
+                    cache.k.slice_set(&kk.to_dtype(self.kv)?, 2, start)?;
+                    cache.v.slice_set(&v.to_dtype(self.kv)?, 2, start)?;
+                    (q, Some((kk, v)))
+                }
+            };
 
             let span = start + t;
-            // Only the prefill branch uses these, and it goes through candle's matmul, so it
-            // wants f32. One cast per segment, not per step.
-            let k_all = cache.k.narrow(2, 0, span)?;
-            let v_all = cache.v.narrow(2, 0, span)?;
 
             let attn =
                 if t == 1 {
@@ -359,26 +413,34 @@ impl Stack {
                     tts_nn::attn::decode_attention(&qg, &cache.k, &cache.v, span, wstart)?
                         .reshape((b, 1, g.q_width()))?
                 } else {
-                    // Prefill goes through candle's matmul, which needs matching dtypes. One
-                    // cast per segment, not per step.
-                    let k_rep = self.repeat_kv(&k_all.to_dtype(DType::F32)?)?;
-                    let v_rep = self.repeat_kv(&v_all.to_dtype(DType::F32)?)?;
-                    let scores = q.matmul(&k_rep.transpose(2, 3)?.contiguous()?)?;
+                    // The new positions attend over their own f32 k/v, not the cache's copy, and
+                    // only an earlier prefix is read back. Query heads sharing a kv head are
+                    // stacked along rows, `[b, n_kv, gqa * t, hd]`, a free reshape where
+                    // `repeat_kv` copied k and v per layer; these two cost 535 ms of an 8-lane
+                    // window's 1.87 s.
+                    let (kk, v) = fresh.expect("prefill k and v");
+                    let (k_all, v_all) = if start == 0 {
+                        (kk, v)
+                    } else {
+                        let prior = |c: &Tensor| c.narrow(2, 0, start)?.to_dtype(DType::F32);
+                        (
+                            Tensor::cat(&[&prior(&cache.k)?, &kk], 2)?,
+                            Tensor::cat(&[&prior(&cache.v)?, &v], 2)?,
+                        )
+                    };
+                    let qg = q.reshape((b, g.n_kv, g.gqa() * t, g.head_dim))?;
+                    let scores = qg.matmul(&k_all.contiguous()?.t()?)?;
                     let scores = match scale {
                         Some(s) => (scores * s)?,
                         None => scores,
                     };
-                    // Rows are positions `start..start+t`, columns `0..span`, so the mask is the
-                    // bottom-right block of a `[span, span]` causal-window mask.
-                    let full = tts_nn::causal_window_mask(span, g.window, &self.device)?;
-                    let block = full.narrow(0, start, t)?;
-                    let scores = scores.broadcast_add(&block)?;
+                    let scores = scores.broadcast_add(mask.as_ref().expect("prefill mask"))?;
                     let probs = candle_nn::ops::softmax_last_dim(&scores)?;
                     probs
-                        .matmul(&v_rep.contiguous()?)?
+                        .matmul(&v_all.contiguous()?)?
+                        .reshape((b, g.heads, t, g.head_dim))?
                         .transpose(1, 2)?
                         .reshape((b, t, g.q_width()))?
-                        .contiguous()?
                 };
 
             let attn = layer.wo.forward(&attn)?;
@@ -402,17 +464,5 @@ impl Stack {
         }
         state.width = start + t;
         rms_norm(&h, &self.norm, g.eps)
-    }
-
-    fn repeat_kv(&self, x: &Tensor) -> Result<Tensor> {
-        let g = &self.geo;
-        if g.gqa() == 1 {
-            return Ok(x.contiguous()?);
-        }
-        let (b, n_kv, span, hd) = x.dims4()?;
-        Ok(x.unsqueeze(2)?
-            .broadcast_as((b, n_kv, g.gqa(), span, hd))?
-            .reshape((b, g.heads, span, hd))?
-            .contiguous()?)
     }
 }
