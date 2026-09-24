@@ -23,8 +23,43 @@ impl Linear {
         })
     }
 
+    /// Several projections of one input as one, joined on the host; `scale[i]` multiplies the
+    /// `i`th, weights and bias.
+    fn stacked(w: &Weights, prefixes: &[&str], scale: &[f64]) -> Result<Self> {
+        let host = |name: String| -> Result<Tensor> {
+            Ok(w.cpu(&name)?.to_dtype(candle_core::DType::F32)?)
+        };
+        let ws = prefixes
+            .iter()
+            .zip(scale)
+            .map(|(p, s)| Ok((host(format!("{p}.weight"))? * *s)?))
+            .collect::<Result<Vec<_>>>()?;
+        let bs = prefixes
+            .iter()
+            .zip(scale)
+            .map(|(p, s)| Ok((host(format!("{p}.bias"))? * *s)?))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            w: Tensor::cat(&ws, 0)?
+                .t()?
+                .contiguous()?
+                .to_device(w.device())?,
+            b: Tensor::cat(&bs, 0)?.to_device(w.device())?,
+        })
+    }
+
     fn apply(&self, x: &Tensor) -> Result<Tensor> {
         Ok(x.broadcast_matmul(&self.w)?.broadcast_add(&self.b)?)
+    }
+
+    /// The bias broadcast to `[1, t, out]` once, for a layer applied twelve times: a broadcast
+    /// add is 33 us at a sentence's length and a plain one 4.
+    fn bias_for(&self, t: usize) -> Result<Tensor> {
+        Ok(self.b.broadcast_as((1, t, self.b.dim(0)?))?.contiguous()?)
+    }
+
+    fn apply_with(&self, x: &Tensor, bias: &Tensor) -> Result<Tensor> {
+        Ok((x.broadcast_matmul(&self.w)? + bias)?)
     }
 }
 
@@ -52,9 +87,9 @@ pub struct Albert {
     token_type: Tensor,
     embed_norm: Norm,
     map_in: Linear,
-    query: Linear,
-    key: Linear,
-    value: Linear,
+    /// Query, key and value as one projection, so one bias add and one head split serve all
+    /// three: at a sentence's length those small passes cost more than the GEMMs.
+    qkv: Linear,
     dense: Linear,
     attn_norm: Norm,
     ffn: Linear,
@@ -75,9 +110,20 @@ impl Albert {
             token_type: w.get("bert.embeddings.token_type_embeddings.weight")?,
             embed_norm: Norm::load(w, "bert.embeddings.LayerNorm")?,
             map_in: Linear::load(w, "bert.encoder.embedding_hidden_mapping_in")?,
-            query: Linear::load(w, &format!("{p}.attention.query"))?,
-            key: Linear::load(w, &format!("{p}.attention.key"))?,
-            value: Linear::load(w, &format!("{p}.attention.value"))?,
+            qkv: Linear::stacked(
+                w,
+                &[
+                    &format!("{p}.attention.query"),
+                    &format!("{p}.attention.key"),
+                    &format!("{p}.attention.value"),
+                ],
+                // 1/sqrt(head_dim) folded into the queries: a power of two, so exact.
+                &[
+                    1.0 / ((hidden / cfg.plbert.num_attention_heads) as f64).sqrt(),
+                    1.0,
+                    1.0,
+                ],
+            )?,
             dense: Linear::load(w, &format!("{p}.attention.dense"))?,
             attn_norm: Norm::load(w, &format!("{p}.attention.LayerNorm"))?,
             ffn: Linear::load(w, &format!("{p}.ffn"))?,
@@ -102,30 +148,35 @@ impl Albert {
         x = self.embed_norm.apply(&x.unsqueeze(0)?)?;
         x = self.map_in.apply(&x)?;
 
+        let (b_qkv, b_dense, b_ffn, b_out) = (
+            self.qkv.bias_for(t)?,
+            self.dense.bias_for(t)?,
+            self.ffn.bias_for(t)?,
+            self.ffn_out.bias_for(t)?,
+        );
         for _ in 0..self.layers {
-            let q = self.split_heads(&self.query.apply(&x)?, t)?;
-            let k = self.split_heads(&self.key.apply(&x)?, t)?;
-            let v = self.split_heads(&self.value.apply(&x)?, t)?;
-            let scale = (self.head_dim as f64).sqrt();
-            let scores = ((q.matmul(&k.transpose(2, 3)?)?) / scale)?;
+            let qkv = self
+                .qkv
+                .apply_with(&x, &b_qkv)?
+                .reshape((t, 3, self.heads, self.head_dim))?
+                .permute((1, 2, 0, 3))?
+                .contiguous()?;
+            let (q, k, v) = (qkv.get(0)?, qkv.get(1)?, qkv.get(2)?);
+            let scores = q.matmul(&k.t()?)?;
             let ctx = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?;
             let ctx = ctx
-                .transpose(1, 2)?
+                .transpose(0, 1)?
                 .reshape((1, t, self.heads * self.head_dim))?
                 .contiguous()?;
             // ALBERT normalises after the residual, inside the attention block.
-            let attended = self.attn_norm.apply(&(self.dense.apply(&ctx)? + &x)?)?;
-            let ffn = tts_nn::gelu_tanh(&self.ffn.apply(&attended)?)?;
+            let attended = self
+                .attn_norm
+                .apply(&(self.dense.apply_with(&ctx, &b_dense)? + &x)?)?;
+            let ffn = tts_nn::gelu_tanh(&self.ffn.apply_with(&attended, &b_ffn)?)?;
             x = self
                 .full_norm
-                .apply(&(self.ffn_out.apply(&ffn)? + &attended)?)?;
+                .apply(&(self.ffn_out.apply_with(&ffn, &b_out)? + &attended)?)?;
         }
         Ok(x)
-    }
-
-    fn split_heads(&self, x: &Tensor, t: usize) -> Result<Tensor> {
-        Ok(x.reshape((1, t, self.heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?)
     }
 }

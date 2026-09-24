@@ -1353,6 +1353,57 @@ kernel void topk_sample_f32(
         out[row] = pick;
     }
 }
+// LayerNorm over rows of `n`, two passes like the composed reference: E[x^2] - mean^2 in one
+// pass cancels on ALBERT's activations and moved kokoro's F0 past its gate. A threadgroup a row.
+kernel void layer_norm_rows_f32(
+    device const float *src [[buffer(0)]],
+    device const float *w   [[buffer(1)]],
+    device const float *b   [[buffer(2)]],
+    device float       *dst [[buffer(3)]],
+    constant uint      &n   [[buffer(4)]],
+    constant float     &eps [[buffer(5)]],
+    uint  row  [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_position_in_threadgroup]],
+    uint  ntid [[threads_per_threadgroup]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  slid [[thread_index_in_simdgroup]],
+    uint  nsg  [[simdgroups_per_threadgroup]])
+{
+    threadgroup float part[32];
+    threadgroup float total;
+    device const float *x = src + (ulong)row * n;
+    device float *y = dst + (ulong)row * n;
+
+    // Summed about the row's first value, so an offset row's mean keeps its low bits.
+    const float shift = x[0];
+    float s = 0.0f;
+    for (uint i = tid; i < n; i += ntid) { s += x[i] - shift; }
+    s = simd_sum(s);
+    if (slid == 0) { part[sgid] = s; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgid == 0) {
+        s = simd_sum(slid < nsg ? part[slid] : 0.0f);
+        if (slid == 0) { total = s; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float mean = shift + total / (float)n;
+
+    float q = 0.0f;
+    for (uint i = tid; i < n; i += ntid) { const float d = x[i] - mean; q += d * d; }
+    q = simd_sum(q);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (slid == 0) { part[sgid] = q; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgid == 0) {
+        q = simd_sum(slid < nsg ? part[slid] : 0.0f);
+        if (slid == 0) { total = q; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float sd = sqrt(total / (float)n + eps);
+
+    for (uint i = tid; i < n; i += ntid) { y[i] = (x[i] - mean) / sd * w[i] + b[i]; }
+}
+
 "#;
 
 /// Compile the library once per device and hand out cached pipelines by function name.

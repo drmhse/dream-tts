@@ -23,6 +23,8 @@ struct SnakeResBlock {
     alpha1: Vec<(Tensor, Tensor)>,
     alpha2: Vec<(Tensor, Tensor)>,
     padded: Option<Padded>,
+    /// The whole padded block as one MPSGraph, where every conv is centred and biased.
+    block: Option<tts_nn::mpsblock::BlockKey>,
 }
 
 /// The block's six AdaINs in the layout [`SnakeResBlock::apply_padded`] reads, in pair order
@@ -61,6 +63,30 @@ impl Padded {
     }
 }
 
+/// The block's fused-graph key: every conv centred, biased and `C -> C`.
+fn block_key(
+    convs1: &[Conv1d],
+    convs2: &[Conv1d],
+    device: &Device,
+) -> Option<tts_nn::mpsblock::BlockKey> {
+    use tts_nn::mpsblock::ConvShape;
+    let mut channels = None;
+    let mut shape = |conv: &Conv1d| -> Option<ConvShape> {
+        let (w, _, k, dilation) = conv.centred_parts()?;
+        let (_, cin, cout) = w.dims3().ok()?;
+        if cin != cout || *channels.get_or_insert(cin) != cin {
+            return None;
+        }
+        Some(ConvShape { k, dilation })
+    };
+    let pairs = convs1
+        .iter()
+        .zip(convs2)
+        .map(|(a, b)| Some((shape(a)?, shape(b)?)))
+        .collect::<Option<Vec<_>>>()?;
+    tts_nn::mpsblock::key(device, channels?, pairs, NORM_EPS as f32)
+}
+
 fn alpha_pair(w: &Weights, name: &str) -> Result<(Tensor, Tensor)> {
     let a = w.cpu(name)?.to_dtype(candle_core::DType::F32)?;
     let recip = a.recip()?;
@@ -83,6 +109,12 @@ impl SnakeResBlock {
             alpha1.push(alpha_pair(w, &format!("{prefix}.alpha1.{i}"))?);
             alpha2.push(alpha_pair(w, &format!("{prefix}.alpha2.{i}"))?);
         }
+        let padded = Padded::load(w, prefix, dilations.len())?;
+        let block = if padded.is_some() && std::env::var("KOKORO_NO_MPSBLOCK").is_err() {
+            block_key(&convs1, &convs2, w.device())
+        } else {
+            None
+        };
         Ok(Self {
             convs1,
             convs2,
@@ -90,11 +122,21 @@ impl SnakeResBlock {
             adain2,
             alpha1,
             alpha2,
-            padded: Padded::load(w, prefix, dilations.len())?,
+            padded,
+            block,
         })
     }
 
+    fn block_prewarm(&self, len: usize, out: &mut Vec<(tts_nn::mpsblock::BlockKey, usize)>) {
+        if let Some(key) = &self.block {
+            out.push((key.clone(), len));
+        }
+    }
+
     fn mps_specs(&self, len: usize, out: &mut Vec<tts_nn::mpsconv::Spec>) {
+        if self.block.is_some() {
+            return;
+        }
         for (c1, c2) in self.convs1.iter().zip(&self.convs2) {
             out.extend(c1.mps_spec(len, false));
             out.extend(c2.mps_spec(len, true));
@@ -111,6 +153,17 @@ impl SnakeResBlock {
             s.matmul(&p.fc_w)?
                 .broadcast_add(&p.fc_b)?
                 .reshape((2 * self.convs1.len(), 2, c))?;
+        if let Some(key) = &self.block {
+            let params = Tensor::cat(&[&gb, &p.ab], 1)?;
+            let convs: Vec<(&Tensor, &Tensor)> = self
+                .convs1
+                .iter()
+                .zip(&self.convs2)
+                .flat_map(|(a, b)| [a, b])
+                .filter_map(|conv| conv.centred_parts().map(|(w, b, _, _)| (w, b)))
+                .collect();
+            return tts_nn::mpsblock::apply(key, x, &params, &convs, valid);
+        }
         let adain = |x: &Tensor, k: usize| -> Result<Tensor> {
             Ok(tts_nn::fused::adain_snake_masked(
                 x,
@@ -349,6 +402,7 @@ impl Generator {
             return;
         }
         let mut specs = Vec::new();
+        let mut blocks = Vec::new();
         let mut at = bucket(len);
         for i in 0..self.ups.len() {
             specs.extend(self.ups[i].mps_spec(at));
@@ -357,12 +411,15 @@ impl Generator {
                 at += 1;
             }
             self.noise_res[i].mps_specs(at, &mut specs);
+            self.noise_res[i].block_prewarm(at, &mut blocks);
             for j in 0..self.kernels {
                 self.resblocks[i * self.kernels + j].mps_specs(at, &mut specs);
+                self.resblocks[i * self.kernels + j].block_prewarm(at, &mut blocks);
             }
         }
         specs.extend(self.conv_post.mps_spec(at, false));
         tts_nn::mpsconv::prewarm(device, specs);
+        tts_nn::mpsblock::prewarm(device, blocks);
     }
 
     /// [`Self::forward`] at a bucketed length.

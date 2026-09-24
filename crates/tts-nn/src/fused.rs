@@ -1213,7 +1213,7 @@ pub fn moments_valid(x: &Tensor, valid: usize) -> Result<Tensor> {
 
 /// Buffer and byte offset of a device tensor an op reads beside its input.
 #[cfg(feature = "metal")]
-fn operand(t: &Tensor) -> Result<(candle_metal_kernels::metal::Buffer, usize)> {
+pub(crate) fn operand(t: &Tensor) -> Result<(candle_metal_kernels::metal::Buffer, usize)> {
     let (s, l) = t.storage_and_layout();
     if !l.is_contiguous() {
         candle_core::bail!("operand must be contiguous");
@@ -1322,6 +1322,78 @@ pub fn adain_snake_masked(
             eps: eps as f32,
         },
     )
+}
+
+/// LayerNorm over the last axis, with its affine; see [`crate::layer_norm`].
+pub(crate) struct LayerNormRows {
+    pub weight: Tensor,
+    pub bias: Tensor,
+    pub eps: f32,
+}
+
+impl CustomOp1 for LayerNormRows {
+    fn name(&self) -> &'static str {
+        "layer_norm_rows"
+    }
+
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("layer_norm_rows: Metal only")
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s: &candle_core::MetalStorage,
+        l: &Layout,
+    ) -> Result<(candle_core::MetalStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::{DType, MetalStorage};
+        use objc2_metal::{MTLResourceUsage, MTLSize};
+
+        let n = l.shape().dims().last().copied().unwrap_or(0);
+        let count = l.shape().elem_count();
+        if n == 0 || self.weight.elem_count() != n || self.bias.elem_count() != n {
+            candle_core::bail!(
+                "layer_norm_rows: affine of {} for rows of {n}",
+                self.weight.elem_count()
+            );
+        }
+        let device = s.device();
+        let p = mtl::pipeline(device, "layer_norm_rows_f32")?;
+        let dst = device.new_buffer(count, DType::F32, "layer_norm_rows")?;
+        let (w, wo) = operand(&self.weight)?;
+        let (b, bo) = operand(&self.bias)?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("tts_nn::layer_norm_rows");
+        encoder.set_compute_pipeline_state(&p);
+        encoder.set_buffer(0, Some(s.buffer()), l.start_offset() * 4);
+        encoder.set_buffer(1, Some(&w), wo);
+        encoder.set_buffer(2, Some(&b), bo);
+        encoder.set_buffer(3, Some(dst.as_ref()), 0);
+        encoder.set_bytes(4, &(n as u32));
+        encoder.set_bytes(5, &self.eps);
+        encoder.use_resource(s.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(&w, MTLResourceUsage::Read);
+        encoder.use_resource(&b, MTLResourceUsage::Read);
+        encoder.use_resource(dst.as_ref(), MTLResourceUsage::Write);
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: count / n,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: n.next_power_of_two().clamp(32, 256),
+                height: 1,
+                depth: 1,
+            },
+        );
+        drop(encoder);
+        Ok((
+            MetalStorage::new(dst, device.clone(), count, DType::F32),
+            l.shape().clone(),
+        ))
+    }
 }
 
 /// `max(x, slope * x)` over the first `valid` samples of `[1, C, len]`, zeros after.
@@ -1772,6 +1844,65 @@ pub fn lstm_seq(
             hidden,
         },
     )
+}
+
+#[cfg(test)]
+mod layer_norm_tests {
+    use super::*;
+
+    /// Against an f64 two-pass reference, on rows whose mean dwarfs their spread, where a
+    /// one-pass variance cancels.
+    #[test]
+    fn matches_f64_on_offset_rows() -> anyhow::Result<()> {
+        #[cfg(feature = "metal")]
+        let _gpu = crate::gpu_guard();
+        let Some(d) = crate::usable_metal() else {
+            return Ok(());
+        };
+        for (rows, n) in [(60usize, 768usize), (7, 512), (3, 1090)] {
+            let x = (Tensor::randn(0f32, 0.05, (1, rows, n), &d)? + 3.0)?;
+            let w = Tensor::rand(0.5f32, 1.5, n, &d)?;
+            let b = Tensor::randn(0f32, 0.1, n, &d)?;
+            let got: Vec<f32> = crate::layer_norm(&x, &w, &b, 1e-12)?
+                .flatten_all()?
+                .to_vec1()?;
+            let (xs, ws, bs): (Vec<f32>, Vec<f32>, Vec<f32>) =
+                (x.flatten_all()?.to_vec1()?, w.to_vec1()?, b.to_vec1()?);
+            let mut worst = 0f64;
+            for r in 0..rows {
+                let row = &xs[r * n..(r + 1) * n];
+                let mean = row.iter().map(|v| *v as f64).sum::<f64>() / n as f64;
+                let var = row.iter().map(|v| (*v as f64 - mean).powi(2)).sum::<f64>() / n as f64;
+                for i in 0..n {
+                    let want =
+                        (row[i] as f64 - mean) / (var + 1e-12).sqrt() * ws[i] as f64 + bs[i] as f64;
+                    worst = worst.max((got[r * n + i] as f64 - want).abs());
+                }
+            }
+            let composed: Vec<f32> = crate::layer_norm_plain(&x, 1e-12)?
+                .broadcast_mul(&w)?
+                .broadcast_add(&b)?
+                .flatten_all()?
+                .to_vec1()?;
+            let mut worst_composed = 0f64;
+            for r in 0..rows {
+                let row = &xs[r * n..(r + 1) * n];
+                let mean = row.iter().map(|v| *v as f64).sum::<f64>() / n as f64;
+                let var = row.iter().map(|v| (*v as f64 - mean).powi(2)).sum::<f64>() / n as f64;
+                for i in 0..n {
+                    let want =
+                        (row[i] as f64 - mean) / (var + 1e-12).sqrt() * ws[i] as f64 + bs[i] as f64;
+                    worst_composed = worst_composed.max((composed[r * n + i] as f64 - want).abs());
+                }
+            }
+            // No worse than the composed passes it replaces.
+            assert!(
+                worst <= worst_composed * 1.5 + 1e-6,
+                "{rows}x{n}: {worst:.2e} vs {worst_composed:.2e}"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

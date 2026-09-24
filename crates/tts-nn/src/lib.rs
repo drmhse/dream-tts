@@ -28,6 +28,7 @@
 pub mod attn;
 pub mod fused;
 pub mod im2col;
+pub mod mpsblock;
 pub mod mpsconv;
 pub mod mpsnlc;
 pub(crate) mod mtl;
@@ -905,6 +906,18 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
 
 /// LayerNorm over the last dimension, with weight and bias.
 pub fn layer_norm(x: &Tensor, weight: &Tensor, bias: &Tensor, eps: f64) -> Result<Tensor> {
+    // One dispatch on the device, where the composed form was eight: 108 us on ALBERT's
+    // [60, 768]. candle's fused kernel was not used because its one-pass variance cancels.
+    if x.device().is_metal()
+        && x.dtype() == DType::F32
+        && std::env::var("TTS_NN_LN").as_deref() != Ok("0")
+    {
+        return Ok(x.contiguous()?.apply_op1_no_bwd(&fused::LayerNormRows {
+            weight: weight.contiguous()?,
+            bias: bias.contiguous()?,
+            eps: eps as f32,
+        })?);
+    }
     let normed = layer_norm_plain(x, eps)?;
     Ok(normed.broadcast_mul(weight)?.broadcast_add(bias)?)
 }

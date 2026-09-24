@@ -112,6 +112,14 @@ impl Conv1d {
         self.apply_residual(x, None)
     }
 
+    /// `(kio, bias, k, dilation)` for a centred, biased conv — what a fused block graph takes.
+    pub fn centred_parts(&self) -> Option<(&Tensor, &Tensor, usize, usize)> {
+        match (&self.weight, &self.b) {
+            (ConvWeight::Kio(kio), Some(b)) => Some((kio, b, self.k, self.dilation)),
+            _ => None,
+        }
+    }
+
     /// The MPSGraph conv [`Self::apply_residual`] will run at `len`, if any.
     pub fn mps_spec(&self, len: usize, residual: bool) -> Option<tts_nn::mpsconv::Spec> {
         let ConvWeight::Kio(kio) = &self.weight else {

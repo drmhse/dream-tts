@@ -19,7 +19,7 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSDictionary", "NSValue"] }
 objc2-metal = "0.3.2"
 objc2-metal-performance-shaders = { version = "0.3.2", features = ["MPSCore", "MPSCoreTypes"] }
-objc2-metal-performance-shaders-graph = { version = "0.3.2", features = ["MPSGraph", "MPSGraphCore", "MPSGraphTensor", "MPSGraphTensorData", "MPSGraphOperation", "MPSGraphConvolutionOps", "MPSGraphArithmeticOps", "MPSGraphMemoryOps", "MPSGraphDevice", "MPSGraphExecutable", "objc2-metal-performance-shaders"] }
+objc2-metal-performance-shaders-graph = { version = "0.3.2", features = ["MPSGraph", "MPSGraphCore", "MPSGraphTensor", "MPSGraphTensorData", "MPSGraphOperation", "MPSGraphConvolutionOps", "MPSGraphArithmeticOps", "MPSGraphReductionOps", "MPSGraphTensorShapeOps", "MPSGraphMemoryOps", "MPSGraphDevice", "MPSGraphExecutable", "objc2-metal-performance-shaders"] }
 
 [features]
 default = ["metal"]
