@@ -19,6 +19,10 @@ pub(crate) struct NlcConv {
     pub k: usize,
     pub dilation: usize,
     pub has_bias: bool,
+    /// SnakeBeta `(alpha, 1/beta)` applied to `x` as it loads.
+    pub snake: Option<(Tensor, Tensor)>,
+    /// `[L, cout]` added to the output.
+    pub res: Option<Tensor>,
 }
 
 impl CustomOp3 for NlcConv {
@@ -35,6 +39,9 @@ impl CustomOp3 for NlcConv {
         s3: &CpuStorage,
         l3: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
+        if self.snake.is_some() || self.res.is_some() {
+            candle_core::bail!("nlc_conv: snake and residual are Metal only");
+        }
         let (x, w, b) = match (s1, s2, s3) {
             (CpuStorage::F32(x), CpuStorage::F32(w), CpuStorage::F32(b)) => (x, w, b),
             _ => candle_core::bail!("nlc_conv: only f32"),
@@ -104,6 +111,32 @@ impl CustomOp3 for NlcConv {
         encoder.set_bytes(7, &(self.k as u32));
         encoder.set_bytes(8, &(self.dilation as u32));
         encoder.set_bytes(9, &(u32::from(self.has_bias)));
+        let buf = |t: &Tensor| -> Result<_> {
+            let (st, l) = t.storage_and_layout();
+            match &*st {
+                candle_core::Storage::Metal(m) => Ok((m.buffer().clone(), l.start_offset() * 4)),
+                _ => candle_core::bail!("nlc_conv: operand must be on the device"),
+            }
+        };
+        let snake = match &self.snake {
+            Some((a, b)) => Some((buf(a)?, buf(b)?)),
+            None => None,
+        };
+        let res = self.res.as_ref().map(buf).transpose()?;
+        // Unused operands still need a binding; the input serves.
+        let fallback = (s1.buffer().clone(), 0usize);
+        let (alpha, brecip) = snake
+            .clone()
+            .unwrap_or((fallback.clone(), fallback.clone()));
+        let r = res.clone().unwrap_or(fallback);
+        encoder.set_buffer(10, Some(&alpha.0), alpha.1);
+        encoder.set_buffer(11, Some(&brecip.0), brecip.1);
+        encoder.set_buffer(12, Some(&r.0), r.1);
+        encoder.set_bytes(13, &(u32::from(snake.is_some())));
+        encoder.set_bytes(14, &(u32::from(res.is_some())));
+        for b in [&alpha.0, &brecip.0, &r.0] {
+            encoder.use_resource(b, MTLResourceUsage::Read);
+        }
         encoder.use_resource(s1.buffer(), MTLResourceUsage::Read);
         encoder.use_resource(s2.buffer(), MTLResourceUsage::Read);
         encoder.use_resource(s3.buffer(), MTLResourceUsage::Read);

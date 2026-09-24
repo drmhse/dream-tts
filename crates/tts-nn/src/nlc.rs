@@ -35,6 +35,38 @@ pub fn tap_weight(w: &Tensor) -> Result<Tensor> {
 /// Causal conv over `[b, L, C_in]` -> `[b, L, C_out]`.
 ///
 /// `w` is `[k, in, out]` from [`tap_weight`]; `bias` is `[out]`.
+/// `res + causal_conv1d(snake(x))` in one pass, when the fused kernel takes these shapes;
+/// `None` otherwise, for the caller to compose. `snake` is SnakeBeta's `(alpha, 1/beta)`.
+pub fn snake_conv_residual(
+    x: &Tensor,
+    w: &Tensor,
+    bias: &Tensor,
+    dilation: usize,
+    snake: (&Tensor, &Tensor),
+    res: &Tensor,
+) -> Result<Option<Tensor>> {
+    let (b, len, cin) = x.dims3()?;
+    let (k, _, out) = w.dims3()?;
+    if !crate::nlcconv::eligible(b, cin, out, len, x) || res.dims() != [b, len, out] {
+        return Ok(None);
+    }
+    let op = crate::nlcconv::NlcConv {
+        len,
+        cin,
+        cout: out,
+        k,
+        dilation,
+        has_bias: true,
+        snake: Some((snake.0.contiguous()?, snake.1.contiguous()?)),
+        res: Some(res.contiguous()?),
+    };
+    Ok(Some(x.contiguous()?.apply_op3_no_bwd(
+        &w.reshape((k * cin, out))?.contiguous()?,
+        &bias.flatten_all()?.contiguous()?,
+        &op,
+    )?))
+}
+
 pub fn causal_conv1d(
     x: &Tensor,
     w: &Tensor,
@@ -56,6 +88,8 @@ pub fn causal_conv1d(
                 k,
                 dilation,
                 has_bias: true,
+                snake: None,
+                res: None,
             };
             return Ok(x.contiguous()?.apply_op3_no_bwd(
                 &w.reshape((k * cin, out))?.contiguous()?,
@@ -224,6 +258,34 @@ pub fn depthwise(x: &Tensor, w: &Tensor, bias: Option<&Tensor>) -> Result<Tensor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fused snake-conv-residual against the three ops it replaces.
+    #[test]
+    fn snake_conv_residual_matches_composed() -> anyhow::Result<()> {
+        #[cfg(feature = "metal")]
+        let _gpu = crate::gpu_guard();
+        let Some(d) = crate::usable_metal() else {
+            return Ok(());
+        };
+        for (len, c, k, dil) in [(5000usize, 96usize, 1usize, 1usize), (4100, 192, 7, 3)] {
+            let x = Tensor::randn(0f32, 1., (1, len, c), &d)?;
+            let res = Tensor::randn(0f32, 1., (1, len, c), &d)?;
+            let w = (Tensor::randn(0f32, 1., (k, c, c), &d)? * (1.0 / ((k * c) as f64).sqrt()))?;
+            let b = Tensor::randn(0f32, 0.1, c, &d)?;
+            let alpha = Tensor::rand(0.5f32, 2.0, c, &d)?;
+            let brecip = Tensor::rand(0.2f32, 1.5, c, &d)?;
+            let got = snake_conv_residual(&x, &w, &b, dil, (&alpha, &brecip), &res)?
+                .expect("fused path at these shapes");
+            let snaked = crate::fused::snake_beta_nlc(&x, &alpha, &brecip)?;
+            let want = (causal_conv1d(&snaked, &w, Some(&b), dil)? + &res)?;
+            let (abs, rel) = crate::abs_and_rel(&got, &want)?;
+            assert!(
+                rel < 1e-5,
+                "len={len} c={c} k={k}: abs {abs:.2e} rel {rel:.2e}"
+            );
+        }
+        Ok(())
+    }
     use candle_core::Device;
 
     /// Against the channel-major implementations, on every device available. These are the same

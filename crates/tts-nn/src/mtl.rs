@@ -587,6 +587,154 @@ kernel void decode_weighted_f32(
     dst[(bh * gqa + g) * hd + d] = acc;
 }
 
+// Fused decode attention, f16 cache, head_dim 128, gqa <= 2: one threadgroup per (lane, kv
+// head), so each K and V row is read once for both query heads. A simdgroup covers a row with
+// one half4 per thread — 256 coalesced bytes — and keeps an online softmax over its share of
+// positions; the simdgroups merge at the end. The two-kernel form read each row once per query
+// head, one thread per row or per output dimension, and ran at ~17 GB/s.
+constant uint FA_SG = 4;
+
+kernel void decode_attn_f16(
+    device const float *q      [[buffer(0)]],
+    device const half  *k      [[buffer(1)]],
+    device const half  *v      [[buffer(2)]],
+    device float       *dst    [[buffer(3)]],
+    constant uint      &span   [[buffer(4)]],
+    constant uint      &cap    [[buffer(5)]],
+    constant uint      &gqa    [[buffer(6)]],
+    constant uint      &wstart [[buffer(7)]],
+    uint bh   [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float part_m[FA_SG][2];
+    threadgroup float part_l[FA_SG][2];
+    threadgroup float4 part_o[FA_SG][2][32];
+
+    const device float4 *q4 = (const device float4 *)(q + bh * gqa * 128);
+    const float4 q0 = q4[lane];
+    const float4 q1 = gqa > 1 ? q4[32 + lane] : float4(0.0f);
+
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
+    float4 o0 = float4(0.0f), o1 = float4(0.0f);
+
+    const device half4 *k4 = (const device half4 *)(k + bh * cap * 128);
+    const device half4 *v4 = (const device half4 *)(v + bh * cap * 128);
+    for (uint p = wstart + sg; p < span; p += FA_SG) {
+        const float4 kr = float4(k4[p * 32 + lane]);
+        const float4 vr = float4(v4[p * 32 + lane]);
+        const float s0 = simd_sum(dot(q0, kr));
+        const float n0 = max(m0, s0);
+        const float c0 = precise::exp(m0 - n0), e0 = precise::exp(s0 - n0);
+        l0 = l0 * c0 + e0;
+        o0 = o0 * c0 + e0 * vr;
+        m0 = n0;
+        if (gqa > 1) {
+            const float s1 = simd_sum(dot(q1, kr));
+            const float n1 = max(m1, s1);
+            const float c1 = precise::exp(m1 - n1), e1 = precise::exp(s1 - n1);
+            l1 = l1 * c1 + e1;
+            o1 = o1 * c1 + e1 * vr;
+            m1 = n1;
+        }
+    }
+
+    if (lane == 0) {
+        part_m[sg][0] = m0; part_l[sg][0] = l0;
+        part_m[sg][1] = m1; part_l[sg][1] = l1;
+    }
+    part_o[sg][0][lane] = o0;
+    part_o[sg][1][lane] = o1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Simdgroup g merges query head g; an empty share has m = -inf and weighs nothing.
+    if (sg < gqa) {
+        float mx = -INFINITY;
+        for (uint i = 0; i < FA_SG; ++i) { mx = max(mx, part_m[i][sg]); }
+        float l = 0.0f;
+        float4 o = float4(0.0f);
+        for (uint i = 0; i < FA_SG; ++i) {
+            const float w = part_m[i][sg] == -INFINITY ? 0.0f : precise::exp(part_m[i][sg] - mx);
+            l += part_l[i][sg] * w;
+            o += part_o[i][sg][lane] * w;
+        }
+        ((device float4 *)(dst + (bh * gqa + sg) * 128))[lane] = o / l;
+    }
+}
+
+// QK-norm, half-split rope and the cache write in one pass, head_dim 128. One threadgroup per
+// (lane, position); a simdgroup per head, query heads first. A lane holds dims `l`, `l+32` and
+// their rope partners `l+64`, `l+96`. Eight dispatches per layer became this one.
+//
+// `qkv` is `[b, t, heads*128 + 2*n_kv*128]`; `norms` is `[2, 128]`, q's weight then k's;
+// `rope` is `[positions, 64]` cos then the same for sin at `rope + rope_len * 64`.
+kernel void qk_rope_f32(
+    device const float *qkv    [[buffer(0)]],
+    device const float *norms  [[buffer(1)]],
+    device const float *cosb   [[buffer(2)]],
+    device const float *sinb   [[buffer(3)]],
+    device float       *q_out  [[buffer(4)]],
+    device half        *kc     [[buffer(5)]],
+    device half        *vc     [[buffer(6)]],
+    device float       *kf     [[buffer(7)]],
+    device float       *vf     [[buffer(8)]],
+    constant uint      &t      [[buffer(9)]],
+    constant uint      &heads  [[buffer(10)]],
+    constant uint      &n_kv   [[buffer(11)]],
+    constant uint      &start  [[buffer(12)]],
+    constant uint      &cap    [[buffer(13)]],
+    constant uint      &has_f  [[buffer(14)]],
+    constant float     &eps    [[buffer(15)]],
+    uint row  [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint hh   [[simdgroup_index_in_threadgroup]])
+{
+    const uint bi = row / t, ti = row % t, pos = start + ti;
+    const uint width = (heads + 2 * n_kv) * 128;
+    device const float *x = qkv + row * width;
+    const bool is_q = hh < heads;
+    const uint kh = hh - heads;
+    device const float *src = x + hh * 128;
+    device const float *w = norms + (is_q ? 0 : 128);
+
+    float y[4];
+    float ss = 0.0f;
+    for (uint j = 0; j < 4; ++j) { y[j] = src[lane + 32 * j]; ss += y[j] * y[j]; }
+    const float r = rsqrt(simd_sum(ss) / 128.0f + eps);
+    for (uint j = 0; j < 4; ++j) { y[j] = y[j] * r * w[lane + 32 * j]; }
+
+    float o[4];
+    for (uint j = 0; j < 2; ++j) {
+        const float c = cosb[pos * 64 + lane + 32 * j];
+        const float s = sinb[pos * 64 + lane + 32 * j];
+        o[j] = y[j] * c - y[j + 2] * s;
+        o[j + 2] = y[j + 2] * c + y[j] * s;
+    }
+
+    if (is_q) {
+        device float *dq = q_out + ((bi * heads + hh) * t + ti) * 128;
+        for (uint j = 0; j < 4; ++j) { dq[lane + 32 * j] = o[j]; }
+        return;
+    }
+    device const float *vs = x + (heads + n_kv + kh) * 128;
+    device half *dk = kc + ((bi * n_kv + kh) * cap + pos) * 128;
+    device half *dv = vc + ((bi * n_kv + kh) * cap + pos) * 128;
+    for (uint j = 0; j < 4; ++j) {
+        const uint d = lane + 32 * j;
+        dk[d] = half(o[j]);
+        dv[d] = half(vs[d]);
+    }
+    if (has_f) {
+        device float *fk = kf + ((bi * n_kv + kh) * t + ti) * 128;
+        device float *fv = vf + ((bi * n_kv + kh) * t + ti) * 128;
+        for (uint j = 0; j < 4; ++j) {
+            const uint d = lane + 32 * j;
+            fk[d] = o[j];
+            fv[d] = vs[d];
+        }
+    }
+}
+
 // f16 cache variants: half the bytes on the hot read, accumulated in float either way.
 kernel void decode_scores_f16(
     device const float *q     [[buffer(0)]],
@@ -695,10 +843,19 @@ kernel void nlc_conv_f32(
     constant uint      &k     [[buffer(7)]],
     constant uint      &dil   [[buffer(8)]],
     constant uint      &has_b [[buffer(9)]],
+    device const float *alpha [[buffer(10)]],
+    device const float *brecip [[buffer(11)]],
+    device const float *res   [[buffer(12)]],
+    constant uint      &has_snake [[buffer(13)]],
+    constant uint      &has_res [[buffer(14)]],
     uint2 tgp [[threadgroup_position_in_grid]],
     uint  tid [[thread_index_in_threadgroup]],
     uint  sg  [[simdgroup_index_in_threadgroup]])
 {
+    // Optionally SnakeBeta on the input as it loads and a residual added on the way out, so a
+    // residual unit's second activation and its add are not passes of their own. A padded tap
+    // stays zero, since snake(0) = 0.
+    //
     // 64 positions x 32 output channels per threadgroup, on the matrix units.
     //
     // **The channel tile is the grid's fast axis.** A threadgroup re-reads its slice of `x`
@@ -748,9 +905,16 @@ kernel void nlc_conv_f32(
             const uint m = idx >> 3;
             const uint q = idx & 7;
             const int s = int(l0 + m) + shift;
-            as4[m * 10 + q] = (s >= 0 && s < int(len))
+            float4 v = (s >= 0 && s < int(len))
                 ? *(const device float4 *)(x + uint(s) * cin + ci0 + q * 4)
                 : float4(0.0f);
+            if (has_snake) {
+                const float4 a = *(const device float4 *)(alpha + ci0 + q * 4);
+                const float4 br = *(const device float4 *)(brecip + ci0 + q * 4);
+                const float4 sv = sin(a * v);
+                v = v + br * sv * sv;
+            }
+            as4[m * 10 + q] = v;
         }
         for (uint idx = tid; idx < 32 * 8; idx += 128) {
             const uint kk = idx >> 3;
@@ -793,6 +957,7 @@ kernel void nlc_conv_f32(
         if (l >= len) { continue; }
         float4 v = ((threadgroup float4 *)as_)[m * 10 + q];
         if (has_b) { v += *(const device float4 *)(bias + n0 + q * 4); }
+        if (has_res) { v += *(const device float4 *)(res + l * cout + n0 + q * 4); }
         *(device float4 *)(y + l * cout + n0 + q * 4) = v;
     }
 }
@@ -800,14 +965,14 @@ kernel void nlc_conv_f32(
 // ---- skinny GEMM ---------------------------------------------------------------
 //
 // `[m, k] x [k, n] -> [m, n]`, f16 in, f32 accumulated and out, for the shapes an
-// autoregressive decode step actually has: `m` is the lane count, 48, where candle reaches
-// 1.1-2.35 TFLOP/s against the 3.64 it manages on a 2048-cube. Six rows of the matrix units is
-// not enough work to hide anything, so the tile is sized by `n` and `k` instead and `m` is
-// carried along for the ride.
+// autoregressive decode step actually has: `m` is the lane count, at most 48, where candle
+// reaches 1.1-2.35 TFLOP/s against the 3.64 it manages on a 2048-cube.
 //
-// 64x64 per threadgroup, eight simdgroups over it, 32 deep. `k` and `n` are multiples of 32 and
-// 64 at every projection in the talker; `m` is masked, being the one dimension that shrinks as
-// lanes are shed.
+// What mattered, measured at m = 48 on an M4: splitting `k` so the narrow projections fill
+// the GPU (the predictor's down projection launched 16 threadgroups), and giving each
+// simdgroup a 48x16 strip loaded straight from device memory — no threadgroup staging, no
+// barriers. Tried and slower: double-buffered staging, a 48x128 tile, 64-deep chunks, and any
+// layout past 12 accumulators per simdgroup, which spills (0.4 TFLOP/s at 24).
 kernel void gemm_skinny_f16(
     device const half  *a   [[buffer(0)]],
     device const half  *b   [[buffer(1)]],
@@ -815,78 +980,71 @@ kernel void gemm_skinny_f16(
     constant uint      &m   [[buffer(3)]],
     constant uint      &k   [[buffer(4)]],
     constant uint      &n   [[buffer(5)]],
+    constant uint      &kper [[buffer(6)]],
     uint2 tgp [[threadgroup_position_in_grid]],
-    uint  tid [[thread_index_in_threadgroup]],
     uint  sg  [[simdgroup_index_in_threadgroup]])
 {
-    // A 48x64 tile: `m` is the lane count, and 48 is the default, so the tile is the batch.
-    //
-    // Two shapes came before it. A 64-row tile wasted a quarter of the matrix-unit work on
-    // padding and measured 0.87-0.92x against candle; making the row count a *runtime* loop
-    // bound removed the waste and the unrolling with it, at 0.55-0.80x. The tile has to be a
-    // compile-time shape that happens to fit the batch.
-    threadgroup half as_[48 * 40];
-    threadgroup half bs_[32 * 64];
-    threadgroup float out_[48 * 64];
+    // Split-K: grid row `tgp.y` reduces `[tgp.y * kper, +kper)` into its own `[m, n]` slab,
+    // summed in split order by `sum_splits_f32`. One split is the whole reduction, in place.
+    c += tgp.y * m * n;
+    const uint kbeg = tgp.y * kper;
+    const uint kend = kbeg + kper;
 
-    const uint n0 = tgp.x * 64;
-    const uint sm = (sg >> 2) * 24;
-    const uint sn = (sg & 3) * 16;
+    // 48 rows because 48 is the batch: a 64-row tile wasted a quarter of the matrix work on
+    // padding, and a runtime row count lost the unrolling (0.55-0.80x). Every B element belongs
+    // to one simdgroup, so staging it bought only barriers; A is small enough to stay in cache.
+    // `m` is a multiple of 8 (see `skinny::eligible`); rows past it read row 0, never stored.
+    // Each simdgroup owns a 24x32 patch (rows `sm`, columns `n0`): 7 tile loads per 12 MMAs.
+    const uint sm = (sg & 1) * 24;
+    const uint n0 = tgp.x * 64 + (sg >> 1) * 32;
 
-    simdgroup_float8x8 acc[3][2];
+    simdgroup_float8x8 acc[3][4];
     for (uint i = 0; i < 3; ++i) {
-        for (uint j = 0; j < 2; ++j) {
+        for (uint j = 0; j < 4; ++j) {
             acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
         }
     }
 
-    threadgroup half4 *as4 = (threadgroup half4 *)as_;
-    threadgroup half4 *bs4 = (threadgroup half4 *)bs_;
+    uint rows[3];
+    for (uint i = 0; i < 3; ++i) { rows[i] = (sm + i * 8 < m) ? sm + i * 8 : 0; }
 
-    for (uint kc = 0; kc < k; kc += 32) {
-        for (uint idx = tid; idx < 48 * 8; idx += 256) {
-            const uint r = idx >> 3;
-            const uint q = idx & 7;
-            as4[r * 10 + q] =
-                (r < m) ? *(const device half4 *)(a + r * k + kc + q * 4) : half4(0.0h);
+    for (uint kc = kbeg; kc < kend; kc += 8) {
+        simdgroup_half8x8 av[3], bv[4];
+        for (uint i = 0; i < 3; ++i) {
+            simdgroup_load(av[i], a + rows[i] * k + kc, k);
         }
-        for (uint idx = tid; idx < 32 * 16; idx += 256) {
-            const uint r = idx >> 4;
-            const uint q = idx & 15;
-            bs4[r * 16 + q] = *(const device half4 *)(b + (kc + r) * n + n0 + q * 4);
+        for (uint j = 0; j < 4; ++j) {
+            simdgroup_load(bv[j], b + kc * n + n0 + j * 8, n);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint kk = 0; kk < 32; kk += 8) {
-            simdgroup_half8x8 av[3], bv[2];
-            for (uint i = 0; i < 3; ++i) {
-                simdgroup_load(av[i], as_ + (sm + i * 8) * 40 + kk, 40);
-            }
-            for (uint j = 0; j < 2; ++j) {
-                simdgroup_load(bv[j], bs_ + kk * 64 + sn + j * 8, 64);
-            }
-            for (uint i = 0; i < 3; ++i) {
-                for (uint j = 0; j < 2; ++j) {
-                    simdgroup_multiply_accumulate(acc[i][j], av[i], bv[j], acc[i][j]);
-                }
+        for (uint i = 0; i < 3; ++i) {
+            for (uint j = 0; j < 4; ++j) {
+                simdgroup_multiply_accumulate(acc[i][j], av[i], bv[j], acc[i][j]);
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = 0; i < 3; ++i) {
-        for (uint j = 0; j < 2; ++j) {
-            simdgroup_store(acc[i][j], out_ + (sm + i * 8) * 64 + sn + j * 8, 64);
+        if (sm + i * 8 >= m) { break; }
+        for (uint j = 0; j < 4; ++j) {
+            simdgroup_store(acc[i][j], c + (sm + i * 8) * n + n0 + j * 8, n);
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
 
-    for (uint idx = tid; idx < 48 * 64; idx += 256) {
-        const uint r = idx >> 6;
-        if (r >= m) { continue; }
-        c[r * n + n0 + (idx & 63)] = out_[idx];
+// dst[i] = src[i] + src[count + i] + ..., in split order so a render stays reproducible.
+kernel void sum_splits_f32(
+    device const float4 *src    [[buffer(0)]],
+    device float4       *dst    [[buffer(1)]],
+    constant uint       &count4 [[buffer(2)]],
+    constant uint       &splits [[buffer(3)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= count4) { return; }
+    float4 acc = src[i];
+    for (uint s = 1; s < splits; ++s) {
+        acc += src[s * count4 + i];
     }
+    dst[i] = acc;
 }
 
 // ---- swiglu tail ---------------------------------------------------------------
@@ -1004,6 +1162,94 @@ kernel void stft_inverse_f32(
         env += w * w;
     }
     dst[t] = (env > 1e-11f) ? acc / env : 0.0f;
+}
+// ---- top-k sampling ------------------------------------------------------------
+//
+// One threadgroup per row. The top `k` are selected by value, ties to the lower index, which
+// is the host sampler's order; thread 0 then repeats its arithmetic exactly — sequential sums,
+// a division by the temperature, `precise::exp` — so a pick differs from the host's only when
+// the draw lands within an ulp of a boundary.
+constant uint TOPK_MAX_N = 4096;
+constant uint TOPK_MAX_K = 64;
+
+inline bool topk_better(float va, uint ia, float vb, uint ib) {
+    return va > vb || (va == vb && ia < ib);
+}
+
+kernel void topk_sample_f32(
+    device const float* logits [[buffer(0)]],
+    device const float* draws  [[buffer(1)]],
+    device uint*        out    [[buffer(2)]],
+    constant uint&      n      [[buffer(3)]],
+    constant uint&      k      [[buffer(4)]],
+    constant float&     temp   [[buffer(5)]],
+    uint row  [[threadgroup_position_in_grid]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tpg  [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float v[TOPK_MAX_N];
+    threadgroup float sg_val[32];
+    threadgroup uint  sg_idx[32];
+    threadgroup float sel_val[TOPK_MAX_K];
+    threadgroup uint  sel_idx[TOPK_MAX_K];
+
+    device const float* x = logits + row * n;
+    for (uint i = tid; i < n; i += tpg) {
+        v[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint groups = (tpg + 31) / 32;
+    for (uint j = 0; j < k; ++j) {
+        float bv = -INFINITY;
+        uint bi = 0xffffffffu;
+        for (uint i = tid; i < n; i += tpg) {
+            // A taken slot is NaN, which no comparison selects.
+            if (topk_better(v[i], i, bv, bi)) { bv = v[i]; bi = i; }
+        }
+        for (uint off = 16; off > 0; off >>= 1) {
+            const float ov = simd_shuffle_down(bv, off);
+            const uint oi = simd_shuffle_down(bi, off);
+            if (lane + off < 32 && topk_better(ov, oi, bv, bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) { sg_val[sg] = bv; sg_idx[sg] = bi; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float wv = sg_val[0];
+            uint wi = sg_idx[0];
+            for (uint g = 1; g < groups; ++g) {
+                if (topk_better(sg_val[g], sg_idx[g], wv, wi)) { wv = sg_val[g]; wi = sg_idx[g]; }
+            }
+            sel_val[j] = wv;
+            sel_idx[j] = wi;
+            v[wi] = NAN;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        float p[TOPK_MAX_K];
+        const float mx = sel_val[0];
+        float total = 0.0f;
+        for (uint j = 0; j < k; ++j) {
+            p[j] = precise::exp((sel_val[j] - mx) / temp);
+            total += p[j];
+        }
+        float renorm = 0.0f;
+        for (uint j = 0; j < k; ++j) {
+            p[j] /= total;
+            renorm += p[j];
+        }
+        float u = draws[row] * renorm;
+        uint pick = sel_idx[k - 1];
+        for (uint j = 0; j < k; ++j) {
+            u -= p[j];
+            if (u <= 0.0f) { pick = sel_idx[j]; break; }
+        }
+        out[row] = pick;
+    }
 }
 "#;
 

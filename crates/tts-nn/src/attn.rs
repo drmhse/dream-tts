@@ -30,6 +30,22 @@ pub fn decode_attention(
     let capacity = k.dim(2)?;
     anyhow::ensure!(span <= capacity, "span {span} exceeds capacity {capacity}");
 
+    #[cfg(feature = "metal")]
+    if fused_eligible(q, k, head_dim, gqa) {
+        return Ok(q.contiguous()?.apply_op3_no_bwd(
+            &k.contiguous()?,
+            &v.contiguous()?,
+            &Fused {
+                b,
+                n_kv,
+                gqa,
+                capacity,
+                span,
+                window_start,
+            },
+        )?);
+    }
+
     let scores = q.contiguous()?.apply_op2_no_bwd(
         &k.contiguous()?,
         &Scores {
@@ -278,5 +294,141 @@ impl candle_core::CustomOp2 for Weighted {
             MetalStorage::new(dst, device.clone(), count, DType::F32),
             (self.b, self.n_kv, self.gqa, self.head_dim).into(),
         ))
+    }
+}
+
+/// The fused kernel's shapes: an f16 cache on Metal, `head_dim` 128, at most two query heads per
+/// kv head. `TTS_NN_FUSED_ATTN=0` keeps the two-kernel path, for A/B.
+#[cfg(feature = "metal")]
+fn fused_eligible(q: &Tensor, k: &Tensor, head_dim: usize, gqa: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TTS_NN_FUSED_ATTN").as_deref() != Ok("0"))
+        && q.device().is_metal()
+        && q.dtype() == DType::F32
+        && k.dtype() == DType::F16
+        && head_dim == 128
+        && (1..=2).contains(&gqa)
+}
+
+#[cfg(feature = "metal")]
+struct Fused {
+    b: usize,
+    n_kv: usize,
+    gqa: usize,
+    capacity: usize,
+    span: usize,
+    window_start: usize,
+}
+
+#[cfg(feature = "metal")]
+impl candle_core::CustomOp3 for Fused {
+    fn name(&self) -> &'static str {
+        "decode_attn"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        candle_core::bail!("decode_attn: Metal only")
+    }
+
+    fn metal_fwd(
+        &self,
+        s1: &candle_core::MetalStorage,
+        l1: &Layout,
+        s2: &candle_core::MetalStorage,
+        l2: &Layout,
+        s3: &candle_core::MetalStorage,
+        l3: &Layout,
+    ) -> candle_core::Result<(candle_core::MetalStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::MetalStorage;
+        use objc2_metal::{MTLResourceUsage, MTLSize};
+
+        let count = self.b * self.n_kv * self.gqa * 128;
+        let device = s1.device();
+        let p = mtl::pipeline(device, "decode_attn_f16")?;
+        let dst = device.new_buffer(count, DType::F32, "decode_attn")?;
+
+        let encoder = device.command_encoder()?;
+        encoder.set_label("tts_nn::decode_attn");
+        encoder.set_compute_pipeline_state(&p);
+        encoder.set_buffer(0, Some(s1.buffer()), l1.start_offset() * 4);
+        encoder.set_buffer(1, Some(s2.buffer()), l2.start_offset() * 2);
+        encoder.set_buffer(2, Some(s3.buffer()), l3.start_offset() * 2);
+        encoder.set_buffer(3, Some(dst.as_ref()), 0);
+        encoder.set_bytes(4, &(self.span as u32));
+        encoder.set_bytes(5, &(self.capacity as u32));
+        encoder.set_bytes(6, &(self.gqa as u32));
+        encoder.set_bytes(7, &(self.window_start as u32));
+        encoder.use_resource(s1.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(s2.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(s3.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(dst.as_ref(), MTLResourceUsage::Write);
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: self.b * self.n_kv,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+        drop(encoder);
+
+        Ok((
+            MetalStorage::new(dst, device.clone(), count, DType::F32),
+            (self.b, self.n_kv, self.gqa, 128).into(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device};
+
+    /// The fused kernel against the CPU path, which is neither Metal kernel.
+    #[test]
+    fn fused_matches_cpu() -> anyhow::Result<()> {
+        #[cfg(feature = "metal")]
+        let _gpu = crate::gpu_guard();
+        let Some(d) = crate::usable_metal() else {
+            return Ok(());
+        };
+        for (b, n_kv, gqa, cap, span, wstart) in [
+            (48usize, 8usize, 2usize, 400usize, 250usize, 0usize),
+            (40, 8, 2, 17, 3, 0),
+            (8, 8, 2, 300, 211, 90),
+            (4, 8, 1, 64, 33, 0),
+        ] {
+            let q = (Tensor::randn(0f32, 1., (b, n_kv, gqa, 128), &d)? * 0.1)?;
+            let k = Tensor::randn(0f32, 1., (b, n_kv, cap, 128), &d)?.to_dtype(DType::F16)?;
+            let v = Tensor::randn(0f32, 1., (b, n_kv, cap, 128), &d)?.to_dtype(DType::F16)?;
+            let got = decode_attention(&q, &k, &v, span, wstart)?;
+            let cpu = Device::Cpu;
+            let want = decode_attention(
+                &q.to_device(&cpu)?,
+                &k.to_device(&cpu)?,
+                &v.to_device(&cpu)?,
+                span,
+                wstart,
+            )?;
+            let (abs, rel) = crate::abs_and_rel(&got.to_device(&cpu)?, &want)?;
+            assert!(
+                rel < 1e-5,
+                "b={b} gqa={gqa} span={span} wstart={wstart}: abs {abs:.2e} rel {rel:.2e}"
+            );
+        }
+        Ok(())
     }
 }

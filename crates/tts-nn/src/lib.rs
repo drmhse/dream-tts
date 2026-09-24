@@ -28,14 +28,17 @@
 pub mod attn;
 pub mod fused;
 pub mod im2col;
-pub(crate) mod mtl;
 pub mod mpsconv;
+pub mod mpsnlc;
+pub(crate) mod mtl;
 pub mod nlc;
 mod nlcconv;
+pub mod qkrope;
 pub mod skinny;
 pub mod stats;
 pub mod stft;
 pub mod tapconv;
+pub mod topk;
 pub mod upconv;
 
 use anyhow::{Context, Result};
@@ -149,13 +152,56 @@ impl Weights {
 
     /// Fetch as f32. Checkpoints here are f32 (the folded codec, CosyVoice) or bf16
     /// (Audio8's AR); the port computes in f32 unless a tensor is quantized.
+    ///
+    /// Converted on the host, then uploaded. candle 0.10.2 pools every op's output in a map
+    /// it never trims, rounded up to a power of two, while a buffer uploaded from host data
+    /// is exact and released when dropped — so a device-side cast left its source and its
+    /// result both resident for the life of the process.
     pub fn get(&self, name: &str) -> Result<Tensor> {
-        Ok(self.fetch(name)?.to_dtype(DType::F32)?)
+        Ok(self
+            .cpu(name)?
+            .to_dtype(DType::F32)?
+            .to_device(&self.device)?)
+    }
+
+    /// The tensor on the host in its on-disk dtype, for load-time work that should not
+    /// allocate on the device; see [`Self::get`].
+    pub fn cpu(&self, name: &str) -> Result<Tensor> {
+        self.file
+            .load(name, &Device::Cpu)
+            .with_context(|| format!("missing tensor {name}"))
     }
 
     /// Same, but keeps the on-disk dtype — used where a copy would be wasteful.
     pub fn raw(&self, name: &str) -> Result<Tensor> {
         self.fetch(name)
+    }
+
+    /// Rows `ids` of a 2-D tensor, read from the mapping in the on-disk dtype. For a table
+    /// that is large and sparsely read: the rows cost a copy each, and the rest stays clean
+    /// file-backed pages that count against nothing.
+    pub fn rows(&self, name: &str, ids: &[u32]) -> Result<Tensor> {
+        let view = self
+            .file
+            .get(name)
+            .with_context(|| format!("missing tensor {name}"))?;
+        let dtype = DType::try_from(view.dtype())?;
+        let shape = view.shape();
+        anyhow::ensure!(shape.len() == 2, "{name} is {}-D, not a table", shape.len());
+        let row = shape[1] * dtype.size_in_bytes();
+        let data = view.data();
+        let mut buf = Vec::with_capacity(ids.len() * row);
+        for &id in ids {
+            let at = id as usize * row;
+            anyhow::ensure!(at + row <= data.len(), "row {id} is past the end of {name}");
+            buf.extend_from_slice(&data[at..at + row]);
+        }
+        Ok(Tensor::from_raw_buffer(
+            &buf,
+            dtype,
+            &[ids.len(), shape[1]],
+            &self.device,
+        )?)
     }
 
     /// `get`, or `None` when absent. For genuinely optional tensors only — a typo in a
@@ -325,13 +371,11 @@ impl Proj {
     /// `name` is the `[out, in]` weight.
     pub fn load_as(w: &Weights, name: &str, how: Weight, device: &Device) -> Result<Self> {
         match how {
-            Weight::F32 => Ok(Proj::Dense(w.get(name)?.t()?.contiguous()?)),
-            // Straight from the checkpoint's dtype. Going via f32 would double the transient
-            // footprint, and candle's Metal buffer pool has no public way to release anything —
-            // an f32 intermediate per projection stays resident for the life of the process.
-            Weight::F16 => Ok(Proj::Half(
-                w.raw(name)?.to_dtype(DType::F16)?.t()?.contiguous()?,
-            )),
+            // Cast and transposed on the host, then uploaded once: on the device each step's
+            // output stays pooled for good (see `Weights::get`), which left qwen3tts's talker
+            // allocating 6.8 GB for 3.4 of weights.
+            Weight::F32 => Ok(Proj::Dense(host_layout(&w.cpu(name)?, DType::F32, device)?)),
+            Weight::F16 => Ok(Proj::Half(host_layout(&w.cpu(name)?, DType::F16, device)?)),
             Weight::Quant(q) => {
                 // `quantize_onto` needs a CPU f32 source and writes the blocks straight
                 // to the device.
@@ -350,8 +394,8 @@ impl Proj {
 
     pub fn from_tensor_as(t: &Tensor, how: Weight, device: &Device) -> Result<Self> {
         match how {
-            Weight::F32 => Ok(Proj::Dense(t.t()?.contiguous()?)),
-            Weight::F16 => Ok(Proj::Half(t.to_dtype(DType::F16)?.t()?.contiguous()?)),
+            Weight::F32 => Ok(Proj::Dense(host_layout(t, DType::F32, device)?)),
+            Weight::F16 => Ok(Proj::Half(host_layout(t, DType::F16, device)?)),
             Weight::Quant(q) => {
                 let cpu = t.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
                 Ok(Proj::Quant(QMatMul::from_qtensor(QTensor::quantize_onto(
@@ -413,13 +457,13 @@ impl Linear {
     }
 
     pub fn load(w: &Weights, prefix: &str, bias: bool) -> Result<Self> {
-        let weight = w.get(&format!("{prefix}.weight"))?;
         let b = if bias {
             Some(w.get(&format!("{prefix}.bias"))?)
         } else {
             None
         };
-        Self::new(&weight, b)
+        let w_t = host_layout(&w.cpu(&format!("{prefix}.weight"))?, DType::F32, &w.device)?;
+        Ok(Self { w_t, b })
     }
 
     /// `[.., in] -> [.., out]`, as a single two-dimensional GEMM.
@@ -1234,4 +1278,25 @@ mod tests {
         }
         Ok(())
     }
+}
+
+/// `[out, in]` as `[in, out]` in `dtype` on `device`, the cast and transpose done on the host
+/// so the device sees a single exact upload; see [`Weights::get`].
+fn host_layout(t: &Tensor, dtype: DType, device: &Device) -> Result<Tensor> {
+    Ok(t.to_device(&Device::Cpu)?
+        .to_dtype(dtype)?
+        .t()?
+        .contiguous()?
+        .to_device(device)?)
+}
+
+/// Bytes the Metal device has allocated for this process, pool included; `None` off Metal.
+pub fn allocated_bytes(device: &Device) -> Option<u64> {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        use objc2_metal::MTLDevice;
+        return Some(m.device().as_ref().currentAllocatedSize() as u64);
+    }
+    let _ = device;
+    None
 }

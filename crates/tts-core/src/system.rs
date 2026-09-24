@@ -30,6 +30,27 @@ pub fn total_memory() -> Option<u64> {
     (rc == 0).then_some(value)
 }
 
+/// This process's physical footprint in bytes — what Activity Monitor calls Memory, and what
+/// decides whether a render swaps. `None` off macOS.
+#[cfg(target_os = "macos")]
+pub fn footprint() -> Option<u64> {
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a `rusage_info_v2`, which is what flavor 2 writes.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id() as i32,
+            libc::RUSAGE_INFO_V2,
+            (&raw mut info).cast(),
+        )
+    };
+    (rc == 0).then_some(info.ri_phys_footprint)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn footprint() -> Option<u64> {
+    None
+}
+
 /// `MemTotal: N kB`, the first line of `/proc/meminfo`.
 #[cfg(not(target_os = "macos"))]
 pub fn total_memory() -> Option<u64> {
