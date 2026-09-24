@@ -301,7 +301,7 @@ passage reads **0.314**, still the wrong case for it.
 | `audio8` | 1.307 (PyTorch bf16 MPS, batched) | **0.554** | 0.547–0.562 | 2.36× faster |
 | `cosyvoice` | 4.370 (stock PyTorch, CPU-only) | **0.726** | 0.697–0.734 | 6.02× faster |
 | `qwen3tts` | — | **0.665** | 0.642–0.687 | the wrong case for it; see below |
-| `kokoro` | — | **0.044** | 0.044–0.046 | no loop to fill, so this is its normal rate |
+| `kokoro` | — | **0.038** | 0.037–0.039 | no loop to fill, so this is its normal rate |
 
 ### Chapter, and what batching is actually worth
 
@@ -397,16 +397,18 @@ the only engine whose short-passage and long-form numbers are the same figure.
 
 | engine | voice | RTF | wall | audio | peak footprint |
 |---|---|---|---|---|---|
-| `kokoro` | `af_heart` | **0.043**, before [the second pass](#kokoro-second-pass-the-per-length-compile-the-recurrences-the-load-path) | 31.2 s | 12:15 | 1.68 GB |
-| `kokoro` | `am_michael` | **0.041** | 33.4 s | 13:32 | — |
+| `kokoro` | `af_heart` | **0.038** | 28.5 s | 12:15 | 1.87 GB |
+| `kokoro` | `am_michael` | **0.039** | 31.3 s | 13:32 | 2.15 GB |
 | `audio8` | cloned female / male | 0.536 / 0.527 | 6m 12s / 5m 47s | 11:34 / 10:59 | — |
 | `cosyvoice` | cloned female / male | 0.718 / 0.703 | 9m 12s / 8m 15s | 12:48 / 11:44 | — |
 
 The stage split under `kokoro` is flat across both: decoder 78–80%, prosody 7.6%, bert 6.4%,
 duration 4.3%, encoder 1.5%. A segment is one forward pass, so there is no batch to fill and
-nothing that rewards length — 0.044 on seven segments against 0.043 on a hundred is the whole
+nothing that rewards length — 0.038 on seven segments against 0.038 on a hundred is the whole
 story, and it is why the engine is worth having on a machine that cannot hold `qwen3tts`.
-Peak footprint is 1.29 GB on the short passage, against 12.3 for the default.
+Peak footprint is 1.28 GB on the short passage, against 6.7 for the default. Those are the build
+after the [second pass](#kokoro-second-pass-the-per-length-compile-the-recurrences-the-load-path),
+with the GPU otherwise idle; before it the chapter was 0.043 and 31.2 s.
 
 ### Word error rate, all eight demo renders
 
