@@ -30,7 +30,9 @@ cargo run -p kokoro --release --bin kokoro-validate
 voices are 28 style tables inside the checkpoint, picked with `--set voice=<name>` — and its
 English frontend is a lexicon with no espeak fallback, so an unknown word is named in a lint
 rather than guessed. `docs/kokoro-frontend.md` and `docs/kokoro-model.md` carry its traps and
-its measurements.
+its measurements. On Metal its generator runs padded to length buckets (`KOKORO_BUCKETS`, 0 to
+disable), so an A/B of a generator change has to render several lengths, not one utterance
+repeated: a repeated utterance never pays MPSGraph's per-length compile.
 
 `cargo build -p <crate>` does not relink the binaries, and `cargo clippy --workspace` leaves them
 built **without Metal**. Rebuild with a plain `cargo build --release` before measuring anything.

@@ -397,7 +397,7 @@ the only engine whose short-passage and long-form numbers are the same figure.
 
 | engine | voice | RTF | wall | audio | peak footprint |
 |---|---|---|---|---|---|
-| `kokoro` | `af_heart` | **0.043** | 31.2 s | 12:15 | 1.68 GB |
+| `kokoro` | `af_heart` | **0.043**, before [the second pass](#kokoro-second-pass-the-per-length-compile-the-recurrences-the-load-path) | 31.2 s | 12:15 | 1.68 GB |
 | `kokoro` | `am_michael` | **0.041** | 33.4 s | 13:32 | — |
 | `audio8` | cloned female / male | 0.536 / 0.527 | 6m 12s / 5m 47s | 11:34 / 10:59 | — |
 | `cosyvoice` | cloned female / male | 0.718 / 0.703 | 9m 12s / 8m 15s | 12:48 / 11:44 | — |
@@ -523,11 +523,50 @@ so `simdgroup_multiply_accumulate` is a scheduled ALU sequence and Apple schedul
 better. The right conclusion was not "tune harder" but "use more of Apple's code", which is
 change 1.
 
-**What is left.** The two transposed convolutions are 31 ms and still on `upconv`;
-MPSGraph has `convolutionTranspose2D` and the machinery is now in place. The MPSGraph calls
-each cost a commit and a wait, because candle does not expose its command buffer to encode
-into — with `encodeToCommandBuffer` the syncs would go. And `bert` is 27 ms of launch-bound
-attention over 170 tokens.
+**What was left then**, and what became of it in the next section: the transposed
+convolutions (now one stacked conv each), the MPSGraph syncs (still there — candle does not
+expose its command buffer), and `bert` (still 30 ms; neither fused QKV nor fused attention moved
+it).
+
+### Kokoro, second pass: the per-length compile, the recurrences, the load path
+
+The first pass was measured the way it was built: one utterance rendered four times. A chapter
+is a hundred utterances of a hundred lengths, and that hid the largest cost left. Interleaved
+against the committed build in one session, M4 / 16 GB, with a browser open (so both columns
+read high against the quiet-machine 0.043 above; the ratio is the finding):
+
+| | before | after |
+|---|---|---|
+| `examples/chapter.txt`, three rounds | RTF 0.052 / 0.054 / 0.058 | **0.038 / 0.040 / 0.043** |
+| `examples/senior.txt`, three rounds | 0.057 / 0.058 / 0.052 | **0.039 / 0.038 / 0.038** |
+| one sentence, fresh process: synthesis / wall | 0.4 s / 0.61 s | **0.2 s / 0.51 s** |
+| load | 0.29 s | **0.12 s** |
+| Metal allocated after load | 0.65 GB | **0.38 GB** |
+| peak footprint, short passage / chapter | 1.36 / 1.93 GB | 1.27 / 1.87 GB |
+
+Quality: the chapter renders to the same length, 49 dB apart. Whisper (`--backend openai`)
+reads 14 errors in both, WER 0.009; median F0 198.3 Hz in both; LTAS cosine 1.00000. The
+batched `faster` backend read the committed build's file as 0.047 by dropping a 62-word span;
+the audio does not differ there. With `TTS_NN_LSTM_SEQ=0` the two builds are 89 dB apart,
+which is 16-bit quantisation: the LSTM's summation order is the only numeric change, and it is
+the more accurate of the two (below). The fixture gate is 10 rows, 0 failures.
+
+| change | what it was | effect |
+|---|---|---|
+| **Length buckets + executables compiled ahead** | MPSGraph specialises a graph for every input length, ~4 ms a graph, on the caller's thread with the GPU idle; the generator runs ~26 graphs, so ~100 ms a segment and a third of the decoder on a chapter. The generator now pads its input to one of eight lengths per octave, and `mpsconv::prewarm` compiles the executables that length needs on four threads as soon as the durations are known, behind the prosody and decoder blocks | the bulk of the chapter gain |
+| **Exact padding** | `adain_snake_masked` takes moments over the real samples only and writes zeros past them, `leaky_masked` likewise, so every conv reads the zeros its own padding would have. 86.6 dB against the unpadded path — 16-bit quantisation | ~3% of padded work |
+| **`lstm_seq`** | one encoder of per-step dispatches, both directions per dispatch, a simdgroup per hidden unit summing H/32 terms of all four gates; the step form was a gemv, a gates kernel and copies per direction | 30 → 7 µs a step; duration 22 → 8 ms and prosody 33 → 24 on an 11 s utterance. 1.9e-7 max error against an f64 recurrence over 1200 steps, where the step form is 4.4e-7 |
+| **Transposed convs as one conv** | the `s` phases share an input and differ in which of three offsets they read, so they stack into one `[kw, in, s * out]` conv and an interleave, where the tap loop was ~20 matmuls, copies and adds | 36 → 17 ms a segment; MPSGraph for `ups.1`, the GEMM for `ups.0`, whose input is short |
+| **Residual inside the conv graph** | `convs2`'s output plus the block input, added in MPSGraph rather than as a pass | ~2% of the decoder |
+| **One weight layout per conv** | `[k, in, out]` is MPSGraph's HWIO, and transposed it is the gather GEMM's `[out, k * in]`; every conv held both candle's layout and the tap-major one, each rearranged on the device into candle's pool | load allocation 0.65 → 0.38 GB |
+| **Host rearranging, done fast** | the rearranging moved to the host, where candle's strided copy of a transposed view doubled load time; a tiled transpose on threads (`host_layout`, shared with every engine) and a tap-plane permute fixed it | load 0.29 → 0.12 s |
+| **The frontend a segment ahead** | G2P ran twice per segment, on the synthesis thread; it runs once, on its own thread | ~3% of a chapter |
+| **`leaky_relu` in one pass** | relu, sub, mul, add | bit-identical |
+
+**Next:** the SnakeResBlock as one MPSGraph. There are still ~49 commit-and-wait syncs a segment,
+and with the compile hidden they are what is left between the convs, which already run at
+MPSGraph's ceiling (2.4-2.7 TFLOP/s f32): ~80 ms of waiting on an 11 s utterance, of which the
+elementwise work between convs is ~27.
 
 ### How to measure without fooling yourself
 
@@ -1142,6 +1181,12 @@ rather than let the server run a chapter ahead into memory.
 | **Fusing residual add, RMS norm and the f16 cast** | one dispatch for four, and no measurable change in a decode step (69.8 against 69.5 ms). The QK-norm/rope fusion paid because it replaced slow 4-D norm and rope kernels, not because it removed dispatches |
 | **SnakeBeta fused into a 768-channel conv** | the kernel reloads its input once per 32 output channels, so the sin runs 24 times per element and the saved pass buys nothing; up to 384 channels it is a 9.5% win and shipped |
 | **Padded decode attention** | superseded by fused decode attention |
+| **`kokoro`: an LSTM in one threadgroup per direction** | all steps in one dispatch, h and gates in threadgroup memory: 31 µs a step against the step form's ~16 per direction. One core cannot pull `w_hh`'s 1 MB a step; spreading the rows over threadgroups, with the dispatch boundary as the barrier, is what shipped |
+| **`kokoro`: a thread per gate row, looping over H** | 33 µs a step: 256 dependent loads per thread, latency-bound. A simdgroup per unit, H/32 independent loads a lane, is 7 |
+| **`kokoro`: fused QKV and candle's `sdpa` in ALBERT** | 30 ms before and after. The GEMMs run at under 1 TFLOP/s at M = 189, and neither change touches that |
+| **`kokoro`: MPSGraph below 4096 samples** | `TTS_MPS_MIN_LEN=512`, to take the decoder's 1090-channel convs: prosody 23 → 28 ms, decoder no better |
+| **`kokoro`: MPSGraph at `Level0`** | a new length still cost ~3 ms a graph against ~4; compiling ahead is what removed it |
+| **`kokoro`: f16 generator convs through MPSGraph** | 1.12-1.18× over f32 at 128 channels, not enough to spend quality on |
 
 The one that keeps paying: **candle is 1.70–2.23× slower than torch on this codec**, stable
 across every thermal state, which is what motivated the custom Metal kernels in `tts-nn`.

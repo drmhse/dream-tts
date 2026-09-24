@@ -289,6 +289,10 @@ iSTFTNet decoder. What follows from that is most of what makes it worth having:
 - **RTF 0.041-0.043, and it does not depend on length.** 12m 15s of speech in 31 seconds, 23×
   realtime — and 0.044 on a 132-word passage, where `qwen3tts` needs a long document to reach
   about 0.11. There is no batch to fill, so a single sentence runs at the same rate as a chapter.
+  Those are the quiet-machine figures from before the second pass, which takes a further 27%
+  off a chapter and 30% off the short passage, measured interleaved against the old build on a
+  loaded machine (0.038 against 0.052 on the chapter) — see
+  [docs/reference.md](docs/reference.md#kokoro-second-pass-the-per-length-compile-the-recurrences-the-load-path).
 - **1.3 GB of peak footprint**, against 6.7 for the default. 82M parameters and no KV cache.
 - **No sampler, so no length drift.** Two renders of the same text are the same length; the
   only stochastic stage is the decoder's excitation noise, which is seeded.
@@ -307,9 +311,12 @@ engine here, is **0.009** for `af_heart` — the lowest of the eight files on th
 each other rather than reporting a publishable figure, is in
 [docs/reference.md](docs/reference.md#performance).
 
-**Where the time goes: 78% is the decoder**, and inside it the generator's convolutions. Those
+**Where the time goes: 80% is the decoder**, and inside it the generator's convolutions. Those
 run through MPSGraph rather than candle, which materialises no im2col matrix — 1.7× on the
-shape that dominates, with a dynamic length axis so one compiled graph serves every utterance.
+shape that dominates. MPSGraph compiles a graph afresh for every input length, ~4 ms each and
+~26 of them, which on a chapter was a third of the decoder: the generator pads to one of eight
+lengths per octave, exactly, and the graphs a length needs are compiled on other threads while
+the GPU is still on the prosody stage.
 The recurrences are the other half of the story: Metal compiles with fast math on by default,
 and an LSTM multiplies its own rounding, which was enough here to move the predicted durations
 and *halve the length of the audio*. `lstm_gates` uses `precise::exp` and `precise::tanh` for
