@@ -660,7 +660,7 @@ streams.
 
 | route | |
 |---|---|
-| `POST /tts`, `POST /tts/stream`, `GET /health`, `GET /v1/capabilities`, `GET /` | served |
+| `POST /tts`, `POST /tts/stream`, `POST /v1/batch`, `GET /health`, `GET /v1/capabilities`, `GET /` | served |
 | `/v1/tts-jobs`, `/v1/alignment-jobs`, `/v1/artifacts/…` | **501 with an explanation**, not 404 |
 
 `mode=instruct`, `mode=cross_lingual`, `speed != 1.0` and `instruct_text` also return 501.

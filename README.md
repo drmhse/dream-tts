@@ -462,6 +462,7 @@ override the negotiation.
 |---|---|
 | `POST /tts` | WAV body, PCM s16le mono. JSON, or `text/plain` with the text as the body |
 | `POST /tts/stream` | same, incremental rather than buffered: raw PCM as each segment lands |
+| `POST /v1/batch` | `{"texts": [...]}`, up to 16, rendered in one engine run; JSON with one base64 WAV, word clock and segment clock per text. qwen3tts batches them: RTF 0.58 for one sentence-sized text, 0.146 for twelve |
 | `GET /v1/capabilities` | engines, sample rates, languages, and the weight formats each supports |
 | `GET /v1/jobs` | narration runs. `POST` submits one; the same document resubmitted resumes it |
 | `GET /v1/jobs/<id>/events` | server-sent events: per-segment progress and every state change |

@@ -41,6 +41,7 @@
 //! faster. Requests queue; the semaphore is the queue. Synthesis itself is blocking and
 //! runs on `spawn_blocking` so it never occupies an async worker.
 
+mod batch;
 mod jobs;
 mod stream;
 
@@ -334,6 +335,7 @@ fn validate(app: &App, req: &TtsRequest) -> Result<(), ApiError> {
 
 struct Rendered {
     wav: Vec<u8>,
+    audio: tts_core::Audio,
     seconds: f64,
     wall: f64,
     stages: Vec<(&'static str, f64)>,
@@ -417,6 +419,7 @@ async fn render(app: &Arc<App>, req: TtsRequest) -> Result<Rendered, ApiError> {
     let wav = tts_core::wav::to_bytes(&out.audio);
     Ok(Rendered {
         wav,
+        audio: out.audio,
         seconds,
         wall,
         stages: out.stats.stages,
@@ -521,6 +524,9 @@ async fn post_tts(
             ),
         ),
         hdr("x-audio-format", "pcm_s16le_mono".into()),
+        // Additive: which engine rendered this, so a client caching by engine can refuse audio
+        // from a different one that has since taken the port.
+        hdr("x-engine", app.engine_id.clone()),
         // Additive: the per-stage split the CLI prints, so a client can see where the
         // time went without a second request.
         hdr(
@@ -743,6 +749,9 @@ This page is what a browser gets; every other client gets JSON from the same URL
   <tr><td class="m">POST</td><td class="m">/tts/stream</td>
       <td><strong>Incremental.</strong> Raw PCM as each segment lands, chunked, so first
           audio arrives after one segment rather than after all of them.</td></tr>
+  <tr><td class="m">POST</td><td class="m">/v1/batch</td>
+      <td>Up to 16 texts in one engine run, answered as one WAV per text with its clocks.
+          The way to get batched throughput per text.</td></tr>
   <tr><td class="m">GET</td><td class="m"><a href="/v1/jobs">/v1/jobs</a></td>
       <td>Narration runs. <code>POST</code> submits one; the same document resubmitted
           resumes it.</td></tr>
@@ -873,7 +882,7 @@ fn root_json(app: &Arc<App>) -> Json<serde_json::Value> {
         "max_chars": app.max_chars,
         "uptime_seconds": app.started.elapsed().as_secs(),
         "endpoints": [
-            "/health", "/v1/capabilities", "POST /tts", "POST /tts/stream",
+            "/health", "/v1/capabilities", "POST /tts", "POST /tts/stream", "POST /v1/batch",
             "GET /v1/jobs", "POST /v1/jobs", "GET /v1/jobs/{id}",
             "GET /v1/jobs/{id}/events", "POST /v1/jobs/{id}/{action}",
         ],
@@ -923,6 +932,7 @@ async fn get_capabilities(State(app): State<Arc<App>>) -> Json<serde_json::Value
         "streaming": caps.streaming,
         "cloning": format!("{:?}", caps.cloning),
         "jobs": {"durable": true, "route": "/v1/jobs"},
+        "batch": {"route": "/v1/batch", "maxTexts": batch::MAX_TEXTS},
         "alignment": if caps.word_timings {
             serde_json::json!({
                 "available": true,
@@ -1097,6 +1107,7 @@ async fn main() -> Result<()> {
         .route("/v1/capabilities", get(get_capabilities))
         .route("/tts", post(post_tts))
         .route("/tts/stream", post(post_tts_stream))
+        .route("/v1/batch", post(batch::post_batch))
         .route("/v1/jobs", get(jobs::get_jobs).post(jobs::post_jobs))
         .route("/v1/jobs/:id", get(jobs::get_job))
         .route("/v1/jobs/:id/events", get(jobs::get_job_events))
