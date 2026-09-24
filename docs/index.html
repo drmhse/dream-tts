@@ -193,8 +193,8 @@
       </audio>
     </div>
     <div class="stats">
-      <span>af_heart <b>0.038</b> · 28s → 12:15</span>
-      <span>am_michael <b>0.039</b> · 31s → 13:32</span>
+      <span>af_heart <b>0.036</b> · 27s → 12:15</span>
+      <span>am_michael <b>0.034</b> · 28s → 13:32</span>
     </div>
     <p class="caveat">
       These two are not cloned voices — they are 2 of the 28 style tables that ship inside
@@ -441,7 +441,7 @@ curl -X POST localhost:3003/v1/jobs/&lt;id&gt;/cancel    -H 'X-API-Key: secret'<
       <tr><td class="mono">qwen3tts</td><td class="num">0.104–0.114</td><td class="num">1m 12s–1m 19s</td><td>yes, 48 lanes</td><td>the default. Best quality here, and the only one that makes a book practical</td></tr>
       <tr><td class="mono">cosyvoice</td><td class="num">0.703–0.718</td><td class="num">8m 15s</td><td>no</td><td>you want the widest language coverage</td></tr>
       <tr><td class="mono">audio8</td><td class="num">0.527–0.536</td><td class="num">5m 47s</td><td>no</td><td>you want 44.1 kHz, the highest-fidelity output here</td></tr>
-      <tr><td class="mono">kokoro</td><td class="num">0.038–0.039</td><td class="num">28s</td><td>n/a, no loop</td><td>English, no cloning, and you want it now — or you have 2&nbsp;GB rather than 12</td></tr>
+      <tr><td class="mono">kokoro</td><td class="num">0.034–0.036</td><td class="num">27s</td><td>n/a, no loop</td><td>English, no cloning, and you want it now — or you have 2&nbsp;GB rather than 12</td></tr>
     </tbody>
   </table>
   </div>
@@ -453,7 +453,7 @@ curl -X POST localhost:3003/v1/jobs/&lt;id&gt;/cancel    -H 'X-API-Key: secret'<
     because it batches across sections, so it wants length: on a 132-word passage it is 0.314,
     against 0.544 for <code>audio8</code> and 0.716 for <code>cosyvoice</code>. Never
     benchmark it on a paragraph. <code>kokoro</code> has nothing to batch and is steady at any
-    length — 0.038 on that same passage.
+    length — 0.036 on that same passage.
   </p>
   <p class="caveat">
     Memory is the other axis, and it runs the other way. On that short passage

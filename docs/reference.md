@@ -301,7 +301,7 @@ passage reads **0.314**, still the wrong case for it.
 | `audio8` | 1.307 (PyTorch bf16 MPS, batched) | **0.554** | 0.547–0.562 | 2.36× faster |
 | `cosyvoice` | 4.370 (stock PyTorch, CPU-only) | **0.726** | 0.697–0.734 | 6.02× faster |
 | `qwen3tts` | — | **0.665** | 0.642–0.687 | the wrong case for it; see below |
-| `kokoro` | — | **0.038** | 0.037–0.039 | no loop to fill, so this is its normal rate |
+| `kokoro` | — | **0.036** | 0.035–0.036 | no loop to fill, so this is its normal rate |
 
 ### Chapter, and what batching is actually worth
 
@@ -397,18 +397,18 @@ the only engine whose short-passage and long-form numbers are the same figure.
 
 | engine | voice | RTF | wall | audio | peak footprint |
 |---|---|---|---|---|---|
-| `kokoro` | `af_heart` | **0.038** | 28.5 s | 12:15 | 1.87 GB |
-| `kokoro` | `am_michael` | **0.039** | 31.3 s | 13:32 | 2.15 GB |
+| `kokoro` | `af_heart` | **0.036** | 26.9 s | 12:15 | 2.01 GB |
+| `kokoro` | `am_michael` | **0.034** | 27.8 s | 13:32 | 2.33 GB |
 | `audio8` | cloned female / male | 0.536 / 0.527 | 6m 12s / 5m 47s | 11:34 / 10:59 | — |
 | `cosyvoice` | cloned female / male | 0.718 / 0.703 | 9m 12s / 8m 15s | 12:48 / 11:44 | — |
 
 The stage split under `kokoro` is flat across both: decoder 78–80%, prosody 7.6%, bert 6.4%,
 duration 4.3%, encoder 1.5%. A segment is one forward pass, so there is no batch to fill and
-nothing that rewards length — 0.038 on seven segments against 0.038 on a hundred is the whole
+nothing that rewards length — 0.036 on seven segments against 0.036 on a hundred is the whole
 story, and it is why the engine is worth having on a machine that cannot hold `qwen3tts`.
-Peak footprint is 1.28 GB on the short passage, against 6.7 for the default. Those are the build
-after the [second pass](#kokoro-second-pass-the-per-length-compile-the-recurrences-the-load-path),
-with the GPU otherwise idle; before it the chapter was 0.043 and 31.2 s.
+Peak footprint is 1.57 GB on the short passage, against 6.7 for the default. Those are the build
+after the [third pass](#kokoro-third-pass-one-graph-per-resblock-and-albert-s-small-passes),
+with the GPU otherwise idle; after the second it was 0.038 and 28.5 s, and before it 0.043.
 
 ### Word error rate, all eight demo renders
 
@@ -565,10 +565,44 @@ the more accurate of the two (below). The fixture gate is 10 rows, 0 failures.
 | **The frontend a segment ahead** | G2P ran twice per segment, on the synthesis thread; it runs once, on its own thread | ~3% of a chapter |
 | **`leaky_relu` in one pass** | relu, sub, mul, add | bit-identical |
 
-**Next:** the SnakeResBlock as one MPSGraph. There are still ~49 commit-and-wait syncs a segment,
-and with the compile hidden they are what is left between the convs, which already run at
-MPSGraph's ceiling (2.4-2.7 TFLOP/s f32): ~80 ms of waiting on an 11 s utterance, of which the
-elementwise work between convs is ~27.
+**Next:** the SnakeResBlock as one MPSGraph, done in the next section.
+
+### Kokoro, third pass: one graph per resblock, and ALBERT's small passes
+
+Measured interleaved against 96565e2, M4 / 16 GB, the GPU otherwise idle (`gpumon` reads 97%
+busy through a chapter on both builds, so what was left was work, not waiting):
+
+| | 96565e2 | now |
+|---|---|---|
+| `examples/chapter.txt`, `af_heart`, three rounds | RTF 0.039 / 0.038 / 0.039 | **0.036 / 0.036 / 0.036** |
+| `examples/chapter.txt`, `am_michael` | 0.036 | **0.034** |
+| `examples/senior.txt`, two rounds | 0.038 / 0.039 | **0.035 / 0.036** |
+| one sentence (4.5 s), fresh process | 0.49 s | **0.45 s** |
+| one sentence through a warm server: first / median / best | 0.25 / 0.16 / 0.10 s | **0.21 / 0.15 / 0.10 s** |
+| `/v1/batch`, `senior.txt`'s paragraphs | 2.17 s | **1.95 s** |
+| peak footprint, short passage / chapter | 1.28 / 1.87 GB | 1.57 / 2.01 GB |
+
+Quality: the fixture gate is 10 rows, 0 failures, with every stage's error unchanged. The chapter
+renders to the same length, median F0 198.3 Hz in both, LTAS cosine 1.00000; faster-whisper
+`small.en` reads 16 errors against 17, and its differences go both ways (the new render loses
+"someone" and gains "invariants"), which is the transcriber flipping on near-identical audio. The
+two renders are 45 dB apart. The resblock graph alone is 87 dB apart — 16-bit rounding — and the
+rest is the layer norm: a 1e-6 difference in ALBERT's output moves F0 by as little, and the sine
+source integrates that into a phase that drifts over a segment without changing how it sounds.
+
+| change | what it was | effect |
+|---|---|---|
+| **One MPSGraph per SnakeResBlock** (`tts_nn::mpsblock`) | each of the six AdaIN-snake-conv steps was a moments pass, an AdaIN pass and an MPSGraph conv with its commit-and-wait. Now the moments over the real samples, the AdaIN and snake, the masking, the convs, biases and residuals of a block are one executable, prewarmed like the convs were | 1.07-1.13× at a chapter's 48k samples, 1.3-2.0× at a sentence's; eight of these per segment |
+| **Graphs in a six-entry LRU** | a graph keeps every run's intermediates, ~90 MB at 128 channels and 48k samples, until it is dropped; with no bound a chapter peaked at 6.65 GB. A segment needs six (the noise blocks share the resblocks' shapes), and three recompiled every segment (RTF 0.053) | +0.14 GB on a chapter's peak |
+| **A two-pass layer norm kernel** | `tts_nn::layer_norm` was the eight-pass composed reference, 108 µs on ALBERT's `[60, 768]`. candle's fused kernel takes the variance in one pass, which cancelled on ALBERT's activations and moved F0 past its gate tolerance (2.7e-3 against 2.0e-3). The kernel takes two passes and sums about the row's first value: 3.9e-6 from an f64 reference where the composed passes are 1.4e-5 | ALBERT 14.0 → 11.3 ms at 60 tokens |
+| **ALBERT's QKV as one projection** | one GEMM, one bias add and one head split for all three instead of three of each; the split copies and broadcast adds cost more than the GEMMs at a sentence's length | 11.3 → 10.1 ms |
+| **Biases broadcast once per forward** | twelve layers share one set of weights, so each bias is broadcast to `[1, t, n]` once and added plainly: a broadcast add is 33 µs at 60 tokens and a plain one 4 | 10.1 → 8.8 ms; 20.4 ms at 190 tokens against 30.7 |
+| **The attention scale in the queries** | 1/√64 is a power of two, so folding it into the query weights is exact and drops a pass | — |
+
+**Next:** ALBERT is now GEMM-bound at a sentence's length — candle's f32 matmul runs at 0.3 TFLOP/s
+for `[60, 768] × [768, 768]` against 2.2 at 190 rows — and the generator's convs are at
+MPSGraph's f32 ceiling. What is left in f32 is small; the larger lever is precision, which this
+pass did not spend.
 
 ### How to measure without fooling yourself
 
@@ -1189,6 +1223,10 @@ rather than let the server run a chapter ahead into memory.
 | **`kokoro`: MPSGraph below 4096 samples** | `TTS_MPS_MIN_LEN=512`, to take the decoder's 1090-channel convs: prosody 23 → 28 ms, decoder no better |
 | **`kokoro`: MPSGraph at `Level0`** | a new length still cost ~3 ms a graph against ~4; compiling ahead is what removed it |
 | **`kokoro`: f16 generator convs through MPSGraph** | 1.12-1.18× over f32 at 128 channels, not enough to spend quality on |
+| **`kokoro`: candle's fused layer norm** | as fast as the kernel that shipped, but its one-pass variance cancels on ALBERT's activations: F0 2.7e-3 from the fixture against a 2.0e-3 tolerance, where the composed passes give 1.3e-3 |
+| **`kokoro`: the resblock graph encoded onto an `MPSCommandBuffer`** | the hope was that intermediates would come from the buffer's heap and be released with it. They grew by the same ~90 MB a length; only dropping the graph frees them |
+| **`kokoro`: draining an autorelease pool around graph runs** | no change to the footprint; the memory is held by the graph, not by autoreleased objects |
+| **`kokoro`: ALBERT's linears as 2-D matmuls** | on the suspicion that `broadcast_matmul` copied the weight per call: no change, it does not |
 
 The one that keeps paying: **candle is 1.70–2.23× slower than torch on this codec**, stable
 across every thermal state, which is what motivated the custom Metal kernels in `tts-nn`.

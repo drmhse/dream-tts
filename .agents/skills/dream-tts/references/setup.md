@@ -43,7 +43,7 @@ Each converts its checkpoint with PyTorch, so they want python >= 3.10 and a tor
 | `qwen3tts` | 6.7 GB | 0.314 | the default: best quality, and the only cloning engine practical for books |
 | `audio8` | 9.7 GB | 0.544 | 44.1 kHz output |
 | `cosyvoice` | 5.0 GB | 0.716 | widest language coverage |
-| `kokoro` | 1.3 GB | 0.038 | fastest and smallest by far, English only, cannot clone: `--set voice=<name>` |
+| `kokoro` | 1.6 GB | 0.036 | fastest and smallest by far, English only, cannot clone: `--set voice=<name>` |
 
 **16 GB for the default engine.** Most of its peak is the codec decoder's activations rather
 than weights — one 300-frame chunk is 5.5 GB — so no weight format moves the floor. Under 16 GB

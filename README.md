@@ -97,7 +97,7 @@ eight in place.
 | `audio8` | 0.527-0.536 | 5m 47s | 11:34 / 10:59 | you want 44.1 kHz, the highest-fidelity output here |
 | `cosyvoice` | 0.703-0.718 | 8m 15s | 12:48 / 11:44 | you want the widest language coverage |
 | `qwen3tts` | **0.104–0.114** | **1m 12s–1m 19s** | 11:35 / — | the default. Best quality here, and the only one of the three cloning engines that makes book-length text practical |
-| `kokoro` | **0.038-0.039** | **28s** | 12:15 / 13:32 | English, no cloning, and you want it now — or you have 2 GB to spend rather than 12 |
+| `kokoro` | **0.034-0.036** | **27s** | 12:15 / 13:32 | English, no cloning, and you want it now — or you have 2 GB to spend rather than 12 |
 
 **Those two bottom rows are the point of the project.** A chapter becomes 11 minutes of
 speech in about 1m 15s with a cloned voice, on a laptop — 9× faster than realtime, so a 16-hour
@@ -119,7 +119,7 @@ by batching across sections, so it wants length — on a 7-segment passage it is
 too.
 
 Short-passage figures, for comparison. `examples/senior.txt`, 132 words: `audio8` 0.544,
-`cosyvoice` 0.716, `qwen3tts` 0.314, `kokoro` 0.038.
+`cosyvoice` 0.716, `qwen3tts` 0.314, `kokoro` 0.036.
 
 ### What it needs to be this fast
 
@@ -142,7 +142,7 @@ What does help a smaller machine is a different engine. Same passage, same measu
 
 | engine | peak footprint | RTF |
 |---|---|---|
-| `kokoro` | **1.3 GB** | 0.038 |
+| `kokoro` | **1.6 GB** | 0.036 |
 | `cosyvoice` | 5.0 GB | 0.716 |
 | `audio8` | 9.7 GB | 0.544 |
 | `qwen3tts` | 6.7 GB | 0.314 |
@@ -286,12 +286,12 @@ whole `qwen3tts` section above is about. Kokoro-82M does not have one. It predic
 for *every phoneme at once*, stretches the encoding to match, and runs a single pass through an
 iSTFTNet decoder. What follows from that is most of what makes it worth having:
 
-- **RTF 0.038, and it does not depend on length.** 12m 15s of speech in 28 seconds, 26×
-  realtime — and 0.038 on a 132-word passage, where `qwen3tts` needs a long document to reach
+- **RTF 0.036, and it does not depend on length.** 12m 15s of speech in 27 seconds, 27×
+  realtime — and 0.036 on a 132-word passage, where `qwen3tts` needs a long document to reach
   about 0.11. There is no batch to fill, so a single sentence runs at the same rate as a chapter:
-  4.5 s of it in 0.5 s from a cold process, 0.16 s from a running server. See
+  4.5 s of it in 0.45 s from a cold process, 0.15 s from a running server. See
   [docs/reference.md](docs/reference.md#kokoro-second-pass-the-per-length-compile-the-recurrences-the-load-path).
-- **1.3 GB of peak footprint**, against 6.7 for the default. 82M parameters and no KV cache.
+- **1.6 GB of peak footprint** on a short passage and 2.0 on a chapter, against 6.7 and 9.2 for the default. 82M parameters and no KV cache.
 - **No sampler, so no length drift.** Two renders of the same text are the same length; the
   only stochastic stage is the decoder's excitation noise, which is seeded.
 - **It cannot clone.** Its voices are 28 style tables of `[510, 256]` shipped inside the
