@@ -18,7 +18,7 @@ pub struct Linear {
 impl Linear {
     pub fn load(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {
-            w: w.get(&format!("{prefix}.weight"))?.t()?.contiguous()?,
+            w: w.get_t(&format!("{prefix}.weight"))?,
             b: w.get_opt(&format!("{prefix}.bias"))?,
         })
     }
@@ -35,75 +35,144 @@ impl Linear {
 /// A same-padded 1-D convolution. Kokoro's kernels are all odd, so the padding is exact
 /// and there is no asymmetric case to get wrong.
 pub struct Conv1d {
-    w: Tensor,
-    /// `[out, k * in]`, the layout `tts_nn`'s im2col GEMM wants. Built once at load.
-    w_tap: Tensor,
+    weight: ConvWeight,
     b: Option<Tensor>,
     padding: usize,
     stride: usize,
     dilation: usize,
-    groups: usize,
     k: usize,
+}
+
+/// One layout per conv, never both: a second copy of every weight was a third of the model.
+enum ConvWeight {
+    /// `[k, in, out]`, for a centred stride-1 conv: MPSGraph's HWIO, and transposed it is the
+    /// `[out, k * in]` the gather GEMM wants.
+    Kio(Tensor),
+    /// candle's `[out, in, k]`, for everything else.
+    Oik(Tensor),
+}
+
+/// `[out, in, k]` to `[k, in, out]` by hand, a tap plane per thread: candle's strided copy
+/// made loading twice as slow.
+fn kio(w: &Tensor) -> Result<Tensor> {
+    let (cout, cin, k) = w.dims3()?;
+    let src: Vec<f32> = w.flatten_all()?.to_vec1()?;
+    let mut dst = vec![0f32; src.len()];
+    std::thread::scope(|sc| {
+        for (j, plane) in dst.chunks_mut(cin * cout).enumerate() {
+            let src = &src;
+            sc.spawn(move || {
+                for i in 0..cin {
+                    for o in 0..cout {
+                        plane[i * cout + o] = src[(o * cin + i) * k + j];
+                    }
+                }
+            });
+        }
+    });
+    Ok(Tensor::from_vec(dst, (k, cin, cout), w.device())?)
 }
 
 impl Conv1d {
     pub fn load(w: &Weights, prefix: &str, stride: usize, dilation: usize) -> Result<Self> {
-        let weight = w.get(&format!("{prefix}.weight"))?;
-        let k = weight.dim(2)?;
+        Self::load_padded(w, prefix, stride, dilation, None)
+    }
+
+    /// `padding` defaults to the same-length one.
+    pub fn load_padded(
+        w: &Weights,
+        prefix: &str,
+        stride: usize,
+        dilation: usize,
+        padding: Option<usize>,
+    ) -> Result<Self> {
+        let host = w
+            .cpu(&format!("{prefix}.weight"))?
+            .to_dtype(candle_core::DType::F32)?;
+        let k = host.dim(2)?;
+        let padding = padding.unwrap_or((k * dilation - dilation) / 2);
+        let centred = padding * 2 == (k - 1) * dilation && stride == 1;
+        // Rearranged on the host: on the device the copy would stay in candle's pool.
+        let weight = if centred {
+            ConvWeight::Kio(kio(&host)?.to_device(w.device())?)
+        } else {
+            ConvWeight::Oik(host.to_device(w.device())?)
+        };
         Ok(Self {
-            w_tap: tts_nn::tap_major_weight(&weight)?,
-            w: weight,
+            weight,
             b: w.get_opt(&format!("{prefix}.bias"))?,
-            padding: (k * dilation - dilation) / 2,
+            padding,
             stride,
             dilation,
-            groups: 1,
             k,
         })
     }
 
-    pub fn with_padding(mut self, padding: usize) -> Self {
-        self.padding = padding;
-        self
-    }
-
-    pub fn with_groups(mut self, groups: usize) -> Self {
-        self.groups = groups;
-        self
-    }
-
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
-        // Centred, stride 1, ungrouped — the shape every convolution in the decoder has,
-        // and the one candle's Metal conv1d is worst at. The centred gather folds
-        // both edge pads, so there is no pre-pad in and no re-centring slice out.
-        let same = self.padding * 2 == (self.k - 1) * self.dilation;
-        if same && self.stride == 1 && self.groups == 1 && x.dim(0)? == 1 {
-            if std::env::var("KOKORO_NO_MPS").is_err() && tts_nn::mpsconv::eligible(x, &self.w) {
-                return tts_nn::mpsconv::centered_conv1d(
+        self.apply_residual(x, None)
+    }
+
+    /// The MPSGraph conv [`Self::apply_residual`] will run at `len`, if any.
+    pub fn mps_spec(&self, len: usize, residual: bool) -> Option<tts_nn::mpsconv::Spec> {
+        let ConvWeight::Kio(kio) = &self.weight else {
+            return None;
+        };
+        if std::env::var("KOKORO_NO_MPS").is_ok()
+            || !tts_nn::mpsconv::eligible_len(kio.device(), len)
+        {
+            return None;
+        }
+        let (k, cin, cout) = kio.dims3().ok()?;
+        Some(tts_nn::mpsconv::Spec {
+            cin,
+            cout,
+            k,
+            dilation: self.dilation,
+            pad_left: self.padding,
+            bias: self.b.is_some(),
+            residual,
+            len,
+        })
+    }
+
+    /// The conv plus `residual`, which the MPSGraph route adds inside its graph.
+    pub fn apply_residual(&self, x: &Tensor, residual: Option<&Tensor>) -> Result<Tensor> {
+        let add = |y: Tensor| -> Result<Tensor> {
+            Ok(match residual {
+                Some(r) => (y + r)?,
+                None => y,
+            })
+        };
+        let w = match &self.weight {
+            // Centred, stride 1 — the shape every convolution in the decoder has, and the one
+            // candle's Metal conv1d is worst at. The centred gather folds both edge pads, so
+            // there is no pre-pad in and no re-centring slice out.
+            ConvWeight::Kio(kio) if x.dim(0)? == 1 => {
+                if std::env::var("KOKORO_NO_MPS").is_err() && tts_nn::mpsconv::eligible(x, kio) {
+                    return tts_nn::mpsconv::centered_conv1d_residual(
+                        x,
+                        kio,
+                        self.b.as_ref(),
+                        self.dilation,
+                        self.padding,
+                        residual,
+                    );
+                }
+                let (_, cin, cout) = kio.dims3()?;
+                return add(tts_nn::centered_conv1d_gemm(
                     x,
-                    &self.w,
+                    &kio.reshape((self.k * cin, cout))?.t()?,
                     self.b.as_ref(),
+                    self.k,
                     self.dilation,
                     self.padding,
-                );
+                )?);
             }
-            return tts_nn::centered_conv1d_gemm(
-                x,
-                &self.w_tap,
-                self.b.as_ref(),
-                self.k,
-                self.dilation,
-                self.padding,
-            );
-        }
-        let y = x.conv1d(
-            &self.w,
-            self.padding,
-            self.stride,
-            self.dilation,
-            self.groups,
-        )?;
-        Ok(match &self.b {
+            ConvWeight::Kio(kio) => kio.permute((2, 1, 0))?.contiguous()?,
+            ConvWeight::Oik(w) => w.clone(),
+        };
+        let y = x.conv1d(&w, self.padding, self.stride, self.dilation, 1)?;
+        add(match &self.b {
             Some(b) => y.broadcast_add(&b.reshape((1, b.dim(0)?, 1))?)?,
             None => y,
         })
@@ -130,6 +199,14 @@ impl ConvTranspose1d {
 
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
         self.up.apply(x)
+    }
+
+    pub fn stride(&self) -> usize {
+        self.up.stride()
+    }
+
+    pub fn mps_spec(&self, l_in: usize) -> Option<tts_nn::mpsconv::Spec> {
+        self.up.mps_spec(l_in)
     }
 }
 

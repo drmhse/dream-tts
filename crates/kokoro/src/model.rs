@@ -151,6 +151,10 @@ impl Model {
 
         let d = self.predictor.text_encoder.forward(&d_en, &s_pred)?;
         let durations = self.predictor.durations(&d, speed)?;
+        // The decoder's last block doubles the frame rate before the generator.
+        self.decoder
+            .generator
+            .prewarm(2 * durations.iter().sum::<usize>(), &self.device);
         lap("duration", &mut timings, &mut mark, &self.device)?;
 
         let aln = Predictor::alignment(&durations, &self.device)?;

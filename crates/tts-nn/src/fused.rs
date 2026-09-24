@@ -1101,6 +1101,7 @@ pub fn adain_apply(
 struct Moments {
     channels: usize,
     len: usize,
+    valid: usize,
 }
 
 impl CustomOp1 for Moments {
@@ -1119,15 +1120,15 @@ impl CustomOp1 for Moments {
         let o = l.start_offset();
         let mut dst = vec![0f32; 2 * self.channels];
         for c in 0..self.channels {
-            let row = &x[o + c * self.len..o + (c + 1) * self.len];
+            let row = &x[o + c * self.len..o + c * self.len + self.valid];
             let (mut sum, mut sq) = (0f32, 0f32);
             for v in row {
                 sum += v;
                 sq += v * v;
             }
-            let mean = sum / self.len as f32;
+            let mean = sum / self.valid as f32;
             dst[c] = mean;
-            dst[self.channels + c] = (sq / self.len as f32 - mean * mean).max(0.0);
+            dst[self.channels + c] = (sq / self.valid as f32 - mean * mean).max(0.0);
         }
         Ok((CpuStorage::F32(dst), (2, self.channels).into()))
     }
@@ -1159,6 +1160,7 @@ impl CustomOp1 for Moments {
         encoder.set_buffer(1, Some(dst.as_ref()), 0);
         encoder.set_bytes(2, &(self.len as u32));
         encoder.set_bytes(3, &(self.channels as u32));
+        encoder.set_bytes(4, &(self.valid as u32));
         encoder.use_resource(s.buffer(), MTLResourceUsage::Read);
         encoder.use_resource(dst.as_ref(), MTLResourceUsage::Write);
         // One threadgroup per channel: grid width equals the group width, so the
@@ -1190,12 +1192,204 @@ impl CustomOp1 for Moments {
 /// Replaces `mean_keepdim` + [`sub_sqr`] + `mean_keepdim`, which is three passes over the
 /// signal and one full-size intermediate.
 pub fn moments(x: &Tensor) -> Result<Tensor> {
+    moments_valid(x, x.dim(2)?)
+}
+
+/// [`moments`] over the first `valid` samples only.
+pub fn moments_valid(x: &Tensor, valid: usize) -> Result<Tensor> {
     let (b, c, len) = x.dims3()?;
     if b != 1 {
         candle_core::bail!("channel_moments: batch must be 1, got {b}");
     }
-    x.contiguous()?
-        .apply_op1_no_bwd(&Moments { channels: c, len })
+    if valid == 0 || valid > len {
+        candle_core::bail!("channel_moments: {valid} valid of {len}");
+    }
+    x.contiguous()?.apply_op1_no_bwd(&Moments {
+        channels: c,
+        len,
+        valid,
+    })
+}
+
+/// Buffer and byte offset of a device tensor an op reads beside its input.
+#[cfg(feature = "metal")]
+fn operand(t: &Tensor) -> Result<(candle_metal_kernels::metal::Buffer, usize)> {
+    let (s, l) = t.storage_and_layout();
+    if !l.is_contiguous() {
+        candle_core::bail!("operand must be contiguous");
+    }
+    match &*s {
+        candle_core::Storage::Metal(m) => Ok((m.buffer().clone(), l.start_offset() * 4)),
+        _ => candle_core::bail!("operand must be on the device"),
+    }
+}
+
+/// [`adain_snake`] on a padded signal: moments `[2, C]`, the style's `[2, C]` (gamma, beta)
+/// and the learned `[2, C]` (alpha, 1/beta) as they are, and zeros past `valid`.
+struct AdainSnakeMasked {
+    gb: Tensor,
+    ab: Tensor,
+    valid: usize,
+    eps: f32,
+}
+
+impl candle_core::CustomOp2 for AdainSnakeMasked {
+    fn name(&self) -> &'static str {
+        "adain_snake_masked"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("adain_snake_masked: Metal only")
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &candle_core::MetalStorage,
+        l1: &Layout,
+        s2: &candle_core::MetalStorage,
+        l2: &Layout,
+    ) -> Result<(candle_core::MetalStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::{DType, MetalStorage};
+        use objc2_metal::{MTLResourceUsage, MTLSize};
+
+        let (_, c, len) = l1.shape().dims3()?;
+        let (gb, ab) = (operand(&self.gb)?, operand(&self.ab)?);
+        let device = s1.device();
+        let p = mtl::pipeline(device, "adain_snake_masked_f32")?;
+        let dst = device.new_buffer(c * len, DType::F32, "adain_snake_masked")?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("tts_nn::adain_snake_masked");
+        encoder.set_compute_pipeline_state(&p);
+        encoder.set_buffer(0, Some(s1.buffer()), l1.start_offset() * 4);
+        encoder.set_buffer(1, Some(s2.buffer()), l2.start_offset() * 4);
+        encoder.set_buffer(2, Some(&gb.0), gb.1);
+        encoder.set_buffer(3, Some(&ab.0), ab.1);
+        encoder.set_buffer(4, Some(dst.as_ref()), 0);
+        encoder.set_bytes(5, &(len as u32));
+        encoder.set_bytes(6, &(c as u32));
+        encoder.set_bytes(7, &(self.valid as u32));
+        encoder.set_bytes(8, &self.eps);
+        for r in [s1.buffer(), s2.buffer(), &gb.0, &ab.0] {
+            encoder.use_resource(r, MTLResourceUsage::Read);
+        }
+        encoder.use_resource(dst.as_ref(), MTLResourceUsage::Write);
+        let w = mtl::group_width(&p, len);
+        encoder.dispatch_threads(
+            MTLSize {
+                width: len,
+                height: c,
+                depth: 1,
+            },
+            MTLSize {
+                width: w,
+                height: 1,
+                depth: 1,
+            },
+        );
+        drop(encoder);
+        Ok((
+            MetalStorage::new(dst, device.clone(), c * len, DType::F32),
+            (1, c, len).into(),
+        ))
+    }
+}
+
+/// AdaIN then SnakeBeta over the first `valid` samples of `x` `[1, C, len]`, zeros after.
+/// `gb` is the style's `[2, C]` (gamma, beta), `ab` the learned `[2, C]` (alpha, 1/beta);
+/// both may be views.
+pub fn adain_snake_masked(
+    x: &Tensor,
+    gb: &Tensor,
+    ab: &Tensor,
+    eps: f64,
+    valid: usize,
+) -> Result<Tensor> {
+    let m = moments_valid(x, valid)?;
+    x.contiguous()?.apply_op2_no_bwd(
+        &m,
+        &AdainSnakeMasked {
+            gb: gb.clone(),
+            ab: ab.clone(),
+            valid,
+            eps: eps as f32,
+        },
+    )
+}
+
+/// `max(x, slope * x)` over the first `valid` samples of `[1, C, len]`, zeros after.
+struct LeakyMasked {
+    valid: usize,
+    slope: f32,
+}
+
+impl CustomOp1 for LeakyMasked {
+    fn name(&self) -> &'static str {
+        "leaky_masked"
+    }
+
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("leaky_masked: Metal only")
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s: &candle_core::MetalStorage,
+        l: &Layout,
+    ) -> Result<(candle_core::MetalStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::{DType, MetalStorage};
+        use objc2_metal::{MTLResourceUsage, MTLSize};
+
+        let (_, c, len) = l.shape().dims3()?;
+        let device = s.device();
+        let p = mtl::pipeline(device, "leaky_masked_f32")?;
+        let dst = device.new_buffer(c * len, DType::F32, "leaky_masked")?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("tts_nn::leaky_masked");
+        encoder.set_compute_pipeline_state(&p);
+        encoder.set_buffer(0, Some(s.buffer()), l.start_offset() * 4);
+        encoder.set_buffer(1, Some(dst.as_ref()), 0);
+        encoder.set_bytes(2, &(len as u32));
+        encoder.set_bytes(3, &(self.valid as u32));
+        encoder.set_bytes(4, &self.slope);
+        encoder.use_resource(s.buffer(), MTLResourceUsage::Read);
+        encoder.use_resource(dst.as_ref(), MTLResourceUsage::Write);
+        let w = mtl::group_width(&p, len);
+        encoder.dispatch_threads(
+            MTLSize {
+                width: len,
+                height: c,
+                depth: 1,
+            },
+            MTLSize {
+                width: w,
+                height: 1,
+                depth: 1,
+            },
+        );
+        drop(encoder);
+        Ok((
+            MetalStorage::new(dst, device.clone(), c * len, DType::F32),
+            (1, c, len).into(),
+        ))
+    }
+}
+
+/// Leaky ReLU over the first `valid` samples, zeros after, in one pass.
+pub fn leaky_masked(x: &Tensor, slope: f64, valid: usize) -> Result<Tensor> {
+    x.contiguous()?.apply_op1_no_bwd(&LeakyMasked {
+        valid,
+        slope: slope as f32,
+    })
 }
 
 /// [`adain_apply`] with SnakeBeta folded into its epilogue.
@@ -1460,6 +1654,126 @@ pub fn lstm_gates(gates: &Tensor, pre: &Tensor, c: &Tensor) -> Result<Tensor> {
     )
 }
 
+/// Hidden units per threadgroup in `lstm_step_f32`, a simdgroup each.
+const LSTM_UNITS: usize = 8;
+
+/// Both directions of a single-layer LSTM over a whole sequence, in one encoder.
+struct LstmSeq {
+    w_f: Tensor,
+    w_b: Tensor,
+    hidden: usize,
+}
+
+impl candle_core::CustomOp2 for LstmSeq {
+    fn name(&self) -> &'static str {
+        "lstm_seq"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("lstm_seq: Metal only")
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &candle_core::MetalStorage,
+        l1: &Layout,
+        s2: &candle_core::MetalStorage,
+        l2: &Layout,
+    ) -> Result<(candle_core::MetalStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::{DType, MetalStorage, Storage};
+        use objc2_metal::{MTLResourceUsage, MTLSize};
+
+        let buf = |t: &Tensor| -> Result<_> {
+            let (s, l) = t.storage_and_layout();
+            match &*s {
+                Storage::Metal(m) => Ok((m.buffer().clone(), l.start_offset() * 4)),
+                _ => candle_core::bail!("lstm_seq: weights must be on the device"),
+            }
+        };
+        let steps = l1.shape().dims2()?.0;
+        let h = self.hidden;
+        let device = s1.device();
+        let p = mtl::pipeline(device, "lstm_step_f32")?;
+        let dst = device.new_buffer(steps * 2 * h, DType::F32, "lstm_seq")?;
+        let cell = device.new_buffer(2 * h, DType::F32, "lstm_seq cell")?;
+        let (wf, wb) = (buf(&self.w_f)?, buf(&self.w_b)?);
+
+        let encoder = device.command_encoder()?;
+        encoder.set_label("tts_nn::lstm_seq");
+        encoder.set_compute_pipeline_state(&p);
+        encoder.set_buffer(0, Some(s1.buffer()), l1.start_offset() * 4);
+        encoder.set_buffer(1, Some(s2.buffer()), l2.start_offset() * 4);
+        encoder.set_buffer(2, Some(&wf.0), wf.1);
+        encoder.set_buffer(3, Some(&wb.0), wb.1);
+        encoder.set_buffer(4, Some(dst.as_ref()), 0);
+        encoder.set_buffer(5, Some(cell.as_ref()), 0);
+        encoder.set_bytes(6, &(steps as u32));
+        encoder.set_bytes(7, &(h as u32));
+        for r in [s1.buffer(), s2.buffer(), &wf.0, &wb.0] {
+            encoder.use_resource(r, MTLResourceUsage::Read);
+        }
+        encoder.use_resource(dst.as_ref(), MTLResourceUsage::Write);
+        encoder.use_resource(cell.as_ref(), MTLResourceUsage::Write);
+        for step in 0..steps {
+            encoder.set_bytes(8, &(step as u32));
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: h.div_ceil(LSTM_UNITS),
+                    height: 2,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 32 * LSTM_UNITS,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        drop(encoder);
+
+        Ok((
+            MetalStorage::new(dst, device.clone(), steps * 2 * h, DType::F32),
+            (steps, 2 * h).into(),
+        ))
+    }
+}
+
+/// Whether [`lstm_seq`] can run: Metal and f32.
+pub fn lstm_seq_eligible(pre: &Tensor) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TTS_NN_LSTM_SEQ").as_deref() != Ok("0"))
+        && pre.device().is_metal()
+        && pre.dtype() == candle_core::DType::F32
+}
+
+/// A bidirectional LSTM's recurrence. `pre_*` are the input projections `[T, 4H]` with both
+/// biases folded in, `w_hh_*` the recurrent weights in torch's `[4H, H]`. Returns `[T, 2H]`,
+/// forward then backward, each at its own timestep.
+pub fn lstm_seq(
+    pre_f: &Tensor,
+    pre_b: &Tensor,
+    w_hh_f: &Tensor,
+    w_hh_b: &Tensor,
+) -> Result<Tensor> {
+    let hidden = w_hh_f.dim(1)?;
+    pre_f.contiguous()?.apply_op2_no_bwd(
+        &pre_b.contiguous()?,
+        &LstmSeq {
+            w_f: w_hh_f.contiguous()?,
+            w_b: w_hh_b.contiguous()?,
+            hidden,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1508,6 +1822,144 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// A padded signal through the masked kernels gives the unpadded result on its real
+    /// samples, and exact zeros after them — the property the padded generator rests on.
+    #[test]
+    fn masked_kernels_match_the_unpadded_signal() -> anyhow::Result<()> {
+        #[cfg(feature = "metal")]
+        let _gpu = crate::gpu_guard();
+        let Some(d) = crate::usable_metal() else {
+            return Ok(());
+        };
+        let (c, valid, len) = (64usize, 3001usize, 3456usize);
+        let real = Tensor::randn(0f32, 1., (1, c, valid), &d)?;
+        let padded = Tensor::cat(
+            &[&real, &Tensor::randn(0f32, 5., (1, c, len - valid), &d)?],
+            2,
+        )?;
+        let gb = Tensor::randn(0f32, 0.5, (2, c), &d)?;
+        let alpha = Tensor::rand(0.5f32, 1.5, c, &d)?;
+        let ab = Tensor::stack(&[&alpha, &alpha.recip()?], 0)?;
+
+        let m = moments(&real)?;
+        let (_, rel) = crate::abs_and_rel(&moments_valid(&padded, valid)?, &m)?;
+        assert!(rel < 1e-6, "moments over the valid part: rel {rel:.3e}");
+
+        let want = adain_snake(
+            &real,
+            &m.get(0)?,
+            &m.get(1)?,
+            &gb.get(0)?,
+            &gb.get(1)?,
+            &ab.get(0)?,
+            &ab.get(1)?,
+            1e-5,
+        )?;
+        let got = adain_snake_masked(&padded, &gb, &ab, 1e-5, valid)?;
+        let (_, rel) = crate::abs_and_rel(&got.narrow(2, 0, valid)?, &want)?;
+        assert!(
+            rel < 1e-6,
+            "adain_snake_masked on the valid part: rel {rel:.3e}"
+        );
+        let tail = got
+            .narrow(2, valid, len - valid)?
+            .abs()?
+            .sum_all()?
+            .to_scalar::<f32>()?;
+        assert_eq!(tail, 0.0, "adain_snake_masked left the tail nonzero");
+
+        let got = leaky_masked(&padded, 0.1, valid)?;
+        let (_, rel) =
+            crate::abs_and_rel(&got.narrow(2, 0, valid)?, &crate::leaky_relu(&real, 0.1)?)?;
+        assert!(rel < 1e-7, "leaky_masked on the valid part: rel {rel:.3e}");
+        let tail = got
+            .narrow(2, valid, len - valid)?
+            .abs()?
+            .sum_all()?
+            .to_scalar::<f32>()?;
+        assert_eq!(tail, 0.0, "leaky_masked left the tail nonzero");
+        Ok(())
+    }
+
+    /// The whole-sequence kernel against a double-precision host recurrence, over as many steps
+    /// as a long segment's prosody LSTM runs, next to the step path's error on the same input.
+    /// It must be no less accurate: see the fast-math trap below.
+    #[test]
+    fn lstm_seq_tracks_double_precision_over_a_long_sequence() -> anyhow::Result<()> {
+        #[cfg(feature = "metal")]
+        let _gpu = crate::gpu_guard();
+        let Some(d) = crate::usable_metal() else {
+            return Ok(());
+        };
+        let (h, t) = (256usize, 1200usize);
+        let g = 4 * h;
+        let mut state = 7u64;
+        let mut draw = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((state >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * scale
+                })
+                .collect()
+        };
+        let pre: Vec<Vec<f32>> = (0..2).map(|_| draw(t * g, 2.0)).collect();
+        let w: Vec<Vec<f32>> = (0..2).map(|_| draw(h * g, 0.15)).collect();
+
+        let sig = |v: f64| 1.0 / (1.0 + (-v).exp());
+        let mut want = vec![0f64; t * 2 * h];
+        for dir in 0..2 {
+            let (mut hs, mut cs) = (vec![0f64; h], vec![0f64; h]);
+            for s in 0..t {
+                let ts = if dir == 0 { s } else { t - 1 - s };
+                let mut gate = vec![0f64; g];
+                for (r, gv) in gate.iter_mut().enumerate() {
+                    let dot: f64 = (0..h).map(|k| hs[k] * w[dir][k * g + r] as f64).sum();
+                    *gv = dot + pre[dir][ts * g + r] as f64;
+                }
+                for u in 0..h {
+                    cs[u] = sig(gate[h + u]) * cs[u] + sig(gate[u]) * gate[2 * h + u].tanh();
+                    hs[u] = sig(gate[3 * h + u]) * cs[u].tanh();
+                    want[ts * 2 * h + dir * h + u] = hs[u];
+                }
+            }
+        }
+        let err = |got: &[f32]| -> f64 {
+            got.iter()
+                .zip(&want)
+                .map(|(a, b)| (*a as f64 - b).abs())
+                .fold(0.0, f64::max)
+        };
+
+        let tensor = |v: &[f32], dims: (usize, usize)| Tensor::from_slice(v, dims, &d);
+        let (pf, pb) = (tensor(&pre[0], (t, g))?, tensor(&pre[1], (t, g))?);
+        let (wf, wb) = (tensor(&w[0], (h, g))?, tensor(&w[1], (h, g))?);
+        let (wft, wbt) = (wf.t()?.contiguous()?, wb.t()?.contiguous()?);
+        let seq = lstm_seq(&pf, &pb, &wft, &wbt)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+
+        let mut step = vec![0f32; t * 2 * h];
+        for (dir, (p, wh)) in [(&pf, &wf), (&pb, &wb)].into_iter().enumerate() {
+            let mut hc = Tensor::zeros((2, h), candle_core::DType::F32, &d)?;
+            for s in 0..t {
+                let ts = if dir == 0 { s } else { t - 1 - s };
+                let hrow = hc.narrow(0, 0, 1)?.contiguous()?;
+                let crow = hc.narrow(0, 1, 1)?.contiguous()?;
+                hc = lstm_gates(&hrow.matmul(wh)?, &p.narrow(0, ts, 1)?, &crow)?;
+                let row = hc.narrow(0, 0, 1)?.flatten_all()?.to_vec1::<f32>()?;
+                step[ts * 2 * h + dir * h..ts * 2 * h + dir * h + h].copy_from_slice(&row);
+            }
+        }
+        let (e_seq, e_step) = (err(&seq), err(&step));
+        assert!(
+            e_seq <= e_step * 1.5 + 1e-6,
+            "sequence kernel {e_seq:.3e} against the step path's {e_step:.3e}"
+        );
         Ok(())
     }
 

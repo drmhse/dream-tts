@@ -466,6 +466,11 @@ impl G2P {
         (phonemes, unknown)
     }
 
+    /// The phonemes, the unpronounceable words and the spans, from one pass.
+    pub fn phonemize_all(&self, text: &str) -> (String, Vec<String>, Vec<WordSpan>) {
+        self.run(text, true)
+    }
+
     fn run(&self, text: &str, derive_unknown: bool) -> (String, Vec<String>, Vec<WordSpan>) {
         let mut unknown: Vec<String> = Vec::new();
         let mut words = self.retokenize(self.tokenize(text.trim_start()));

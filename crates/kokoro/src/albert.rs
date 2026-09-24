@@ -18,7 +18,7 @@ impl Linear {
     fn load(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {
             // Transposed once at load: every call is x @ wᵀ.
-            w: w.get(&format!("{prefix}.weight"))?.t()?.contiguous()?,
+            w: w.get_t(&format!("{prefix}.weight"))?,
             b: w.get(&format!("{prefix}.bias"))?,
         })
     }

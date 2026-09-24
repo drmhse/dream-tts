@@ -34,6 +34,19 @@ const MAX_CHARS: usize = 400;
 /// Samples per predictor frame: the two upsamples and the iSTFT hop.
 const HOP: usize = 300;
 
+/// Footprint and Metal allocation, under `KOKORO_TIMING`.
+fn mem_line(when: &str, device: &Device) {
+    if std::env::var("KOKORO_TIMING").is_err() {
+        return;
+    }
+    let gb = |b: Option<u64>| b.map_or("?".into(), |b| format!("{:.2} GB", b as f64 / 1e9));
+    eprintln!(
+        "engine {ID}: {when}: footprint {}, Metal allocated {}",
+        gb(tts_core::system::footprint()),
+        gb(tts_nn::allocated_bytes(device)),
+    );
+}
+
 pub struct KokoroEngine {
     model: Model,
     voices: Voices,
@@ -90,6 +103,7 @@ impl KokoroEngine {
             voices.names().join(", ")
         );
         let g2p = tts_phoneme::g2p::G2P::load(&config.path("frontend", "frontend"), british)?;
+        mem_line("loaded", &device);
         Ok(Self {
             model,
             voices,
@@ -137,49 +151,63 @@ impl Engine for KokoroEngine {
         let mut piece_words: Vec<Vec<WordTime>> = Vec::new();
         let t0 = Instant::now();
 
-        for (k, (pi, segment)) in flat.iter().enumerate() {
-            let (phonemes, mut oov) = self.g2p.phonemize_report(segment);
-            unknown.append(&mut oov);
-            let (_, spans) = self.g2p.phonemize_spans(segment);
-            let (ids, offsets) = self.model.cfg.encode_spans(&phonemes);
-            anyhow::ensure!(
-                ids.len() <= MAX_TOKENS,
-                "segment {k} is {} tokens, over the {MAX_TOKENS} the position table holds; \
-                 lower --max-chars",
-                ids.len()
-            );
-            if ids.len() <= 2 {
-                continue;
-            }
-            let style = self.voices.style(&self.voice, ids.len() - 2)?;
-            let (samples, timings, durations) = self
-                .model
-                .synthesize_aligned(&ids, &style, 1.0, &mut draws)?;
-            for (stage, secs) in timings {
-                stats.add(stage, secs);
-            }
-            stats.frames += samples.len() / HOP;
-            stats.segments += 1;
-            // Seconds per predictor frame, taken from the audio this render actually produced
-            // rather than from a constant. The decoder's upsampling is a property of the
-            // checkpoint, and a constant that is right for one and wrong for another would
-            // compress the whole clock silently — which is exactly what a wrong `HOP` did.
-            let frames: usize = durations.iter().sum();
-            let per_frame = if frames == 0 {
-                0.0
-            } else {
-                samples.len() as f64 / frames as f64 / Config::SAMPLE_RATE as f64
-            };
-            piece_words.push(word_times(&spans, &offsets, &durations, per_frame));
-            pieces.push(tts_core::Piece {
-                paragraph: *pi,
-                text: (*segment).clone(),
-                samples,
+        // The frontend runs a segment ahead on another thread, so the GPU never waits on it.
+        let (g2p, segments) = (&self.g2p, &flat);
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        std::thread::scope(|sc| -> Result<()> {
+            sc.spawn(move || {
+                for (_, segment) in segments {
+                    if tx.send(g2p.phonemize_all(segment)).is_err() {
+                        break;
+                    }
+                }
             });
-            request.advanced("decoder", k + 1, flat.len());
-            request.check_interrupt(k + 1)?;
-        }
+            for (k, (pi, segment)) in flat.iter().enumerate() {
+                let (phonemes, mut oov, spans) =
+                    rx.recv().context("the frontend thread stopped")?;
+                unknown.append(&mut oov);
+                let (ids, offsets) = self.model.cfg.encode_spans(&phonemes);
+                anyhow::ensure!(
+                    ids.len() <= MAX_TOKENS,
+                    "segment {k} is {} tokens, over the {MAX_TOKENS} the position table holds; \
+                 lower --max-chars",
+                    ids.len()
+                );
+                if ids.len() <= 2 {
+                    continue;
+                }
+                let style = self.voices.style(&self.voice, ids.len() - 2)?;
+                let (samples, timings, durations) = self
+                    .model
+                    .synthesize_aligned(&ids, &style, 1.0, &mut draws)?;
+                for (stage, secs) in timings {
+                    stats.add(stage, secs);
+                }
+                stats.frames += samples.len() / HOP;
+                stats.segments += 1;
+                // Seconds per predictor frame, taken from the audio this render actually produced
+                // rather than from a constant. The decoder's upsampling is a property of the
+                // checkpoint, and a constant that is right for one and wrong for another would
+                // compress the whole clock silently — which is exactly what a wrong `HOP` did.
+                let frames: usize = durations.iter().sum();
+                let per_frame = if frames == 0 {
+                    0.0
+                } else {
+                    samples.len() as f64 / frames as f64 / Config::SAMPLE_RATE as f64
+                };
+                piece_words.push(word_times(&spans, &offsets, &durations, per_frame));
+                pieces.push(tts_core::Piece {
+                    paragraph: *pi,
+                    text: (*segment).clone(),
+                    samples,
+                });
+                request.advanced("decoder", k + 1, flat.len());
+                request.check_interrupt(k + 1)?;
+            }
+            Ok(())
+        })?;
         stats.total_s = t0.elapsed().as_secs_f64();
+        mem_line("after synthesis", self.model.device());
 
         if !unknown.is_empty() {
             unknown.sort_unstable();

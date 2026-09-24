@@ -164,6 +164,11 @@ impl Weights {
             .to_device(&self.device)?)
     }
 
+    /// A 2-D weight transposed to `[in, out]`, f32, transposed on the host; see [`Self::get`].
+    pub fn get_t(&self, name: &str) -> Result<Tensor> {
+        host_layout(&self.cpu(name)?, DType::F32, &self.device)
+    }
+
     /// The tensor on the host in its on-disk dtype, for load-time work that should not
     /// allocate on the device; see [`Self::get`].
     pub fn cpu(&self, name: &str) -> Result<Tensor> {
@@ -990,6 +995,10 @@ pub fn elu(x: &Tensor) -> Result<Tensor> {
 
 /// `max(x, slope * x)`.
 pub fn leaky_relu(x: &Tensor, slope: f64) -> Result<Tensor> {
+    // One pass on the device rather than four; the values are identical.
+    if x.device().is_metal() && x.dtype() == DType::F32 && x.rank() == 3 && x.dim(0)? == 1 {
+        return Ok(fused::leaky_masked(x, slope, x.dim(2)?)?);
+    }
     let pos = x.relu()?;
     let neg = (x - &pos)?; // min(x, 0)
     Ok((pos + (neg * slope)?)?)
@@ -1130,6 +1139,18 @@ pub fn abs_and_rel(a: &Tensor, b: &Tensor) -> Result<(f32, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tiled transpose against candle's own, at shapes that are not multiples of a tile.
+    #[test]
+    fn host_transpose_matches_candle() -> anyhow::Result<()> {
+        for (r, c) in [(1usize, 1usize), (3, 130), (257, 65), (1024, 640)] {
+            let t = Tensor::randn(0f32, 1., (r, c), &Device::Cpu)?;
+            let want = t.t()?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let got = transpose(&t.flatten_all()?.to_vec1::<f32>()?, r, c);
+            assert_eq!(got, want, "{r}x{c}");
+        }
+        Ok(())
+    }
 
     /// The centred GEMM route against candle's same-padded conv, on every
     /// available device and at the generator's shapes. CPU exercises the
@@ -1283,11 +1304,51 @@ mod tests {
 /// `[out, in]` as `[in, out]` in `dtype` on `device`, the cast and transpose done on the host
 /// so the device sees a single exact upload; see [`Weights::get`].
 fn host_layout(t: &Tensor, dtype: DType, device: &Device) -> Result<Tensor> {
-    Ok(t.to_device(&Device::Cpu)?
-        .to_dtype(dtype)?
-        .t()?
-        .contiguous()?
-        .to_device(device)?)
+    let t = t.to_device(&Device::Cpu)?.to_dtype(dtype)?;
+    let (rows, cols) = t.dims2()?;
+    let out = match dtype {
+        DType::F32 => Tensor::from_vec(
+            transpose(&t.flatten_all()?.to_vec1::<f32>()?, rows, cols),
+            (cols, rows),
+            &Device::Cpu,
+        )?,
+        DType::F16 => Tensor::from_vec(
+            transpose(&t.flatten_all()?.to_vec1::<half::f16>()?, rows, cols),
+            (cols, rows),
+            &Device::Cpu,
+        )?,
+        _ => t.t()?.contiguous()?,
+    };
+    Ok(out.to_device(device)?)
+}
+
+/// `[rows, cols]` to `[cols, rows]` in 64-square tiles, a band of output rows per thread.
+/// candle's strided copy of a transposed view was most of a checkpoint's load time.
+fn transpose<T: Copy + Default + Send + Sync>(src: &[T], rows: usize, cols: usize) -> Vec<T> {
+    const TILE: usize = 64;
+    let mut dst = vec![T::default(); src.len()];
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(8);
+    let band = cols.div_ceil(threads).div_ceil(TILE).max(1) * TILE;
+    std::thread::scope(|sc| {
+        for (b, out) in dst.chunks_mut(band * rows).enumerate() {
+            sc.spawn(move || {
+                let c0 = b * band;
+                let c1 = (c0 + band).min(cols);
+                for rt in (0..rows).step_by(TILE) {
+                    for ct in (c0..c1).step_by(TILE) {
+                        for c in ct..(ct + TILE).min(c1) {
+                            for r in rt..(rt + TILE).min(rows) {
+                                out[(c - c0) * rows + r] = src[r * cols + c];
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    dst
 }
 
 /// Bytes the Metal device has allocated for this process, pool included; `None` off Metal.

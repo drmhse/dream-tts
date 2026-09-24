@@ -246,11 +246,15 @@ kernel void adain_apply_f32(
 // Squares are accumulated raw rather than by Welford. Every input here is a convolution
 // output whose mean is small against its spread, so the cancellation Welford defends
 // against does not arise; `moments_match_composed` bounds what it costs.
+//
+// Only the first `valid` samples of each row count: a signal padded to a length bucket keeps
+// its statistics.
 kernel void channel_moments_f32(
     device const float *src  [[buffer(0)]],
     device float       *dst  [[buffer(1)]],
     constant uint      &len  [[buffer(2)]],
     constant uint      &chn  [[buffer(3)]],
+    constant uint      &valid [[buffer(4)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tid3 [[thread_position_in_threadgroup]],
     uint3 ntid3 [[threads_per_threadgroup]],
@@ -267,7 +271,7 @@ kernel void channel_moments_f32(
     device const float *row = src + (ulong)c * len;
     float s = 0.0f;
     float q = 0.0f;
-    for (uint i = tid; i < len; i += ntid) {
+    for (uint i = tid; i < valid; i += ntid) {
         const float v = row[i];
         s += v;
         q += v * v;
@@ -280,9 +284,9 @@ kernel void channel_moments_f32(
     s = simd_sum(slid < nsg ? psum[slid] : 0.0f);
     q = simd_sum(slid < nsg ? psq[slid] : 0.0f);
     if (slid != 0) { return; }
-    const float m = s / (float)len;
+    const float m = s / (float)valid;
     dst[c] = m;
-    dst[chn + c] = max(q / (float)len - m * m, 0.0f);
+    dst[chn + c] = max(q / (float)valid - m * m, 0.0f);
 }
 
 // AdaIN's tail and SnakeBeta in one pass: the two always appear together in the
@@ -493,6 +497,52 @@ kernel void conv1d_tap_reg_f32(
     }
 }
 
+// ---- padded-length variants ------------------------------------------------------
+//
+// A signal padded to a length bucket, so MPSGraph meets a length it has already specialised
+// for, stays exact if every convolution reads zeros past the true length: these write them.
+
+// adain_snake_f32 with its parameters unpacked — moments, the style's (gamma, beta) and the
+// learned (alpha, 1/beta) are three buffers, so nothing is stacked per call — and zeros past
+// `valid`.
+kernel void adain_snake_masked_f32(
+    device const float *src   [[buffer(0)]],
+    device const float *mom   [[buffer(1)]],
+    device const float *gb    [[buffer(2)]],
+    device const float *ab    [[buffer(3)]],
+    device float       *dst   [[buffer(4)]],
+    constant uint      &len   [[buffer(5)]],
+    constant uint      &chn   [[buffer(6)]],
+    constant uint      &valid [[buffer(7)]],
+    constant float     &eps   [[buffer(8)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint l = gid.x;
+    if (l >= len) { return; }
+    const uint c = gid.y;
+    const uint i = c * len + l;
+    if (l >= valid) { dst[i] = 0.0f; return; }
+    const float y = (src[i] - mom[c]) * rsqrt(mom[chn + c] + eps) * (gb[c] + 1.0f) + gb[chn + c];
+    const float sn = sin(ab[c] * y);
+    dst[i] = y + ab[chn + c] * sn * sn;
+}
+
+// max(x, slope * x), and zeros past `valid`.
+kernel void leaky_masked_f32(
+    device const float *src   [[buffer(0)]],
+    device float       *dst   [[buffer(1)]],
+    constant uint      &len   [[buffer(2)]],
+    constant uint      &valid [[buffer(3)]],
+    constant float     &slope [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint l = gid.x;
+    if (l >= len) { return; }
+    const uint i = gid.y * len + l;
+    const float v = src[i];
+    dst[i] = l < valid ? (v > 0.0f ? v : v * slope) : 0.0f;
+}
+
 // ---- LSTM gates ----------------------------------------------------------------
 //
 // The whole of an LSTM step except its two matmuls. candle spends eleven dispatches per
@@ -527,6 +577,58 @@ kernel void lstm_gates_f32(
     const float ct = ft * c_in[gid] + it * metal::precise::tanh(gg);
     dst[h + gid] = ct;
     dst[gid] = ot * metal::precise::tanh(ct);
+}
+
+// ---- whole-sequence LSTM ---------------------------------------------------------
+//
+// One timestep of both directions per dispatch, all dispatches in one encoder: the dispatch
+// boundary is the grid-wide barrier the recurrence needs, where the step form spent a gemv,
+// a gates kernel and copies per direction. One simdgroup per hidden unit: each lane sums
+// H/32 terms of all four gate rows, so its loads are few, coalesced and independent — a
+// thread per row looping over H was latency-bound at ~33 us a step.
+//
+// `w` is torch's own `[4H, H]`. h is read back from the previous step's output row and c
+// lives in `cell`.
+kernel void lstm_step_f32(
+    device const float *pre_f [[buffer(0)]],
+    device const float *pre_b [[buffer(1)]],
+    device const float *w_f   [[buffer(2)]],
+    device const float *w_b   [[buffer(3)]],
+    device float       *dst   [[buffer(4)]],
+    device float       *cell  [[buffer(5)]],
+    constant uint      &steps [[buffer(6)]],
+    constant uint      &hidden [[buffer(7)]],
+    constant uint      &at    [[buffer(8)]],
+    uint2 tg   [[threadgroup_position_in_grid]],
+    uint  sg   [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]],
+    uint  sgs  [[simdgroups_per_threadgroup]])
+{
+    const uint H = hidden, dir = tg.y, u = tg.x * sgs + sg;
+    if (u >= H) { return; }
+    const uint t = dir == 0 ? at : steps - 1u - at;
+    device const float *pre = (dir == 0 ? pre_f : pre_b) + t * 4u * H;
+    device const float *w = dir == 0 ? w_f : w_b;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (at != 0) {
+        device const float *hp = dst + (dir == 0 ? t - 1u : t + 1u) * 2u * H + dir * H;
+        for (uint k = lane; k < H; k += 32u) {
+            const float hk = hp[k];
+            for (uint q = 0; q < 4u; ++q) { acc[q] = fma(hk, w[(q * H + u) * H + k], acc[q]); }
+        }
+    }
+    float gate[4];
+    for (uint q = 0; q < 4u; ++q) { gate[q] = simd_sum(acc[q]) + pre[q * H + u]; }
+    if (lane == 0) {
+        // precise: see lstm_gates_f32.
+        const float it = 1.0f / (1.0f + metal::precise::exp(-gate[0]));
+        const float ft = 1.0f / (1.0f + metal::precise::exp(-gate[1]));
+        const float ot = 1.0f / (1.0f + metal::precise::exp(-gate[3]));
+        const float c_prev = at == 0 ? 0.0f : cell[dir * H + u];
+        const float ct = ft * c_prev + it * metal::precise::tanh(gate[2]);
+        cell[dir * H + u] = ct;
+        dst[t * 2u * H + dir * H + u] = ot * metal::precise::tanh(ct);
+    }
 }
 
 // ---- decode attention ----------------------------------------------------------

@@ -22,7 +22,12 @@
 
 use crate::Weights;
 use anyhow::Result;
-use candle_core::Tensor;
+use candle_core::{DType, Device, Tensor};
+
+fn poly_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TTS_NN_POLY_UPCONV").as_deref() != Ok("0"))
+}
 
 /// One output phase: `out_r[q] = sum_m W[m] @ x[q + c' - m]` (zero outside the
 /// input), with `c' = floor((r + p) / s)`.
@@ -47,6 +52,75 @@ pub struct UpConv {
     /// (grouped, or phases of uneven length at some input length).
     w: Tensor,
     groups: usize,
+    /// Every phase as output channels of one stride-1 conv, `r`-major; see [`PolyConv`].
+    poly: Option<PolyConv>,
+}
+
+/// The phases share one input and differ only in which few offsets they read, so they stack
+/// into a single `[s * out, in, kw]` conv over the union of offsets: one dispatch and one
+/// interleave, where the tap loop was ~20 matmuls, copies and adds.
+struct PolyConv {
+    /// `[kw, in, s * out]`; see [`crate::mpsconv`].
+    kio: Tensor,
+    bias: Option<Tensor>,
+    kw: usize,
+    pad_left: usize,
+}
+
+impl PolyConv {
+    /// Built on the host: device-side rearranging would leave its intermediates in candle's pool.
+    fn build(
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        offsets: &[Vec<(isize, usize)>],
+        cin: usize,
+        cout: usize,
+    ) -> Result<Self> {
+        let device = weight.device();
+        let lo = offsets.iter().flatten().map(|o| o.0).min().unwrap_or(0);
+        let hi = offsets.iter().flatten().map(|o| o.0).max().unwrap_or(0);
+        let (kw, pad_left) = ((hi - lo + 1) as usize, (-lo).max(0) as usize);
+        if lo > 0 || hi < 0 {
+            anyhow::bail!("offsets {lo}..={hi} do not straddle zero");
+        }
+        let k_size = weight.dim(2)?;
+        let src: Vec<f32> = weight
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+        let s = offsets.len();
+        let mut kio = vec![0f32; kw * cin * s * cout];
+        for (r, taps) in offsets.iter().enumerate() {
+            for &(off, k) in taps {
+                let j = (off - lo) as usize;
+                for i in 0..cin {
+                    let row = (j * cin + i) * s * cout + r * cout;
+                    for c in 0..cout {
+                        kio[row + c] = src[(i * cout + c) * k_size + k];
+                    }
+                }
+            }
+        }
+        let bias = match bias {
+            Some(b) => {
+                let b: Vec<f32> = b
+                    .to_dtype(DType::F32)?
+                    .to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1()?;
+                let all: Vec<f32> = (0..s).flat_map(|_| b.iter().copied()).collect();
+                Some(Tensor::from_vec(all, s * cout, device)?)
+            }
+            None => None,
+        };
+        Ok(Self {
+            kio: Tensor::from_vec(kio, (kw, cin, s * cout), device)?,
+            bias,
+            kw,
+            pad_left,
+        })
+    }
 }
 
 impl UpConv {
@@ -71,10 +145,15 @@ impl UpConv {
         output_padding: usize,
         groups: usize,
     ) -> Result<Self> {
-        let (_cin, cout, k_size) = weight.dims3()?;
+        let (cin, cout, k_size) = weight.dims3()?;
+        let device = weight.device().clone();
+        let host = weight.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
         let mut phases = Vec::new();
+        let mut offsets: Vec<Vec<(isize, usize)>> = Vec::new();
         // Only the ungrouped case decomposes; anything else keeps candle's
         // implementation via the empty phase list.
+        // The stacked conv below covers every phase; the per-phase taps are only the fallback.
+        let stack = groups == 1 && poly_on();
         if groups == 1 {
             phases.reserve(stride);
             for r in 0..stride {
@@ -85,10 +164,23 @@ impl UpConv {
                     .take_while(|&k| k < k_size)
                     .collect();
                 // A phase with no taps (e.g. k=1, s=2) outputs zeros.
+                offsets.push(
+                    taps_idx
+                        .iter()
+                        .enumerate()
+                        .map(|(m, &k)| (shift as isize - m as isize, k))
+                        .collect(),
+                );
                 let mut taps = Vec::with_capacity(taps_idx.len());
-                for &k in &taps_idx {
+                for &k in taps_idx.iter().filter(|_| !stack) {
                     // `[out, in]`: the window squeezes to `[in, len_p]`.
-                    taps.push(weight.narrow(2, k, 1)?.squeeze(2)?.t()?.contiguous()?);
+                    taps.push(
+                        host.narrow(2, k, 1)?
+                            .squeeze(2)?
+                            .t()?
+                            .contiguous()?
+                            .to_device(&device)?,
+                    );
                 }
                 phases.push(Phase {
                     pad_left: if taps.is_empty() {
@@ -102,6 +194,17 @@ impl UpConv {
                 });
             }
         }
+        let poly = if stack && offsets.iter().all(|o| !o.is_empty()) {
+            Some(PolyConv::build(
+                &weight,
+                bias.as_ref(),
+                &offsets,
+                cin,
+                cout,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             stride,
             padding,
@@ -112,10 +215,32 @@ impl UpConv {
             bias,
             w: weight,
             groups,
+            poly,
         })
     }
 
-    /// `weight` is `[in, out, k]`, the transposed-conv layout.
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    /// The MPSGraph conv [`Self::apply`] will run for an input of `l_in`, if any.
+    pub fn mps_spec(&self, l_in: usize) -> Option<crate::mpsconv::Spec> {
+        let p = self.poly.as_ref()?;
+        if !crate::mpsconv::eligible_len(p.kio.device(), l_in) || !poly_on() {
+            return None;
+        }
+        let (kw, cin, cout) = p.kio.dims3().ok()?;
+        Some(crate::mpsconv::Spec {
+            cin,
+            cout,
+            k: kw,
+            dilation: 1,
+            pad_left: p.pad_left,
+            bias: p.bias.is_some(),
+            residual: false,
+            len: l_in,
+        })
+    }
 
     fn l_out(&self, l_in: usize) -> usize {
         (l_in - 1) * self.stride - 2 * self.padding + (self.k_size - 1) + self.output_padding + 1
@@ -138,10 +263,32 @@ impl UpConv {
 
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
         let (b, _, l_in) = x.dims3()?;
-        if self.phases.is_empty() || b != 1 {
+        let l_out = self.l_out(l_in);
+        if let Some(p) = self
+            .poly
+            .as_ref()
+            .filter(|_| b == 1 && l_out == l_in * self.stride)
+        {
+            let x = x.contiguous()?;
+            let y = if crate::mpsconv::eligible(&x, &p.kio) {
+                crate::mpsconv::centered_conv1d(&x, &p.kio, p.bias.as_ref(), 1, p.pad_left)?
+            } else {
+                let w_tap = p
+                    .kio
+                    .reshape((p.kw * x.dim(1)?, self.stride * self.out_ch))?
+                    .t()?;
+                crate::centered_conv1d_gemm(&x, &w_tap, p.bias.as_ref(), p.kw, 1, p.pad_left)?
+            };
+            // `[s * out, len]`, `r`-major -> `[out, len, s]`.
+            return Ok(y
+                .reshape((self.stride, self.out_ch, l_in))?
+                .permute((1, 2, 0))?
+                .contiguous()?
+                .reshape((1, self.out_ch, l_out))?);
+        }
+        if self.phases.is_empty() || self.phases.iter().any(|p| p.taps.is_empty()) || b != 1 {
             return self.fallback(x);
         }
-        let l_out = self.l_out(l_in);
         // Every phase owns the outputs `t = q*s + r < l_out`: all phases must agree
         // on a length, or the interleave below has nothing regular to stack.
         let len_p = if l_out > 0 {

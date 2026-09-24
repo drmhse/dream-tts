@@ -11,6 +11,8 @@ use anyhow::Result;
 use candle_core::{Device, Tensor};
 use tts_nn::Weights;
 
+const NORM_EPS: f64 = 1e-5;
+
 /// The generator's residual block. Distinct from [`AdainResBlk`]: three dilated pairs with
 /// a learned snake between them, and no shortcut convolution.
 struct SnakeResBlock {
@@ -20,12 +22,49 @@ struct SnakeResBlock {
     adain2: Vec<AdaIn>,
     alpha1: Vec<(Tensor, Tensor)>,
     alpha2: Vec<(Tensor, Tensor)>,
+    padded: Option<Padded>,
+}
+
+/// The block's six AdaINs in the layout [`SnakeResBlock::apply_padded`] reads, in pair order
+/// `adain1[i]`, `adain2[i]`: one style projection for all of them, `[128, 6 * 2C]`, and the
+/// learned `[6, 2, C]` (alpha, 1/beta).
+struct Padded {
+    fc_w: Tensor,
+    fc_b: Tensor,
+    ab: Tensor,
+}
+
+impl Padded {
+    /// `None` where an AdaIN has its own affine, which the masked kernel does not apply.
+    fn load(w: &Weights, prefix: &str, pairs: usize) -> Result<Option<Self>> {
+        let f32 =
+            |n: String| -> Result<Tensor> { Ok(w.cpu(&n)?.to_dtype(candle_core::DType::F32)?) };
+        let (mut ws, mut bs, mut abs) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..pairs {
+            for half in [1, 2] {
+                let adain = format!("{prefix}.adain{half}.{i}");
+                if w.has(&format!("{adain}.norm.weight")) {
+                    return Ok(None);
+                }
+                ws.push(f32(format!("{adain}.fc.weight"))?);
+                bs.push(f32(format!("{adain}.fc.bias"))?);
+                let a = f32(format!("{prefix}.alpha{half}.{i}"))?.flatten_all()?;
+                abs.push(Tensor::stack(&[&a, &a.recip()?], 0)?);
+            }
+        }
+        let device = w.device();
+        Ok(Some(Self {
+            fc_w: Tensor::cat(&ws, 0)?.t()?.contiguous()?.to_device(device)?,
+            fc_b: Tensor::cat(&bs, 0)?.to_device(device)?,
+            ab: Tensor::stack(&abs, 0)?.to_device(device)?,
+        }))
+    }
 }
 
 fn alpha_pair(w: &Weights, name: &str) -> Result<(Tensor, Tensor)> {
-    let a = w.get(name)?;
+    let a = w.cpu(name)?.to_dtype(candle_core::DType::F32)?;
     let recip = a.recip()?;
-    Ok((a, recip))
+    Ok((a.to_device(w.device())?, recip.to_device(w.device())?))
 }
 
 impl SnakeResBlock {
@@ -51,7 +90,42 @@ impl SnakeResBlock {
             adain2,
             alpha1,
             alpha2,
+            padded: Padded::load(w, prefix, dilations.len())?,
         })
+    }
+
+    fn mps_specs(&self, len: usize, out: &mut Vec<tts_nn::mpsconv::Spec>) {
+        for (c1, c2) in self.convs1.iter().zip(&self.convs2) {
+            out.extend(c1.mps_spec(len, false));
+            out.extend(c2.mps_spec(len, true));
+        }
+    }
+
+    /// [`Self::apply`] on a signal whose first `valid` samples are real: every conv reads
+    /// zeros past them, so those samples come out exactly as unpadded. What lies past them
+    /// on the way out is garbage for the caller to mask.
+    fn apply_padded(&self, x: &Tensor, s: &Tensor, valid: usize) -> Result<Tensor> {
+        let p = self.padded.as_ref().expect("checked by Generator::padded");
+        let c = x.dim(1)?;
+        let gb =
+            s.matmul(&p.fc_w)?
+                .broadcast_add(&p.fc_b)?
+                .reshape((2 * self.convs1.len(), 2, c))?;
+        let adain = |x: &Tensor, k: usize| -> Result<Tensor> {
+            Ok(tts_nn::fused::adain_snake_masked(
+                x,
+                &gb.get(k)?,
+                &p.ab.get(k)?,
+                NORM_EPS,
+                valid,
+            )?)
+        };
+        let mut x = x.clone();
+        for i in 0..self.convs1.len() {
+            let t = self.convs1[i].apply(&adain(&x, 2 * i)?)?;
+            x = self.convs2[i].apply_residual(&adain(&t, 2 * i + 1)?, Some(&x))?;
+        }
+        Ok(x)
     }
 
     fn apply(&self, x: &Tensor, s: &Tensor) -> Result<Tensor> {
@@ -60,8 +134,7 @@ impl SnakeResBlock {
             let mut t = self.adain1[i].apply_snake(&x, s, &self.alpha1[i].0, &self.alpha1[i].1)?;
             t = self.convs1[i].apply(&t)?;
             t = self.adain2[i].apply_snake(&t, s, &self.alpha2[i].0, &self.alpha2[i].1)?;
-            t = self.convs2[i].apply(&t)?;
-            x = (t + x)?;
+            x = self.convs2[i].apply_residual(&t, Some(&x))?;
         }
         Ok(x)
     }
@@ -115,13 +188,21 @@ impl Generator {
         for i in 0..ups.len() {
             if i + 1 < g.upsample_rates.len() {
                 let stride: usize = g.upsample_rates[i + 1..].iter().product();
-                noise_convs.push(
-                    Conv1d::load(w, &format!("{p}.noise_convs.{i}"), stride, 1)?
-                        .with_padding((stride + 1) / 2),
-                );
+                noise_convs.push(Conv1d::load_padded(
+                    w,
+                    &format!("{p}.noise_convs.{i}"),
+                    stride,
+                    1,
+                    Some(stride.div_ceil(2)),
+                )?);
             } else {
-                noise_convs
-                    .push(Conv1d::load(w, &format!("{p}.noise_convs.{i}"), 1, 1)?.with_padding(0));
+                noise_convs.push(Conv1d::load_padded(
+                    w,
+                    &format!("{p}.noise_convs.{i}"),
+                    1,
+                    1,
+                    Some(0),
+                )?);
             }
             noise_res.push(SnakeResBlock::load(
                 w,
@@ -172,9 +253,23 @@ impl Generator {
         )
     }
 
+    /// Whether [`Self::forward_padded`] can run: Metal, and no AdaIN with its own affine.
+    fn padded(&self, x: &Tensor) -> bool {
+        x.device().is_metal()
+            && buckets_per_octave() > 0
+            && self
+                .noise_res
+                .iter()
+                .chain(&self.resblocks)
+                .all(|b| b.padded.is_some())
+    }
+
     /// `excitation` is the merged harmonic waveform, computed by [`Self::excitation`] —
     /// on another thread, while the decoder's own blocks were running.
     pub fn forward(&self, x: &Tensor, s: &Tensor, excitation: &[f32]) -> Result<Vec<f32>> {
+        if self.padded(x) {
+            return self.forward_padded(x, s, excitation);
+        }
         let device = x.device().clone();
         let t0 = std::time::Instant::now();
         let har = self.spectrum(excitation, &device)?;
@@ -246,9 +341,124 @@ impl Generator {
         Ok(out)
     }
 
+    /// Compile, off this thread, the MPSGraph executables a generator input of `len` will
+    /// run. Called as soon as the length is known, so the compiles overlap the GPU work
+    /// still ahead of the generator rather than stalling it one at a time.
+    pub fn prewarm(&self, len: usize, device: &Device) {
+        if !device.is_metal() || buckets_per_octave() == 0 {
+            return;
+        }
+        let mut specs = Vec::new();
+        let mut at = bucket(len);
+        for i in 0..self.ups.len() {
+            specs.extend(self.ups[i].mps_spec(at));
+            at *= self.ups[i].stride();
+            if i + 1 == self.ups.len() {
+                at += 1;
+            }
+            self.noise_res[i].mps_specs(at, &mut specs);
+            for j in 0..self.kernels {
+                self.resblocks[i * self.kernels + j].mps_specs(at, &mut specs);
+            }
+        }
+        specs.extend(self.conv_post.mps_spec(at, false));
+        tts_nn::mpsconv::prewarm(device, specs);
+    }
+
+    /// [`Self::forward`] at a bucketed length.
+    ///
+    /// MPSGraph specialises a graph for every input length it meets, at ~4 ms a graph, and
+    /// every utterance has its own length: ~26 graphs made that ~100 ms a segment, a third of
+    /// the decoder. Padded to a bucket, a length recurs. The padding is exact rather than
+    /// close: moments are taken over the real samples only, and every conv input is masked
+    /// to zeros past them, which is what the conv's own padding would have read.
+    fn forward_padded(&self, x: &Tensor, s: &Tensor, excitation: &[f32]) -> Result<Vec<f32>> {
+        let device = x.device().clone();
+        let t0 = std::time::Instant::now();
+        let har = self.spectrum(excitation, &device)?;
+        let t_source = t0.elapsed().as_secs_f64();
+        let t1 = std::time::Instant::now();
+        let mut valid = x.dim(2)?;
+        let mut x = x.pad_with_zeros(2, 0, bucket(valid) - valid)?;
+        for i in 0..self.ups.len() {
+            x = tts_nn::fused::leaky_masked(&x, 0.1, valid)?;
+            x = self.ups[i].apply(&x)?;
+            valid *= self.ups[i].stride();
+            if i + 1 == self.ups.len() {
+                // ReflectionPad1d((1, 0)), as in `forward`.
+                x = Tensor::cat(&[&x.narrow(2, 1, 1)?, &x], 2)?;
+                valid += 1;
+            }
+            let source = self.noise_convs[i].apply(&har)?;
+            anyhow::ensure!(
+                source.dim(2)? == valid,
+                "noise conv gives {} samples against {valid}",
+                source.dim(2)?
+            );
+            let source = source.pad_with_zeros(2, 0, x.dim(2)? - valid)?;
+            let source = self.noise_res[i].apply_padded(&source, s, valid)?;
+            x = (x + source)?;
+            let mut sum: Option<Tensor> = None;
+            for j in 0..self.kernels {
+                let y = self.resblocks[i * self.kernels + j].apply_padded(&x, s, valid)?;
+                sum = Some(match sum {
+                    Some(acc) => (acc + y)?,
+                    None => y,
+                });
+            }
+            x = (sum.unwrap() / self.kernels as f64)?;
+        }
+        // The default slope here, not the 0.1 used inside the loop.
+        x = tts_nn::fused::leaky_masked(&x, 0.01, valid)?;
+        x = self
+            .conv_post
+            .apply(&x)?
+            .narrow(2, 0, valid)?
+            .contiguous()?;
+        device.synchronize()?;
+        let t_net = t1.elapsed().as_secs_f64();
+        let t2 = std::time::Instant::now();
+        let bins = self.stft.bins();
+        let spec = x.narrow(1, 0, bins)?.exp()?;
+        let phase = x.narrow(1, bins, bins)?.sin()?;
+        let both = Tensor::cat(&[spec, phase], 1)?;
+        let out: Vec<f32> = self.stft.inverse_stacked(&both, valid)?.to_vec1()?;
+        if std::env::var("KOKORO_TIMING").is_ok() {
+            eprintln!(
+                "    source {t_source:.3}  net {t_net:.3}  istft {:.3}  ({} samples)",
+                t2.elapsed().as_secs_f64(),
+                x.dim(2)?
+            );
+        }
+        Ok(out)
+    }
+
     pub fn post_conv(&self, x: &Tensor) -> Result<Tensor> {
         self.conv_post.apply(&tts_nn::leaky_relu(x, 0.01)?)
     }
+}
+
+/// `KOKORO_BUCKETS`: length buckets per octave for the padded generator, 0 to not pad. Eight
+/// wastes ~3% on padding; fewer buckets recur more often and waste more.
+fn buckets_per_octave() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("KOKORO_BUCKETS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    })
+}
+
+/// `len` rounded up to the next of `buckets_per_octave` steps in its octave.
+fn bucket(len: usize) -> usize {
+    let n = buckets_per_octave();
+    if n == 0 || len < 2 {
+        return len;
+    }
+    let octave = 1usize << (usize::BITS - 1 - len.leading_zeros());
+    let step = (octave / n).max(1);
+    len.div_ceil(step) * step
 }
 
 pub struct Decoder {

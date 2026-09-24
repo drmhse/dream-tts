@@ -11,6 +11,7 @@ use tts_nn::Weights;
 struct Direction {
     /// Transposed at load; every use is `x @ wᵀ`.
     w_ih: Tensor,
+    /// torch's `[4H, H]`, as [`tts_nn::fused::lstm_seq`] reads it.
     w_hh: Tensor,
     /// torch keeps two bias vectors for symmetry with cuDNN. They are only ever added
     /// together, so they are summed once here.
@@ -19,18 +20,15 @@ struct Direction {
 
 impl Direction {
     fn load(w: &Weights, prefix: &str, suffix: &str) -> Result<Self> {
-        let b_ih = w.get(&format!("{prefix}.bias_ih_l0{suffix}"))?;
-        let b_hh = w.get(&format!("{prefix}.bias_hh_l0{suffix}"))?;
+        let host = |n: &str| -> Result<Tensor> {
+            Ok(w.cpu(&format!("{prefix}.{n}_l0{suffix}"))?
+                .to_dtype(candle_core::DType::F32)?)
+        };
+        let hh = format!("{prefix}.weight_hh_l0{suffix}");
         Ok(Self {
-            w_ih: w
-                .get(&format!("{prefix}.weight_ih_l0{suffix}"))?
-                .t()?
-                .contiguous()?,
-            w_hh: w
-                .get(&format!("{prefix}.weight_hh_l0{suffix}"))?
-                .t()?
-                .contiguous()?,
-            bias: (b_ih + b_hh)?,
+            w_ih: w.get_t(&format!("{prefix}.weight_ih_l0{suffix}"))?,
+            w_hh: w.get(&hh)?,
+            bias: (host("bias_ih")? + host("bias_hh")?)?.to_device(w.device())?,
         })
     }
 
@@ -50,8 +48,11 @@ impl Direction {
         let mut steps: Vec<Tensor> = Vec::with_capacity(t);
         for i in 0..t {
             let idx = if reverse { t - 1 - i } else { i };
-            let hc =
-                tts_nn::fused::lstm_gates(&h.matmul(&self.w_hh)?, &pre.narrow(0, idx, 1)?, &c)?;
+            let hc = tts_nn::fused::lstm_gates(
+                &h.matmul(&self.w_hh.t()?)?,
+                &pre.narrow(0, idx, 1)?,
+                &c,
+            )?;
             h = hc.narrow(0, 0, 1)?.contiguous()?;
             c = hc.narrow(0, 1, 1)?.contiguous()?;
             steps.push(h.clone());
@@ -73,7 +74,7 @@ pub struct BiLstm {
 impl BiLstm {
     pub fn load(w: &Weights, prefix: &str) -> Result<Self> {
         let forward = Direction::load(w, prefix, "")?;
-        let hidden = forward.w_hh.dim(0)?;
+        let hidden = forward.w_hh.dim(1)?;
         Ok(Self {
             forward,
             backward: Direction::load(w, prefix, "_reverse")?,
@@ -85,6 +86,18 @@ impl BiLstm {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let device = x.device().clone();
         let x = x.squeeze(0)?;
+        if tts_nn::fused::lstm_seq_eligible(&x) {
+            let pre = |d: &Direction| -> Result<Tensor> {
+                Ok(x.matmul(&d.w_ih)?.broadcast_add(&d.bias)?)
+            };
+            let out = tts_nn::fused::lstm_seq(
+                &pre(&self.forward)?,
+                &pre(&self.backward)?,
+                &self.forward.w_hh,
+                &self.backward.w_hh,
+            )?;
+            return Ok(out.unsqueeze(0)?);
+        }
         let f = self.forward.run(&x, false, self.hidden, &device)?;
         let b = self.backward.run(&x, true, self.hidden, &device)?;
         Ok(Tensor::cat(&[f, b], 1)?.unsqueeze(0)?)
