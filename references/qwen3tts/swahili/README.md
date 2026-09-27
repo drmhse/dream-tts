@@ -79,7 +79,11 @@ The export embeds the orthography (`meta::scheme`), so the engine tokenizes as t
      Read prompts teach halting delivery even through codebook 0.
    Within one passage, as narration renders, run 12 is at base-model consistency in all three
    voices (ECAPA over the passage's sentences 0.782/0.699/0.672 against 0.747/0.707/0.684).
-7. **Loudness.** The model copies its reference's level: the owner's 16 s clip rendered chapters
+7. **Voices from another language.** Cloning continues the reference clip, accent included:
+   with an English reference the adapter spoke Swahili with an English accent, and training could
+   not undo it (items 5 and 6). `clone=xvector` (speaker embedding only) takes the accent from the
+   adapter: `male-qwen3tts` CER 2.4% over 36 renders against 6.0%.
+8. **Loudness.** The model copies its reference's level: the owner's 16 s clip rendered chapters
    at -34.6 dB mean. The engine now lifts a request's median speech level to -20 dBFS after
    synthesis (`level_db`); a levelled re-export of the clip cost consistency (0.825 -> 0.795).
 

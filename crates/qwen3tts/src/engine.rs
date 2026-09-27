@@ -482,6 +482,8 @@ pub struct Qwen3TtsEngine {
     max_pause: Option<f32>,
     /// Each segment conditioned on the previous one; default under an adapter.
     continuity: bool,
+    /// `--set clone=xvector`: condition on the speaker embedding only (see `synthesize`).
+    xvector_only: bool,
     /// `continuity=paragraph`: the chain restarts at each paragraph.
     per_paragraph: bool,
     /// Segment levels matched ([`match_levels`]); default under an adapter, `--set level=`.
@@ -586,6 +588,11 @@ impl Qwen3TtsEngine {
             None => adapter.is_some(),
         };
         let per_paragraph = spec == Some("paragraph");
+        let xvector_only = match config.overrides.get("clone").and_then(|p| p.to_str()) {
+            Some("xvector") => true,
+            Some("icl") | None => false,
+            Some(v) => anyhow::bail!("clone={v}: expected icl or xvector"),
+        };
         let level = match config.overrides.get("level").and_then(|p| p.to_str()) {
             Some("off" | "0" | "false") => false,
             Some(_) => true,
@@ -619,6 +626,7 @@ impl Qwen3TtsEngine {
             scheme,
             max_pause,
             continuity,
+            xvector_only,
             per_paragraph,
             level,
             level_db,
@@ -678,6 +686,11 @@ impl Engine for Qwen3TtsEngine {
                 .unwrap_or_default()
         };
 
+        // `--set clone=xvector`: the voice by its speaker embedding alone, not by continuing its clip,
+        // which carries the clip's accent too (an English reference read Swahili as an English
+        // speaker would). Continuity then chains on the previous segment only.
+        let (clone_text, clone_codes): (&[u32], &[Vec<u32>]) =
+            if self.xvector_only { (&[], &[]) } else { (&ref_text, &ref_codes) };
         let language = self.language.clone().unwrap_or(Language::Auto);
         let swahili = self.respell && voice.language.as_deref() == Some("swahili");
 
@@ -760,8 +773,8 @@ impl Engine for Qwen3TtsEngine {
             }
             let (prompt, trailing, common) = self.talker.build_prompt_shared(
                 &ids,
-                &ref_text,
-                &ref_codes,
+                clone_text,
+                clone_codes,
                 Some(&spk),
                 &language,
             )?;
@@ -825,9 +838,9 @@ impl Engine for Qwen3TtsEngine {
                 let (pi, chars, prompt, trailing) = &prepared[i];
                 let chained = match i.checked_sub(1).and_then(|p| out[p].as_ref().map(|o| (p, o))) {
                     Some((p, (ppi, _, frames))) if (ppi == pi || !self.per_paragraph) && !frames.is_empty() => {
-                        let mut text = ref_text.clone();
+                        let mut text = clone_text.to_vec();
                         text.extend_from_slice(&prepared_ids[p]);
-                        let mut codes = ref_codes.clone();
+                        let mut codes = clone_codes.to_vec();
                         codes.extend(frames.iter().cloned());
                         Some(self.talker.build_prompt_shared(&prepared_ids[i], &text, &codes, Some(&spk), &language)?)
                     }
@@ -1033,7 +1046,7 @@ impl Engine for Qwen3TtsEngine {
         // The reference also prefixes `ref_codes` and cuts it off. The talker continues that
         // clip, so decoding cold clipped every utterance's first consonant ("Mbwa" → "wa").
         let t = Instant::now();
-        let context = &ref_codes[ref_codes.len().saturating_sub(cfg::codec::CHUNK_LEFT_CONTEXT)..];
+        let context = &clone_codes[clone_codes.len().saturating_sub(cfg::codec::CHUNK_LEFT_CONTEXT)..];
         let all_frames: Vec<Vec<u32>> = context
             .iter()
             .cloned()
