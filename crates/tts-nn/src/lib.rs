@@ -42,6 +42,7 @@ pub mod tapconv;
 pub mod topk;
 pub mod upconv;
 
+use std::collections::HashMap;
 use anyhow::{Context, Result};
 
 /// A Metal device that can actually run this crate's kernels, or `None`.
@@ -129,6 +130,9 @@ use candle_core::{DType, Device, Module, Tensor, D};
 pub struct Weights {
     file: candle_core::safetensors::MmapedSafetensors,
     device: Device,
+    /// A LoRA over the file: `name` becomes `name + b·a` (`name::lora_b`, pre-scaled, times
+    /// `name::lora_a`), or `name::replace` outright. Applied on the host at read.
+    adapter: HashMap<String, Tensor>,
 }
 
 impl Weights {
@@ -142,13 +146,65 @@ impl Weights {
         Ok(Self {
             file,
             device: device.clone(),
+            adapter: HashMap::new(),
         })
     }
 
+    /// Overlay an adapter file; see the `adapter` field. Names it adapts must exist here.
+    /// `scale` multiplies every LoRA delta (`::lora_b`), so one export serves any strength.
+    pub fn with_adapter(mut self, path: &str, scale: f32) -> Result<Self> {
+        let mut t = candle_core::safetensors::load(path, &Device::Cpu)
+            .with_context(|| format!("loading adapter {path}"))?;
+        for key in t.keys().filter(|k| !k.starts_with("meta::")) {
+            let base = key.rsplit_once("::").map_or(key.as_str(), |(b, _)| b);
+            anyhow::ensure!(self.has(base), "adapter {path} adapts `{base}`, which is not in the checkpoint");
+        }
+        if scale != 1.0 {
+            for (k, v) in t.iter_mut().filter(|(k, _)| k.ends_with("::lora_b")) {
+                *v = (&*v * f64::from(scale)).with_context(|| format!("scaling {k}"))?;
+            }
+        }
+        self.adapter = t;
+        Ok(self)
+    }
+
+    /// Whether the adapter carries `meta::{flag}`: how it was trained, e.g. `syllables`.
+    pub fn adapter_flag(&self, flag: &str) -> bool {
+        self.adapter.contains_key(&format!("meta::{flag}"))
+    }
+
+    /// `meta::{key}` as bytes, e.g. the JSON orthography an adapter was trained on.
+    pub fn adapter_bytes(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.adapter
+            .get(&format!("meta::{key}"))
+            .map(|t| Ok(t.flatten_all()?.to_vec1::<u8>()?))
+            .transpose()
+    }
+
+    fn patched(&self, name: &str, base: Tensor) -> Result<Tensor> {
+        if let Some(r) = self.adapter.get(&format!("{name}::replace")) {
+            return Ok(r.to_dtype(base.dtype())?);
+        }
+        match (
+            self.adapter.get(&format!("{name}::lora_a")),
+            self.adapter.get(&format!("{name}::lora_b")),
+        ) {
+            (Some(a), Some(b)) => {
+                let delta = b.to_dtype(DType::F32)?.matmul(&a.to_dtype(DType::F32)?)?;
+                Ok((base.to_dtype(DType::F32)? + delta)?.to_dtype(base.dtype())?)
+            }
+            _ => Ok(base),
+        }
+    }
+
     fn fetch(&self, name: &str) -> Result<Tensor> {
-        self.file
-            .load(name, &self.device)
-            .with_context(|| format!("missing tensor {name}"))
+        if self.adapter.is_empty() {
+            return self
+                .file
+                .load(name, &self.device)
+                .with_context(|| format!("missing tensor {name}"));
+        }
+        Ok(self.cpu(name)?.to_device(&self.device)?)
     }
 
     /// Fetch as f32. Checkpoints here are f32 (the folded codec, CosyVoice) or bf16
@@ -173,9 +229,11 @@ impl Weights {
     /// The tensor on the host in its on-disk dtype, for load-time work that should not
     /// allocate on the device; see [`Self::get`].
     pub fn cpu(&self, name: &str) -> Result<Tensor> {
-        self.file
+        let base = self
+            .file
             .load(name, &Device::Cpu)
-            .with_context(|| format!("missing tensor {name}"))
+            .with_context(|| format!("missing tensor {name}"))?;
+        self.patched(name, base)
     }
 
     /// Same, but keeps the on-disk dtype — used where a copy would be wasteful.
@@ -187,6 +245,10 @@ impl Weights {
     /// that is large and sparsely read: the rows cost a copy each, and the rest stays clean
     /// file-backed pages that count against nothing.
     pub fn rows(&self, name: &str, ids: &[u32]) -> Result<Tensor> {
+        if self.adapter.keys().any(|k| k.starts_with(&format!("{name}::"))) {
+            let idx = Tensor::from_vec(ids.to_vec(), ids.len(), &Device::Cpu)?;
+            return Ok(self.cpu(name)?.index_select(&idx, 0)?.to_device(&self.device)?);
+        }
         let view = self
             .file
             .get(name)

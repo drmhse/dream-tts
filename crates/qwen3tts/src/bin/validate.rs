@@ -181,7 +181,7 @@ fn numerics(report: &mut Report) -> Result<()> {
     };
 
     let voice = tts_core::Voice::load(VOICE)?;
-    let talker = qwen3tts::talker::Talker::load(TALKER, tts_nn::Weight::F32, &device)?;
+    let talker = qwen3tts::talker::Talker::load(TALKER, None, 1.0, tts_nn::Weight::F32, &device)?;
     let spk = talker.speaker(voice.get("spk_embedding")?)?;
     let ref_codes = voice.get_rows_u32("ref_codes")?;
     let ref_text = voice.get_rows_u32("ref_text_tokens")?.remove(0);
@@ -198,7 +198,7 @@ fn numerics(report: &mut Report) -> Result<()> {
         &ref_text,
         &ref_codes,
         Some(&spk),
-        cfg::talker::language_id("english"),
+        &cfg::talker::language_id("english").into(),
     )?;
     report.tensor("prompt.embeds", &prompt, &get("prompt.embeds")?, 2e-3)?;
     report.tensor("prompt.trailing", &trailing, &get("prompt.trailing")?, 2e-3)?;
@@ -214,7 +214,7 @@ fn numerics(report: &mut Report) -> Result<()> {
         &ref_text,
         &ref_codes,
         Some(&spk),
-        cfg::talker::language_id("english"),
+        &cfg::talker::language_id("english").into(),
     )?;
     let other: Vec<u32> = text.iter().rev().copied().collect();
     let (prompt2, _) = talker.build_prompt(
@@ -222,7 +222,7 @@ fn numerics(report: &mut Report) -> Result<()> {
         &ref_text,
         &ref_codes,
         Some(&spk),
-        cfg::talker::language_id("english"),
+        &cfg::talker::language_id("english").into(),
     )?;
     let pair = candle_core::Tensor::cat(&[&prompt, &prompt2], 0)?;
     let span = pair.dim(1)? + 1;

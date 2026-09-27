@@ -16,6 +16,22 @@ use std::time::Instant;
 use tts_core::rng::Rng;
 use tts_nn::{Linear, Proj, Weight, Weights};
 
+/// What fills the language slot of the codec prefill.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Language {
+    /// `CODEC_NOTHINK`: the reference's `language: "auto"`.
+    Auto,
+    Tag(u32),
+    /// A blend of tag rows, `DIM` floats.
+    Vector(Vec<f32>),
+}
+
+impl From<Option<u32>> for Language {
+    fn from(id: Option<u32>) -> Self {
+        id.map_or(Language::Auto, Language::Tag)
+    }
+}
+
 /// Per-stage frame cost, filled when `QWEN3TTS_TIMING` is set. Guessing which of the two
 /// transformers dominates is how this repo previously optimised the wrong stage twice.
 #[derive(Default, Clone, Copy, Debug)]
@@ -552,8 +568,12 @@ pub struct Talker {
 }
 
 impl Talker {
-    pub fn load(path: &str, how: Weight, device: &Device) -> Result<Self> {
-        let w = Weights::load(path, device)?;
+    /// `adapter_scale` multiplies the adapter's LoRA deltas (1.0: as exported).
+    pub fn load(path: &str, adapter: Option<&str>, adapter_scale: f32, how: Weight, device: &Device) -> Result<Self> {
+        let mut w = Weights::load(path, device)?;
+        if let Some(a) = adapter {
+            w = w.with_adapter(a, adapter_scale)?;
+        }
         let geo = Geometry {
             dim: tk::DIM,
             layers: tk::LAYERS,
@@ -598,6 +618,26 @@ impl Talker {
             .reshape((1, 1, tk::DIM))?)
     }
 
+    /// `tts_pad`'s text hidden, `[1, 1, DIM]`: what a lane is fed once its text is spent.
+    pub fn pad_hidden(&self) -> Result<Tensor> {
+        self.text_hidden(&[tk::TTS_PAD])
+    }
+
+    /// See [`tts_nn::Weights::adapter_bytes`].
+    pub fn adapter_bytes(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.weights.adapter_bytes(key)
+    }
+
+    /// See [`tts_nn::Weights::adapter_flag`].
+    pub fn adapter_flag(&self, flag: &str) -> bool {
+        self.weights.adapter_flag(flag)
+    }
+
+    /// A tag's embedding row, for blending into a [`Language::Vector`].
+    pub fn codec_row_f32(&self, id: u32) -> Result<Vec<f32>> {
+        Ok(self.codec_row(id)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?)
+    }
+
     /// Embed one frame of 16 codes and sum at talker width — codebook 0 from the talker's
     /// table, 1..15 from the predictor's.
     fn frame_embed(&self, codes: &[u32]) -> Result<Tensor> {
@@ -620,7 +660,7 @@ impl Talker {
         ref_text: &[u32],
         ref_codes: &[Vec<u32>],
         spk: Option<&Tensor>,
-        language: Option<u32>,
+        language: &Language,
     ) -> Result<(Tensor, Tensor)> {
         let (prompt, trailing, _) =
             self.build_prompt_shared(text, ref_text, ref_codes, spk, language)?;
@@ -636,7 +676,7 @@ impl Talker {
         ref_text: &[u32],
         ref_codes: &[Vec<u32>],
         spk: Option<&Tensor>,
-        language: Option<u32>,
+        language: &Language,
     ) -> Result<(Tensor, Tensor, usize)> {
         let pad = self.text_hidden(&[tk::TTS_PAD])?;
         let bos = self.text_hidden(&[tk::TTS_BOS])?;
@@ -644,19 +684,28 @@ impl Talker {
 
         // Codec-stream prefill: the think/nothink tag, then optionally the x-vector, then
         // pad and bos.
-        let tags: Vec<u32> = match language {
-            Some(lang) => vec![
-                tk::CODEC_THINK,
-                tk::CODEC_THINK_BOS,
-                lang,
-                tk::CODEC_THINK_EOS,
-            ],
-            None => vec![tk::CODEC_NOTHINK, tk::CODEC_THINK_BOS, tk::CODEC_THINK_EOS],
-        };
         let mut codec: Vec<Tensor> = Vec::new();
-        for t in &tags {
-            codec.push(self.codec_row(*t)?);
+        let slot = match language {
+            Language::Auto => None,
+            Language::Tag(id) => Some(self.codec_row(*id)?),
+            Language::Vector(v) => {
+                anyhow::ensure!(v.len() == tk::DIM, "language vector is {} wide, not {}", v.len(), tk::DIM);
+                let dtype = self.codec_embed.dtype();
+                Some(Tensor::from_slice(v, (1, 1, tk::DIM), &self.device)?.to_dtype(dtype)?)
+            }
+        };
+        match slot {
+            Some(row) => {
+                codec.push(self.codec_row(tk::CODEC_THINK)?);
+                codec.push(self.codec_row(tk::CODEC_THINK_BOS)?);
+                codec.push(row);
+            }
+            None => {
+                codec.push(self.codec_row(tk::CODEC_NOTHINK)?);
+                codec.push(self.codec_row(tk::CODEC_THINK_BOS)?);
+            }
         }
+        codec.push(self.codec_row(tk::CODEC_THINK_EOS)?);
         if let Some(spk) = spk {
             codec.push(spk.reshape((1, 1, tk::DIM))?);
         }
@@ -741,7 +790,9 @@ impl Talker {
         }
         timing.prefill_s = t_pre.elapsed().as_secs_f64();
         let trailing_len = trailing.dim(1)?;
-        let pad = trailing.narrow(1, trailing_len - 1, 1)?;
+        // `tts_pad` once the text is spent, as the reference does. Not trailing's last row:
+        // when text outruns the reference frames that row is `tts_eos`, fed on every step after.
+        let pad = self.text_hidden(&[tk::TTS_PAD])?;
 
         let mut frames: Vec<Vec<u32>> = Vec::new();
         let mut seen: Vec<u32> = Vec::new();
@@ -865,7 +916,8 @@ impl Talker {
         timing.prefill_s = t_pre.elapsed().as_secs_f64();
 
         let trailing_len = trailing.dim(1)?;
-        let pad = trailing.narrow(1, trailing_len - 1, 1)?;
+        // See `generate`: `tts_pad`, not trailing's last row.
+        let pad = self.text_hidden(&[tk::TTS_PAD])?.broadcast_as((b, 1, tk::DIM))?.contiguous()?;
         let sub = Sampling::subtalker(s.greedy);
         let banned = |i: usize| i >= tk::VOCAB - 1024 && i != tk::CODEC_EOS as usize;
 

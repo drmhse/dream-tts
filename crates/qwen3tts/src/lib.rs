@@ -65,6 +65,8 @@ pub mod cfg;
 pub mod codec;
 pub mod engine;
 pub mod qwen3;
+pub mod swahili;
+pub mod syllables;
 pub mod talker;
 
 pub use engine::{capabilities, Qwen3TtsEngine, ID};

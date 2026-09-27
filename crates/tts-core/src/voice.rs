@@ -44,6 +44,9 @@ pub struct VoiceManifest {
     /// Seconds of reference audio, for reporting.
     #[serde(default)]
     pub seconds: Option<f64>,
+    /// What the clip is spoken in, e.g. `swahili`; engines may spell for it.
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 /// `Clone` is cheap and intentional: candle tensors are `Arc`-backed, so a clone bumps
@@ -56,6 +59,7 @@ pub struct Voice {
     pub name: String,
     pub text: String,
     pub seconds: Option<f64>,
+    pub language: Option<String>,
     tensors: HashMap<String, Tensor>,
 }
 
@@ -88,6 +92,7 @@ impl Voice {
             name: manifest.name,
             text: manifest.text,
             seconds: manifest.seconds,
+            language: manifest.language,
             tensors,
         })
     }

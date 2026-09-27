@@ -90,9 +90,14 @@ pub mod talker {
             "russian" => 2069,
             "italian" => 2070,
             "portuguese" => 2071,
+            // Not the checkpoint's: row 2074 is untrained there and set by a Swahili fine-tune.
+            "swahili" => SWAHILI,
             _ => return None,
         })
     }
+
+    /// The codec row a Swahili fine-tune trains; at init norm (0.022) in the base checkpoint.
+    pub const SWAHILI: u32 = 2074;
 
     /// Ten, and closed: no `language_id` exists for anything else, so text outside this set
     /// has no faithful prefill. Notably absent: Swahili and every other African language.

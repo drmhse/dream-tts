@@ -34,7 +34,7 @@ fn main() -> Result<()> {
     };
     let device = Device::new_metal(0).context("opening the Metal device")?;
     let t = Instant::now();
-    let talker = Talker::load(WEIGHTS, quant, &device)?;
+    let talker = Talker::load(WEIGHTS, None, 1.0, quant, &device)?;
     println!("loaded talker in {:.1} s", t.elapsed().as_secs_f64());
 
     let voice = Voice::load(VOICE)?;
@@ -62,7 +62,7 @@ fn main() -> Result<()> {
             if use_icl { &ref_text } else { &[] },
             if use_icl { &ref_codes } else { &[] },
             Some(&spk),
-            cfg::talker::language_id("english"),
+            &cfg::talker::language_id("english").into(),
         )?;
         println!(
             "\n=== {label}: prompt {:?}, trailing {:?}",

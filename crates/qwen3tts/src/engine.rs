@@ -11,7 +11,9 @@
 
 use crate::cfg;
 use crate::codec::Codec;
-use crate::talker::{Sampling, Talker};
+use crate::syllables::Scheme;
+use crate::{swahili, syllables};
+use crate::talker::{Language, Sampling, Talker};
 use anyhow::{Context, Result};
 use candle_core::quantized::GgmlDType;
 use candle_core::{Device, Tensor};
@@ -19,8 +21,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokenizers::models::bpe::BPE;
+use tokenizers::normalizers::NFC;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
-use tokenizers::Tokenizer;
+use tokenizers::pre_tokenizers::sequence::Sequence;
+use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
+use tokenizers::pre_tokenizers::PreTokenizerWrapper;
+use tokenizers::{SplitDelimiterBehavior, Tokenizer};
 use tts_core::rng::Rng;
 use tts_core::{
     text, wav, Audio, Capabilities, Cloning, Engine, EngineConfig, Stats, Synthesis,
@@ -110,6 +116,16 @@ fn max_batch() -> usize {
 /// the whole group open behind it.
 const SEGMENT_BUDGET_SLACK: f64 = 2.0;
 
+/// A segment whose frames leave [LOW, HIGH] x the voice's own frames-per-character is redrawn:
+/// past HIGH it has stopped reading and is babbling or looping (a Swahili adapter ran a 46-char
+/// sentence for 40 s), under LOW it dropped text — silently when the text fit inside the
+/// reference block, since nothing is left over to count. Good clips never measured under 0.78,
+/// a skipped sentence 0.58. The reference clip gives the ratio up front, so this works on a
+/// one-sentence request, where `SEGMENT_RATIO_SAMPLE` never fills.
+const REDRAW_HIGH: f64 = 1.8;
+const REDRAW_LOW: f64 = 0.65;
+const REDRAWS: usize = 2;
+
 /// Segments that must have finished before the ratio is trusted to cap anything.
 const SEGMENT_RATIO_SAMPLE: usize = 16;
 
@@ -189,6 +205,46 @@ impl Paths {
     }
 }
 
+/// `auto`, a tag (`italian`), or a blend of tags (`italian:0.7,spanish:0.3`).
+/// `adapted`: the language an adapter's scheme names, and its codec row.
+fn parse_language(
+    spec: &Path,
+    adapted: Option<(&str, u32)>,
+    row: impl Fn(u32) -> Result<Vec<f32>>,
+) -> Result<Language> {
+    let text = spec.to_str().with_context(|| format!("non-utf8 language {}", spec.display()))?;
+    let lower = text.to_ascii_lowercase();
+    if lower == "auto" {
+        return Ok(Language::Auto);
+    }
+    let tag = |name: &str| {
+        if let Some((_, id)) = adapted.filter(|(n, _)| *n == name) {
+            return Ok(id);
+        }
+        cfg::talker::language_id(name).with_context(|| {
+            format!(
+                "engine `{ID}` has no language id for `{name}`; it supports {}, `auto`, or a blend \
+                 like `italian:0.7,spanish:0.3`",
+                cfg::talker::LANGUAGES.join(", ")
+            )
+        })
+    };
+    if !lower.contains(':') {
+        return Ok(Language::Tag(tag(&lower)?));
+    }
+    let mut mix = vec![0f32; cfg::talker::DIM];
+    for part in lower.split(',') {
+        let (name, w) = part
+            .split_once(':')
+            .with_context(|| format!("blend term `{part}` is not `name:weight`"))?;
+        let w: f32 = w.trim().parse().with_context(|| format!("weight in `{part}`"))?;
+        for (m, x) in mix.iter_mut().zip(row(tag(name.trim())?)?) {
+            *m += w * x;
+        }
+    }
+    Ok(Language::Vector(mix))
+}
+
 fn parse_quant(name: Option<&str>) -> Result<Weight> {
     Ok(match name {
         Some("f32") => Weight::F32,
@@ -202,6 +258,136 @@ fn parse_quant(name: Option<&str>) -> Result<Weight> {
             QUANT.join(", ")
         ),
     })
+}
+
+/// The gain an adapter was exported at, from its safetensors header (`finetune.py export`
+/// records it as `__metadata__.gain`).
+fn adapter_export_gain(path: &str) -> Result<f32> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).with_context(|| format!("opening adapter {path}"))?;
+    let mut n = [0u8; 8];
+    f.read_exact(&mut n)?;
+    let mut header = vec![0u8; u64::from_le_bytes(n) as usize];
+    f.read_exact(&mut header)?;
+    let v: serde_json::Value = serde_json::from_slice(&header).context("adapter header")?;
+    v["__metadata__"]["gain"]
+        .as_str()
+        .and_then(|g| g.parse().ok())
+        .with_context(|| format!("adapter {path} records no export gain; adapter_gain cannot be applied"))
+}
+
+/// Qwen2's pre-tokenizer split, as transformers' `Qwen2Converter` writes it.
+const QWEN2_SPLIT: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// Qwen's byte-level BPE from the two files the checkpoint ships, pre-tokenized as transformers'
+/// Qwen2 converter does: NFC, Qwen2's split, then byte-level without GPT-2's regex. GPT-2's split
+/// alone put punctuation against letters differently ("-K", "P.C.E.A"): 107 of 350,722 pieces in
+/// the Swahili training text, English narration included.
+fn qwen_tokenizer(vocab: &str, merges: &str) -> Result<Tokenizer> {
+    let bpe = BPE::from_file(vocab, merges)
+        .build()
+        .map_err(|e| anyhow::anyhow!("building the BPE from vocab.json/merges.txt: {e}"))?;
+    let mut tokenizer = Tokenizer::new(bpe);
+    tokenizer.with_normalizer(Some(NFC));
+    let split = Split::new(SplitPattern::Regex(QWEN2_SPLIT.into()), SplitDelimiterBehavior::Isolated, false)
+        .map_err(|e| anyhow::anyhow!("Qwen2 split regex: {e}"))?;
+    tokenizer.with_pre_tokenizer(Some(Sequence::new(vec![
+        PreTokenizerWrapper::Split(split),
+        PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, true, false)),
+    ])));
+    Ok(tokenizer)
+}
+
+/// Silences inside a segment shortened to `max_s` and its edges to `EDGE_S`, so the gaps
+/// `join_segments` inserts are the pacing. Before the join, so segment timings and the aligner
+/// see the final audio. The Swahili adapter learned its data's pauses: 32 over 0.25 s in a
+/// 142-word chapter against the base's 15, most at segment edges.
+const EDGE_S: f32 = 0.1;
+
+fn cap_pauses(x: &[f32], max_s: f32) -> Vec<f32> {
+    let win = cfg::SAMPLE_RATE / 100;
+    let peak = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let floor = (peak * 0.05).max(1e-3);
+    let quiet: Vec<bool> = x
+        .chunks(win)
+        .map(|c| c.iter().all(|v| v.abs() < floor))
+        .collect();
+    let keep = (max_s * cfg::SAMPLE_RATE as f32) as usize / win;
+    let mut out = Vec::with_capacity(x.len());
+    let mut i = 0;
+    while i < quiet.len() {
+        let mut j = i;
+        while j < quiet.len() && quiet[j] {
+            j += 1;
+        }
+        let run = j - i;
+        let edge = (EDGE_S * cfg::SAMPLE_RATE as f32) as usize / win;
+        if (i == 0 || j == quiet.len()) && run > edge {
+            // Keep the `edge` windows nearest the speech.
+            let (a, b) = if i == 0 { (j - edge, j) } else { (i, i + edge) };
+            out.extend_from_slice(&x[a * win..(b * win).min(x.len())]);
+            i = j;
+        } else if run > keep {
+            let head = keep / 2;
+            out.extend_from_slice(&x[i * win..(i + head) * win]);
+            out.extend_from_slice(&x[(j - (keep - head)) * win..(j * win).min(x.len())]);
+            i = j;
+        } else if run > 0 {
+            out.extend_from_slice(&x[i * win..(j * win).min(x.len())]);
+            i = j;
+        } else {
+            out.extend_from_slice(&x[i * win..((i + 1) * win).min(x.len())]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Speech-active RMS: the mean power of 20 ms windows within 30 dB of the loudest.
+fn active_rms(x: &[f32]) -> f32 {
+    let win = cfg::SAMPLE_RATE / 50;
+    let power: Vec<f32> = x.chunks(win).map(|c| c.iter().map(|v| v * v).sum::<f32>() / c.len() as f32).collect();
+    let top = power.iter().fold(0f32, |m, &p| m.max(p));
+    let active: Vec<f32> = power.into_iter().filter(|&p| p > top * 1e-3).collect();
+    if active.is_empty() {
+        return 0.0;
+    }
+    (active.iter().sum::<f32>() / active.len() as f32).sqrt()
+}
+
+/// Each segment scaled toward the request's median level, within ±6 dB. Segments are drawn
+/// independently and the Swahili adapter's vary audibly in level, heard as a jump at joins.
+/// Then, with `absolute`, one gain for the whole request toward that median speech level in dBFS,
+/// the peak kept under -1 dBFS: the voice's reference sets the level, and the owner's 16 s clip
+/// put a Swahili chapter at -34.6 dB mean against an English post's -23.0. Levelling the clip
+/// itself instead cost consistency (ECAPA 0.825 -> 0.795): it raised the recording's noise too.
+fn match_levels(pieces: &mut [tts_core::Piece], absolute: Option<f32>) {
+    let rms: Vec<f32> = pieces.iter().map(|p| active_rms(&p.samples)).collect();
+    let mut sorted: Vec<f32> = rms.iter().copied().filter(|&r| r > 0.0).collect();
+    if sorted.len() < 2 {
+        return;
+    }
+    sorted.sort_by(f32::total_cmp);
+    let target = sorted[sorted.len() / 2];
+    for (p, r) in pieces.iter_mut().zip(rms) {
+        if r > 0.0 {
+            let g = (target / r).clamp(0.5, 2.0);
+            let peak = p.samples.iter().fold(0f32, |m, v| m.max(v.abs())) * g;
+            let g = if peak > 0.99 { g * 0.99 / peak } else { g };
+            p.samples.iter_mut().for_each(|v| *v *= g);
+        }
+    }
+    let Some(db) = absolute else {
+        return;
+    };
+    let mut now: Vec<f32> = pieces.iter().map(|p| active_rms(&p.samples)).filter(|&r| r > 0.0).collect();
+    now.sort_by(f32::total_cmp);
+    let peak = pieces.iter().flat_map(|p| p.samples.iter()).fold(0f32, |m, v| m.max(v.abs()));
+    if now.is_empty() || peak == 0.0 {
+        return;
+    }
+    let g = (10f32.powf(db / 20.0) / now[now.len() / 2]).clamp(0.1, 10.0).min(0.891 / peak);
+    pieces.iter_mut().for_each(|p| p.samples.iter_mut().for_each(|v| *v *= g));
 }
 
 /// Distinct codebook-0 values across a segment's frames.
@@ -277,9 +463,31 @@ pub struct Qwen3TtsEngine {
     codec: Codec,
     tokenizer: Tokenizer,
     device: Device,
-    /// The prefilled language tag, or `None` for the reference's `nothink` / "auto" path.
-    /// `--set language=english`.
-    language: Option<u32>,
+    /// `--set language=…`; auto when unset.
+    language: Option<Language>,
+    /// `--set lead=…`: what a segment is prefixed with: every segment under an adapter, a
+    /// respelled one only when it opens on a nasal. `lead=off` drops it.
+    lead: String,
+    /// The first token after the reference is often not spoken: behind "... " a
+    /// sentence-initial ng' was kept 11/12 against 0/12 bare; news CER 4.6% -> 4.5%.
+    lead_all: bool,
+    /// Hyphen-and-lead respelling for Swahili voices; off by default under an adapter, whose
+    /// talker was trained on the real spelling. `--set respell=on|off`.
+    respell: bool,
+    /// Syllable BPE (see [`syllables`]); set by an adapter trained that way.
+    syllables: bool,
+    /// The adapter's orthography ([`Scheme`]); supersedes `syllables`.
+    scheme: Option<Scheme>,
+    /// `--set max_pause=S`: cap pauses inside a segment; 0.6 by default under an adapter.
+    max_pause: Option<f32>,
+    /// Each segment conditioned on the previous one; default under an adapter.
+    continuity: bool,
+    /// `continuity=paragraph`: the chain restarts at each paragraph.
+    per_paragraph: bool,
+    /// Segment levels matched ([`match_levels`]); default under an adapter, `--set level=`.
+    level: bool,
+    /// `--set level_db=-20|off`: the request's median speech level; -20 under an adapter.
+    level_db: Option<f32>,
     /// Whether to batch segments through the talker. Dense weights only — see the grouping
     /// code for the measurement.
     batches: bool,
@@ -303,32 +511,7 @@ impl Qwen3TtsEngine {
                 .with_context(|| format!("non-utf8 path {}", p.display()))
         };
 
-        // Qwen's byte-level BPE, assembled from the two files the checkpoint ships.
-        // `add_prefix_space=false` matches the reference's tokenizer_config.
-        let bpe = BPE::from_file(&s(&paths.vocab)?, &s(&paths.merges)?)
-            .build()
-            .map_err(|e| anyhow::anyhow!("building the BPE from vocab.json/merges.txt: {e}"))?;
-        let mut tokenizer = Tokenizer::new(bpe);
-        tokenizer.with_pre_tokenizer(Some(ByteLevel::new(false, true, true)));
-
-        let language = config
-            .overrides
-            .get("language")
-            .and_then(|p| p.to_str())
-            .map(|name| {
-                let lower = name.to_ascii_lowercase();
-                if lower == "auto" {
-                    return Ok(None);
-                }
-                cfg::talker::language_id(&lower).map(Some).with_context(|| {
-                    format!(
-                        "engine `{ID}` has no language id for `{name}`; it supports {} (or `auto`)",
-                        cfg::talker::LANGUAGES.join(", ")
-                    )
-                })
-            })
-            .transpose()?
-            .flatten();
+        let tokenizer = qwen_tokenizer(&s(&paths.vocab)?, &s(&paths.merges)?)?;
 
         if let Some(total) = tts_core::system::total_memory() {
             if total < WANTS_MEMORY {
@@ -343,10 +526,81 @@ impl Qwen3TtsEngine {
             }
         }
 
-        let talker = Talker::load(&s(&paths.talker)?, quant, &device)?;
+        // `--set adapter=…`: a LoRA over the checkpoint, e.g. the Swahili fine-tune.
+        let adapter = config.overrides.get("adapter").map(|p| s(p)).transpose()?;
+        // `--set adapter_gain=G`: the LoRA at strength G, whatever gain the file was exported at.
+        // Voices unlike the training speakers can want less (the male English reference: CER 6.0%
+        // at 0.6, 5.4% at 0.45 over 36 renders) while the owner's voice wants the export's.
+        let adapter_scale = match (config.overrides.get("adapter_gain").and_then(|p| p.to_str()), &adapter) {
+            (Some(g), Some(a)) => {
+                let want: f32 = g.parse().with_context(|| format!("adapter_gain={g}"))?;
+                want / adapter_export_gain(a)?
+            }
+            (Some(_), None) => anyhow::bail!("adapter_gain needs --set adapter=…"),
+            (None, _) => 1.0,
+        };
+        let talker = Talker::load(&s(&paths.talker)?, adapter.as_deref(), adapter_scale, quant, &device)?;
         if std::env::var_os("QWEN3TTS_TIMING").is_some() {
             mem_line("talker loaded", &device);
         }
+        // The orthography an adapter was trained on; it also names the adapter's language row.
+        let scheme = talker
+            .adapter_bytes("scheme")?
+            .map(|b| Scheme::from_json(&b))
+            .transpose()
+            .context("the adapter's meta::scheme")?;
+        let adapted = scheme.as_ref().map(|s| (s.language.as_str(), s.row));
+        let language = config
+            .overrides
+            .get("language")
+            .map(|spec| parse_language(spec, adapted, |id| talker.codec_row_f32(id)))
+            .transpose()?;
+        if let Some(Language::Tag(id)) = language {
+            let norm = talker.codec_row_f32(id)?.iter().map(|x| x * x).sum::<f32>().sqrt();
+            anyhow::ensure!(
+                norm > 0.1,
+                "codec row {id} of this talker is untrained (norm {norm:.3}): that language needs \
+                 its adapter (--set adapter=…)"
+            );
+        }
+        let respell = match config.overrides.get("respell").and_then(|p| p.to_str()) {
+            Some("off" | "0" | "false") => false,
+            Some(_) => true,
+            None => adapter.is_none(),
+        };
+        let lead_spec = config.overrides.get("lead").and_then(|p| p.to_str());
+        let lead = match lead_spec {
+            Some("off") => String::new(),
+            Some(l) => format!("{l} "),
+            None => "... ".to_string(),
+        };
+        let lead_all = adapter.is_some() && !lead.is_empty();
+        let syllables = talker.adapter_flag("syllables");
+        // On by default under an adapter: the Swahili one drifts in timbre between independent
+        // segments (window x-vector cosine 0.983, min 0.973) and chaining holds it (0.988, 0.975).
+        // Across paragraphs too: restarting at each one was heard as a change of voice and level.
+        let spec = config.overrides.get("continuity").and_then(|p| p.to_str());
+        let continuity = match spec {
+            Some("off" | "0" | "false") => false,
+            Some(_) => true,
+            None => adapter.is_some(),
+        };
+        let per_paragraph = spec == Some("paragraph");
+        let level = match config.overrides.get("level").and_then(|p| p.to_str()) {
+            Some("off" | "0" | "false") => false,
+            Some(_) => true,
+            None => adapter.is_some(),
+        };
+        let level_db = match config.overrides.get("level_db").and_then(|p| p.to_str()) {
+            Some("off") => None,
+            Some(v) => Some(v.parse::<f32>().with_context(|| format!("level_db={v}"))?),
+            None => (level && adapter.is_some()).then_some(-20.0),
+        };
+        let max_pause = match config.overrides.get("max_pause").and_then(|p| p.to_str()) {
+            Some("off") => None,
+            Some(v) => Some(v.parse::<f32>().with_context(|| format!("max_pause={v}"))?),
+            None => adapter.as_ref().map(|_| 0.6),
+        };
         let codec = Codec::load(&s(&paths.codec)?, &device)?;
         if std::env::var_os("QWEN3TTS_TIMING").is_some() {
             mem_line("codec loaded", &device);
@@ -358,10 +612,33 @@ impl Qwen3TtsEngine {
             device,
             language,
             batches: quant.batches(),
+            lead,
+            lead_all,
+            respell,
+            syllables,
+            scheme,
+            max_pause,
+            continuity,
+            per_paragraph,
+            level,
+            level_db,
         })
     }
 
     fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        let pieces = match &self.scheme {
+            Some(s) => s.pieces(text),
+            None if self.syllables => syllables::pieces(text),
+            None => return self.encode(text),
+        };
+        let mut ids = Vec::new();
+        for piece in pieces {
+            ids.extend(self.encode(&piece)?);
+        }
+        Ok(ids)
+    }
+
+    fn encode(&self, text: &str) -> Result<Vec<u32>> {
         Ok(self
             .tokenizer
             .encode(text, false)
@@ -390,11 +667,19 @@ impl Engine for Qwen3TtsEngine {
         let spk = self.talker.speaker(voice.get("spk_embedding")?)?;
         // [T, 16] frames-major, the orientation `generate_icl_prompt` indexes.
         let ref_codes = voice.get_rows_u32("ref_codes").unwrap_or_default();
-        let ref_text = voice
-            .get_rows_u32("ref_text_tokens")
-            .ok()
-            .and_then(|r| r.into_iter().next())
-            .unwrap_or_default();
+        // A syllable-trained talker saw its references tokenized the same way.
+        let ref_text = if (self.syllables || self.scheme.is_some()) && !voice.text.is_empty() {
+            self.tokenize(&voice.text)?
+        } else {
+            voice
+                .get_rows_u32("ref_text_tokens")
+                .ok()
+                .and_then(|r| r.into_iter().next())
+                .unwrap_or_default()
+        };
+
+        let language = self.language.clone().unwrap_or(Language::Auto);
+        let swahili = self.respell && voice.language.as_deref() == Some("swahili");
 
         let paragraphs = text::segment(&request.text, request.max_chars);
         let flat: Vec<(usize, &String)> = paragraphs
@@ -460,9 +745,16 @@ impl Engine for Qwen3TtsEngine {
         // Grouping by length is what makes this cheap. See `Talker::generate_batch`.
         let budget = request.max_new_tokens.clamp(1, cfg::talker::MAX_NEW_TOKENS);
         let mut prepared: Vec<(usize, usize, Tensor, Tensor)> = Vec::new();
+        let mut prepared_ids: Vec<Vec<u32>> = Vec::new();
         let mut shared = usize::MAX;
         for (pi, seg) in &flat {
-            let ids = self.tokenize(seg)?;
+            let ids = if swahili {
+                self.tokenize(&swahili::respell(seg, &self.lead))?
+            } else if self.lead_all {
+                self.tokenize(&format!("{}{seg}", self.lead))?
+            } else {
+                self.tokenize(seg)?
+            };
             if ids.is_empty() {
                 continue;
             }
@@ -471,18 +763,21 @@ impl Engine for Qwen3TtsEngine {
                 &ref_text,
                 &ref_codes,
                 Some(&spk),
-                self.language,
+                &language,
             )?;
             shared = shared.min(common);
             prepared.push((*pi, seg.chars().count(), prompt, trailing));
+            prepared_ids.push(ids);
         }
 
-        // Lanes of equal (prompt, trailing) length, in runs of at most MAX_BATCH. Output order
-        // is restored by the paragraph index carried alongside.
+        // Lanes of equal prompt length, in runs of at most MAX_BATCH; trailing is padded to the
+        // group's longest with `tts_pad`, which is what a lane is fed once its text is spent, so
+        // the padding changes nothing. Keying on trailing too left every segment whose text
+        // outran the reference frames — all of them under syllable BPE — unbatched: RTF 1.3.
         let mut groups: Vec<Vec<usize>> = Vec::new();
-        let mut by_shape: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
-        for (i, (_, _, p, tr)) in prepared.iter().enumerate() {
-            by_shape.entry((p.dim(1)?, tr.dim(1)?)).or_default().push(i);
+        let mut by_shape: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (i, (_, _, p, _)) in prepared.iter().enumerate() {
+            by_shape.entry(p.dim(1)?).or_default().push(i);
         }
         let mut shapes: Vec<_> = by_shape.into_values().collect();
         shapes.sort_by_key(|g| g[0]);
@@ -522,12 +817,54 @@ impl Engine for Qwen3TtsEngine {
         let mut unspoken = 0usize;
         let mut talker_done = 0usize;
         let t = Instant::now();
-        for group in &groups {
+        if self.continuity {
+            // Each segment continues the one before it: that segment's text and
+            // frames follow the voice's reference. Independent segments each restart the
+            // delivery, and a paragraph sounds stitched. Sequential, so nothing batches.
+            for i in 0..prepared.len() {
+                let (pi, chars, prompt, trailing) = &prepared[i];
+                let chained = match i.checked_sub(1).and_then(|p| out[p].as_ref().map(|o| (p, o))) {
+                    Some((p, (ppi, _, frames))) if (ppi == pi || !self.per_paragraph) && !frames.is_empty() => {
+                        let mut text = ref_text.clone();
+                        text.extend_from_slice(&prepared_ids[p]);
+                        let mut codes = ref_codes.clone();
+                        codes.extend(frames.iter().cloned());
+                        Some(self.talker.build_prompt_shared(&prepared_ids[i], &text, &codes, Some(&spk), &language)?)
+                    }
+                    _ => None,
+                };
+                let (prompt, trailing) = match &chained {
+                    Some((p, t, _)) => (p, t),
+                    None => (prompt, trailing),
+                };
+                let (frames, left, _) = self.talker.generate(prompt, trailing, budget, &sampling, &mut rng)?;
+                unspoken += left;
+                out[i] = Some((*pi, *chars, frames));
+                talker_done += 1;
+                request.advanced("talker", talker_done, prepared.len());
+                request.check_interrupt(talker_done)?;
+            }
+        }
+        for group in groups.iter().filter(|_| !self.continuity) {
             let mut batched = None;
+            let mut padding: Vec<usize> = Vec::new();
             if group.len() > 1 {
                 let cap = budget.min(BATCH_FRAME_CAP);
                 let prompts: Vec<Tensor> = group.iter().map(|&i| prepared[i].2.clone()).collect();
-                let trailings: Vec<Tensor> = group.iter().map(|&i| prepared[i].3.clone()).collect();
+                let longest = group.iter().map(|&i| prepared[i].3.dim(1)).collect::<Result<Vec<_>, _>>()?;
+                let longest = longest.into_iter().max().unwrap_or(1);
+                let pad = self.talker.pad_hidden()?;
+                let mut trailings: Vec<Tensor> = Vec::with_capacity(group.len());
+                for &i in group {
+                    let tr = &prepared[i].3;
+                    let short = longest - tr.dim(1)?;
+                    padding.push(short);
+                    trailings.push(if short == 0 {
+                        tr.clone()
+                    } else {
+                        Tensor::cat(&[tr.clone(), pad.repeat((1, short, 1))?], 1)?
+                    });
+                }
                 let prompt = Tensor::cat(&prompts, 0)?.contiguous()?;
                 let trailing = Tensor::cat(&trailings, 0)?.contiguous()?;
                 // Per-lane budget from the frames-per-character this voice has already shown,
@@ -579,7 +916,7 @@ impl Engine for Qwen3TtsEngine {
             }
             match batched {
                 Some((frames, left)) => {
-                    unspoken += left.iter().sum::<usize>();
+                    unspoken += left.iter().zip(&padding).map(|(l, p)| l.saturating_sub(*p)).sum::<usize>();
                     for (lane, &i) in group.iter().enumerate() {
                         out[i] = Some((prepared[i].0, prepared[i].1, frames[lane].clone()));
                     }
@@ -615,6 +952,40 @@ impl Engine for Qwen3TtsEngine {
             talker_done += group.len();
             request.advanced("talker", talker_done, prepared.len());
             request.check_interrupt(talker_done)?;
+        }
+
+        // Redraw segments outside the voice's own pace; keep the attempt nearest to it.
+        let voice_chars = voice.text.chars().count();
+        if !ref_codes.is_empty() && voice_chars >= SEGMENT_MIN_CHARS {
+            let per_char = ref_codes.len() as f64 / voice_chars as f64;
+            let mut redrawn = 0usize;
+            for (i, slot) in out.iter_mut().enumerate() {
+                let Some((_, chars, frames)) = slot else { continue };
+                if *chars < SEGMENT_MIN_CHARS {
+                    continue;
+                }
+                let expect = *chars as f64 * per_char;
+                let off = |n: usize| (n as f64 / expect).ln().abs();
+                let bad = |n: usize| (n as f64) > expect * REDRAW_HIGH + 8.0 || (n as f64) < expect * REDRAW_LOW;
+                if !bad(frames.len()) {
+                    continue;
+                }
+                let cap = ((expect * REDRAW_HIGH) as usize + 8).min(budget);
+                let (_, _, prompt, trailing) = &prepared[i];
+                for _ in 0..REDRAWS {
+                    let (again, _, _) = self.talker.generate(prompt, trailing, cap, &sampling, &mut rng)?;
+                    redrawn += 1;
+                    if off(again.len()) < off(frames.len()) {
+                        *frames = again;
+                    }
+                    if !bad(frames.len()) {
+                        break;
+                    }
+                }
+            }
+            if redrawn > 0 {
+                eprintln!("engine {ID}: redrew {redrawn} segment attempt(s) outside the voice's pace");
+            }
         }
 
         let mut spans: Vec<(usize, String, Vec<Vec<u32>>)> = Vec::new();
@@ -658,13 +1029,19 @@ impl Engine for Qwen3TtsEngine {
         // Decoding the concatenation gives every segment real history, and the cut points are
         // *exact* rather than estimated: one frame is `SAMPLES_PER_FRAME` samples, always.
         // Chunking still happens inside `decode`, where it carries its own left context.
+        //
+        // The reference also prefixes `ref_codes` and cuts it off. The talker continues that
+        // clip, so decoding cold clipped every utterance's first consonant ("Mbwa" → "wa").
         let t = Instant::now();
-        let all_frames: Vec<Vec<u32>> = spans
+        let context = &ref_codes[ref_codes.len().saturating_sub(cfg::codec::CHUNK_LEFT_CONTEXT)..];
+        let all_frames: Vec<Vec<u32>> = context
             .iter()
-            .flat_map(|(_, _, frames)| frames.iter().cloned())
+            .cloned()
+            .chain(spans.iter().flat_map(|(_, _, frames)| frames.iter().cloned()))
             .collect();
-        let frames_total = all_frames.len();
-        let joined = self.codec.decode(&all_frames)?;
+        let frames_total = all_frames.len() - context.len();
+        let mut joined = self.codec.decode(&all_frames)?;
+        joined.drain(..(context.len() * cfg::SAMPLES_PER_FRAME).min(joined.len()));
         self.device.synchronize()?;
         stats.add("codec", t.elapsed().as_secs_f64());
         if std::env::var_os("QWEN3TTS_TIMING").is_some() {
@@ -683,15 +1060,22 @@ impl Engine for Qwen3TtsEngine {
                 (at + frames.len() * cfg::SAMPLES_PER_FRAME).min(joined.len())
             };
             if end > at {
+                let mut samples = joined[at..end].to_vec();
+                if let Some(max) = self.max_pause {
+                    samples = cap_pauses(&samples, max);
+                }
                 pieces.push(tts_core::Piece {
                     paragraph: *pi,
                     text: text.clone(),
-                    samples: joined[at..end].to_vec(),
+                    samples,
                 });
             }
             at = end;
         }
 
+        if self.level {
+            match_levels(&mut pieces, self.level_db);
+        }
         let (samples, segments) = tts_core::join_segments(pieces, request.gaps, cfg::SAMPLE_RATE);
         anyhow::ensure!(!samples.is_empty(), "engine {ID} produced no audio");
         stats.segments = spans.len();
@@ -714,6 +1098,95 @@ impl Engine for Qwen3TtsEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ids from transformers' AutoTokenizer on the checkpoint, which made the training data.
+    #[test]
+    fn tokenizer_matches_transformers() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../references/qwen3tts/weights");
+        let (vocab, merges) = (format!("{dir}/vocab.json"), format!("{dir}/merges.txt"));
+        if !Path::new(&vocab).exists() {
+            eprintln!("skipped: no checkpoint tokenizer at {dir}");
+            return;
+        }
+        let t = qwen_tokenizer(&vocab, &merges).unwrap();
+        let ids = |s: &str| t.encode(s, false).unwrap().get_ids().to_vec();
+        let cases: [(&str, &[u32]); 12] = [
+            ("P.C.E.A", &[47, 727, 5142, 875]),
+            ("Mwenyekiti wa P.C.E.A-Kenya", &[44, 16948, 88, 1225, 12303, 10450, 393, 727, 5142, 875, 15843, 268, 7755]),
+            ("-K", &[15843]),
+            ("don't stop", &[15007, 944, 2936]),
+            ("Mwaka 2026, saa 10:30.", &[44, 86, 13334, 220, 17, 15, 17, 21, 11, 822, 64, 220, 16, 15, 25, 18, 15, 13]),
+            ("Hello, world!", &[9707, 11, 1879, 0]),
+            ("mbili\nndani", &[3096, 3921, 198, 303, 5559]),
+            ("  spaced  out ", &[220, 63828, 220, 700, 220]),
+            (" ŋ", &[25917, 233]),
+            ("Ng'ombe (wawili)", &[20897, 6, 316, 1371, 320, 86, 672, 3921, 8]),
+            ("e.g. naam...", &[68, 1302, 13, 99105, 1112]),
+            ("“Habari”—leo", &[2073, 39, 370, 2780, 62650, 81763]),
+        ];
+        for (text, want) in cases {
+            assert_eq!(ids(text), want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn reads_the_export_gain() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../references/qwen3tts/weights/swahili-adapter.safetensors");
+        if !Path::new(path).exists() {
+            eprintln!("skipped: no adapter at {path}");
+            return;
+        }
+        assert!((adapter_export_gain(path).unwrap() - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn levels_to_an_absolute_target() {
+        let tone = |amp: f32, n: usize| -> Vec<f32> {
+            (0..n).map(|i| amp * (i as f32 * 0.05).sin()).collect()
+        };
+        let piece = |samples| tts_core::Piece { paragraph: 0, text: String::new(), samples };
+        let mut pieces = vec![piece(tone(0.02, 24000)), piece(tone(0.025, 24000)), piece(tone(0.018, 24000))];
+        match_levels(&mut pieces, Some(-20.0));
+        let mut db: Vec<f32> = pieces.iter().map(|p| 20.0 * active_rms(&p.samples).log10()).collect();
+        db.sort_by(f32::total_cmp);
+        assert!((db[1] + 20.0).abs() < 0.2, "{db:?}");
+        let mut loud = vec![piece(tone(0.9, 24000)), piece(tone(0.1, 24000))];
+        match_levels(&mut loud, Some(-3.0));
+        let peak = loud.iter().flat_map(|p| p.samples.iter()).fold(0f32, |m, v| m.max(v.abs()));
+        assert!(peak <= 0.892, "{peak}");
+    }
+
+    #[test]
+    fn caps_pauses_and_edges() {
+        let sr = cfg::SAMPLE_RATE;
+        let tone = |n: usize| (0..n).map(|i| (i as f32 * 0.1).sin() * 0.5).collect::<Vec<f32>>();
+        let mut x = vec![0.0; sr / 2];
+        x.extend(tone(sr / 2));
+        x.extend(vec![0.0; 2 * sr]);
+        x.extend(tone(sr / 2));
+        x.extend(vec![0.0; sr / 2]);
+        let y = cap_pauses(&x, 0.6);
+        let secs = (x.len() - y.len()) as f32 / sr as f32;
+        // 1.4 s from the interior run, 0.4 s from each edge.
+        assert!((secs - 2.2).abs() < 0.02, "removed {secs} s");
+    }
+
+    #[test]
+    fn language_specs() {
+        let row = |id: u32| Ok(vec![id as f32; cfg::talker::DIM]);
+        let parse = |s: &str| parse_language(Path::new(s), None, row);
+        assert_eq!(parse("auto").unwrap(), Language::Auto);
+        assert_eq!(parse("Italian").unwrap(), Language::Tag(2070));
+        let Language::Vector(v) = parse("italian:0.5, spanish:0.5").unwrap() else {
+            panic!("a blend is a vector")
+        };
+        assert_eq!(v[0], 0.5 * 2070.0 + 0.5 * 2054.0);
+        assert_eq!(parse("swahili").unwrap(), Language::Tag(cfg::talker::SWAHILI));
+        assert!(parse("klingon").is_err());
+        let kikuyu = parse_language(Path::new("Kikuyu"), Some(("kikuyu", 2075)), row).unwrap();
+        assert_eq!(kikuyu, Language::Tag(2075));
+        assert!(parse("italian:x").is_err());
+    }
 
     /// Geometry identities that would otherwise surface as a shape mismatch mid-port.
     #[test]
@@ -783,8 +1256,9 @@ mod tests {
             );
         }
         assert_eq!(cfg::talker::LANGUAGES.len(), 10);
-        // The limit that decides whether this engine can be used at all.
-        assert!(cfg::talker::language_id("swahili").is_none());
+        // Swahili is ours, not the checkpoint's, so it stays off the advertised list.
+        assert!(!cfg::talker::LANGUAGES.contains(&"swahili"));
+        assert!(cfg::talker::language_id("klingon").is_none());
     }
 
     /// A request with no voice must be refused, not answered with an arbitrary speaker.
