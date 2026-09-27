@@ -38,7 +38,7 @@ by_batch = collections.defaultdict(list)
 for r in rows:
     by_batch[r["batch"]].append(r)
 cut = collections.Counter()
-out, rematched = [], 0
+out, rematched, decisions = [], 0, []
 for batch in by_batch.values():
     texts = [(r["text"], r) for r in batch]
     for r in batch:
@@ -47,6 +47,7 @@ for batch in by_batch.values():
             g = gaps.get((r["wav"], r["text"]))
             if g is None or g > MAX_GAP:
                 cut["unscored" if g is None else "mms"] += 1
+                decisions.append({"wav": r["wav"], "decision": "unscored" if g is None else "mms"})
                 continue
             best, src = 0.0, r
         else:
@@ -66,6 +67,8 @@ for batch in by_batch.values():
                "rate" if not 8 <= len(norm(r2["text"])) / (r2["end"] - r2["start"]) <= 22 else None)
         if why == "disagree":
             disagree.append(r["wav"])
+        decisions.append({"wav": r["wav"], "decision": why or ("reference" if ref_only else "selected"),
+                          "text": r2["text"].strip()})
         if why:
             cut[why] += 1
             continue
@@ -75,6 +78,9 @@ with open(f"{D}/{OUT}", "w") as f:
     for r in out:
         f.write(json.dumps(r, ensure_ascii=False) + "\n")
 open(f"{D}/disagree.txt", "w").write("\n".join(disagree))
+# Each clip's fate and, where it was re-matched within its batch, the text it was given.
+with open(f"{D}/decisions.jsonl", "w") as f:
+    f.writelines(json.dumps(d, ensure_ascii=False) + "\n" for d in decisions)
 h = sum(r["seconds"] for r in out) / 3600
 print(f"{len(rows)} verified -> {len(out)} kept ({h:.2f} h), rematched {rematched}; cut {dict(cut)}")
 print("by channel", collections.Counter(r["channel"] for r in out), "reference-only", sum("ref_only" in r for r in out))
