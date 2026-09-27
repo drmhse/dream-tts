@@ -88,7 +88,8 @@ The export embeds the orthography (`meta::scheme`), so the engine tokenizes as t
    `clone=xvector`, and the most fluent take kept as the voice's own reference. They clone from
    a Swahili clip, so nothing English is inherited: over three paragraphs, sentence-to-sentence
    ECAPA 0.782 and 0.818 with CER 2.6 and 3.1%, against 0.672 and 0.699 for the English-reference
-   voices continuing their clips.
+   voices continuing their clips. On the 12 held-out sentences rendered apart: CER 1.6 and 1.7%,
+   ECAPA 0.885 and 0.885, level SD 0.96 and 0.67 dB. A chapter aligns 142/142 and 141/142 words.
 9. **Loudness.** The model copies its reference's level: the owner's 16 s clip rendered chapters
    at -34.6 dB mean. The engine now lifts a request's median speech level to -20 dBFS after
    synthesis (`level_db`); a levelled re-export of the clip cost consistency (0.825 -> 0.795).
