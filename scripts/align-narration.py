@@ -198,6 +198,60 @@ def evaluate_number_phrase(words: list[str]) -> int | None:
     return total + current if seen else None
 
 
+# Swahili is head-first: the scale leads and its multiplier follows ("elfu mbili" is 2000),
+# and "na" joins the parts. Multiplier ceilings resolve "elfu moja mia tisa" as 1900, not
+# 1,900,000 — the narration's own `laki` covers hundreds of thousands.
+SW_UNITS = {"sifuri": 0, "moja": 1, "mbili": 2, "tatu": 3, "nne": 4, "tano": 5, "sita": 6,
+            "saba": 7, "nane": 8, "tisa": 9}
+SW_TENS = {"kumi": 10, "ishirini": 20, "thelathini": 30, "arobaini": 40, "hamsini": 50,
+           "sitini": 60, "sabini": 70, "themanini": 80, "tisini": 90}
+SW_SCALES = {"bilioni": (10**9, 1000), "milioni": (10**6, 1000), "laki": (10**5, 100),
+             "elfu": (1000, 100)}
+SW_PHRASE_WORDS = set(SW_UNITS) | set(SW_TENS) | set(SW_SCALES) | {"mia", "na"}
+
+
+def evaluate_swahili_number(words: list[str]) -> int | None:
+    """`["elfu", "mbili", "na", "ishirini", "na", "sita"] -> 2026`. None if not one number."""
+    toks = [w for w in words if w != "na"]
+    if not toks or words[-1] == "na":
+        return None
+
+    def parse(pos: int, limit: int) -> tuple[int, int]:
+        total = 0
+        while pos < len(toks):
+            t = toks[pos]
+            if t in SW_SCALES and SW_SCALES[t][0] < limit:
+                mult, pos = parse(pos + 1, SW_SCALES[t][1])
+                total += SW_SCALES[t][0] * (mult or 1)
+            elif t == "mia" and 100 < limit and pos + 1 < len(toks) and toks[pos + 1] in SW_UNITS:
+                total += 100 * SW_UNITS[toks[pos + 1]]
+                pos += 2
+            elif t in SW_TENS and total % 100 == 0 and SW_TENS[t] < limit:
+                total += SW_TENS[t]
+                pos += 1
+            elif t in SW_UNITS and total % 10 == 0 and SW_UNITS[t] < limit:
+                total += SW_UNITS[t]
+                pos += 1
+            else:
+                break
+        return total, pos
+
+    value, end = parse(0, 10**13)
+    return value if end == len(toks) else None
+
+
+# Set by `--language`; every normaliser below reads it.
+LANGUAGE = "en"
+
+
+def phrase_words() -> set[str]:
+    return SW_PHRASE_WORDS if LANGUAGE == "sw" else NUMBER_PHRASE_WORDS
+
+
+def evaluate_phrase(words: list[str]) -> int | None:
+    return evaluate_swahili_number(words) if LANGUAGE == "sw" else evaluate_number_phrase(words)
+
+
 def raw_normalize(word: str) -> str:
     """Lowercased letters and digits only, with no folding.
 
@@ -208,6 +262,9 @@ def raw_normalize(word: str) -> str:
 
 def normalize(word: str) -> str:
     w = re.sub(r"[^a-z0-9']", "", word.lower().replace("\u2019", "'"))
+    if LANGUAGE == "sw":
+        # Matched letter by letter, and recognition is made to spell numbers out, so no fold.
+        return w
     return NUMBER_WORDS.get(w) or BRITISH.get(w, w)
 
 
@@ -313,15 +370,21 @@ def recognise(audio: Path, model_name: str, batch_size: int, beam_size: int = 1
     from faster_whisper import BatchedInferencePipeline, WhisperModel
 
     model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    extra = {}
+    if LANGUAGE == "sw":
+        # Whisper's Swahili numerals are wrong, not just differently spelled ("mia mbili na
+        # hamsini" came back as 1250), so it is made to write the words the narration has.
+        vocab = model.hf_tokenizer.get_vocab()
+        extra["suppress_tokens"] = [-1] + sorted(i for t, i in vocab.items() if any(ch.isdigit() for ch in t))
     t0 = time.time()
     if batch_size and batch_size > 1:
         segments, _ = BatchedInferencePipeline(model=model).transcribe(
-            str(audio), language="en", beam_size=beam_size, batch_size=batch_size,
-            word_timestamps=True,
+            str(audio), language=LANGUAGE, beam_size=beam_size, batch_size=batch_size,
+            word_timestamps=True, **extra,
         )
     else:
         segments, _ = model.transcribe(
-            str(audio), language="en", beam_size=beam_size, word_timestamps=True
+            str(audio), language=LANGUAGE, beam_size=beam_size, word_timestamps=True, **extra
         )
     words: list[Recognised] = []
     for segment in segments:
@@ -376,18 +439,21 @@ def matching_view(canon: list[Canonical], text: str) -> tuple[list[str], list[li
     groups: list[list[int]] = []
     i = 0
     while i < len(canon):
-        if raw_normalize(canon[i].text) in NUMBER_PHRASE_WORDS:
+        if raw_normalize(canon[i].text) in phrase_words() - {"na"}:
             j = i
             while j + 1 < len(canon):
                 nxt = canon[j + 1]
-                if raw_normalize(nxt.text) not in NUMBER_PHRASE_WORDS:
+                if raw_normalize(nxt.text) not in phrase_words():
                     break
                 between = text[canon[j].char_end:nxt.char_start]
                 if re.fullmatch(r"[\s]*(and[\s]*)?", between, re.IGNORECASE) is None:
                     break            # punctuation between them: different numbers
                 j += 1
             if j > i:
-                value = evaluate_number_phrase(
+                # A trailing "na" joins the number to the next noun, not to more number.
+                while j > i and raw_normalize(canon[j].text) == "na":
+                    j -= 1
+                value = evaluate_phrase(
                     [raw_normalize(canon[k].text) for k in range(i, j + 1)]
                 )
                 if value is not None:
@@ -440,6 +506,53 @@ def attach_times(canon: list[Canonical], heard: list[Recognised],
                 word.measured = True
                 word.support = size
                 measured += 1
+    return measured
+
+
+# Swahili recognition splits and merges words ("cha giza" as "chagiza") far more than it
+# misspells them: 30% WER at 8% CER on FLEURS. Word runs of MIN_ANCHOR_BLOCK then barely
+# exist — one chapter measured 14% — so for Swahili the match is over letters instead.
+MIN_CHAR_BLOCK = 5
+
+
+def attach_times_chars(canon: list[Canonical], heard: list[Recognised]) -> int:
+    """`attach_times` over the letter streams, spaces and apostrophes removed."""
+    def key(w) -> str:
+        return w.normalized.replace("'", "")
+
+    c_owner: list[int] = []
+    for i, c in enumerate(canon):
+        c_owner.extend([i] * len(key(c)))
+    h_time: list[float] = []
+    for h in heard:
+        n = len(key(h))
+        h_time.extend(h.start + (k + 0.5) * (h.end - h.start) / n for k in range(n))
+    matcher = difflib.SequenceMatcher(
+        None, "".join(key(c) for c in canon), "".join(key(h) for h in heard),
+        autojunk=False,
+    )
+    hits: dict[int, list[tuple[int, float, int]]] = {}
+    for ci, hi, size in matcher.get_matching_blocks():
+        if size < MIN_CHAR_BLOCK:
+            continue
+        for k in range(size):
+            hits.setdefault(c_owner[ci + k], []).append((ci + k, h_time[hi + k], size))
+    first_char = {}
+    for pos, owner in enumerate(c_owner):
+        first_char.setdefault(owner, pos)
+    measured = 0
+    for i, got in hits.items():
+        n = len(key(canon[i]))
+        if len(got) * 3 < n:
+            continue
+        (p0, t0, size), (p1, t1, _) = got[0], got[-1]
+        per_char = (t1 - t0) / (p1 - p0) if p1 > p0 else 0.06
+        word = canon[i]
+        word.start = t0 - (p0 - first_char[i] + 0.5) * per_char
+        word.end = t1 + (first_char[i] + n - p1 - 0.5) * per_char
+        word.measured = True
+        word.support = max(1, size // 4)
+        measured += 1
     return measured
 
 
@@ -621,11 +734,19 @@ def main() -> int:
     ap.add_argument("--map", type=Path, help="page-word map from md-to-narration.py --emit-map")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--title", default="")
-    ap.add_argument("--asr-model", default="small.en")
+    ap.add_argument("--language", default="en", choices=["en", "sw"],
+                    help="language of the narration; sw also needs a multilingual model")
+    ap.add_argument("--asr-model", default=None,
+                    help="default small.en for en, large-v3-turbo for sw")
     ap.add_argument("--batch-size", type=int, default=16)
     # The retry exists to be correct, not fast, so it does not inherit the fast path's beam.
     ap.add_argument("--retry-beam-size", type=int, default=5)
     args = ap.parse_args()
+    global LANGUAGE
+    LANGUAGE = args.language
+    if args.asr_model is None:
+        # small (multilingual) garbles Swahili; turbo was measured at 8% CER on FLEURS sw_ke.
+        args.asr_model = "large-v3-turbo" if LANGUAGE == "sw" else "small.en"
 
     text = args.text.read_text()
     # Measure the file that will actually be served, so encoder delay is included rather than
@@ -650,7 +771,8 @@ def main() -> int:
         a retry must start from a fresh list rather than a partly-timed one.
         """
         canon = canonical_words(text)
-        measured = attach_times(canon, heard, matching_view(canon, text))
+        measured = (attach_times_chars(canon, heard) if LANGUAGE == "sw"
+                    else attach_times(canon, heard, matching_view(canon, text)))
         dropped = drop_implausible_anchors(canon)
         measured -= dropped
         holes = fill_holes(canon)

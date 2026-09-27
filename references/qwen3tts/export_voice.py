@@ -56,6 +56,11 @@ def main() -> None:
     ap.add_argument("--name", required=True)
     ap.add_argument("--out", required=True, help="voice asset directory to create")
     ap.add_argument("--notes", default=None)
+    ap.add_argument(
+        "--language",
+        default=None,
+        help="what the clip is spoken in; `swahili` makes the engine respell nasal onsets",
+    )
     args = ap.parse_args()
 
     # Imported here so `--help` works without the venv's heavy dependencies resolved.
@@ -144,6 +149,7 @@ def main() -> None:
         "text": args.text,
         "seconds": round(seconds, 3),
         "notes": args.notes,
+        "language": args.language,
         # So a 0.6B asset handed to a 1.7B engine fails with a sentence, not a shape error.
         "enc_dim": enc_dim,
         "frames": int(codes.shape[0]),

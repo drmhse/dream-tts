@@ -75,6 +75,10 @@ DELIVERY="${NARRATE_DELIVERY:-webm}"
 PAUSE_FILE="${NARRATE_PAUSE_FILE:-}"
 STATE_FILE="${NARRATE_STATE_FILE:-}"
 LIST=0
+VOICE_ARG=""
+# Text rules and recognition language. The engine's language rides in the voice asset.
+LANGUAGE="${NARRATE_LANGUAGE:-en}"
+SETS=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -82,6 +86,9 @@ while [ $# -gt 0 ]; do
     --document) DOCUMENT="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
     --engine) ENGINE="$2"; shift 2 ;;
+    --voice) VOICE_ARG="$2"; shift 2 ;;
+    --language) LANGUAGE="$2"; shift 2 ;;
+    --set) SETS+=(--set "$2"); shift 2 ;;
     --bitrate) BITRATE="$2"; shift 2 ;;
     --align-python) ALIGN_PYTHON="$2"; shift 2 ;;
     --no-align) SKIP_ALIGN=1; shift ;;
@@ -161,6 +168,12 @@ case "$ENGINE" in
   qwen3tts)  VOICE=voices/cosy-default-qwen3tts; QUANT="${NARRATE_QUANT:-f16}" ;;
   *) die "unknown engine '$ENGINE'" ;;
 esac
+[ -n "$VOICE_ARG" ] && VOICE="$VOICE_ARG"
+case "$LANGUAGE" in
+  en|english) LANGUAGE=en; NARRATE_LANG=english ;;
+  sw|swahili) LANGUAGE=sw; NARRATE_LANG=swahili ;;
+  *) die "unknown --language '$LANGUAGE'; en or sw" ;;
+esac
 # `f16` for qwen3tts, not its `q8_0` default. Both transformers are bandwidth-bound on weight
 # reads, and only a dense GEMM shares one read across a batch of segments: f16 batches 7.4x per
 # lane where q8_0 batches 1.1x. A chapter is hundreds of segments, so it always batches — RTF
@@ -219,7 +232,7 @@ if [ "$NEED_SERVER" = 1 ]; then
   say "Starting $ENGINE on :$PORT — loads once for all ${#FILES[@]} file(s)"
   DREAM_TTS_API_KEY="$KEY" "$SERVE_BIN" \
     --port "$PORT" --engine "$ENGINE" --voice "$VOICE" --max-chars "$MAX_CHARS" \
-    ${QUANT:+--quant "$QUANT"} \
+    ${QUANT:+--quant "$QUANT"} ${SETS[@]+"${SETS[@]}"} \
     >"$OUT/.server.log" 2>&1 &
   SERVER=$!
   trap 'kill $SERVER 2>/dev/null; wait $SERVER 2>/dev/null' EXIT
@@ -343,7 +356,7 @@ for src in "${FILES[@]}"; do
   # which is the exact failure this pipeline exists to prevent. So when a master already exists,
   # convert to a scratch file and refuse to replace the text that produced it.
   if [ -s "$wav" ] && [ -s "$txt" ]; then
-    "$NARRATE" narrate "$src" -o "$txt.regen" --emit-map "$map.regen" >/dev/null 2>&1
+    "$NARRATE" narrate "$src" --language "$NARRATE_LANG" -o "$txt.regen" --emit-map "$map.regen" >/dev/null 2>&1
     if ! cmp -s "$txt.regen" "$txt"; then
       warn "$base: markdown now converts differently than when the audio was made; keeping the
     original text so the manifest still describes the audio. Delete $wav to re-render."
@@ -352,7 +365,7 @@ for src in "${FILES[@]}"; do
     fi
     rm -f "$txt.regen" "$map.regen"
   else
-    "$NARRATE" narrate "$src" -o "$txt" --emit-map "$map" --stats 2>&1 | sed 's/^/    /'
+    "$NARRATE" narrate "$src" --language "$NARRATE_LANG" -o "$txt" --emit-map "$map" --stats 2>&1 | sed 's/^/    /'
   fi
   chars=$(wc -c < "$txt" | tr -d ' ')
   if [ "$chars" -gt "$MAX_CHARS" ]; then
@@ -412,7 +425,7 @@ for src in "${FILES[@]}"; do
     # at rather than only counting them.
     align_audio="$wav"; [ "$DELIVERY_EXT" = webm ] && align_audio="$delivery"
     "$ALIGN_PYTHON" scripts/align-narration.py --audio "$align_audio" --text "$txt" \
-      --map "$map" --out "$man" --title "$base" 2>&1 | sed 's/^/    /'
+      --map "$map" --out "$man" --title "$base" --language "$LANGUAGE" 2>&1 | sed 's/^/    /'
     if [ ! -s "$man" ]; then
       warn "$base: alignment produced no manifest"; failed=$((failed+1)); continue
     fi

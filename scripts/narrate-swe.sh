@@ -38,6 +38,8 @@ ONLY=""
 # chapter re-rendered next week matches the one beside it.
 SEED="${NARRATE_SEED:-1234}"
 LIST=0
+VOICE=""
+LANGUAGE=""
 NO_PUBLISH=0
 DRY=0
 
@@ -48,6 +50,8 @@ while [ $# -gt 0 ]; do
     --out) OUT="$2"; shift 2 ;;
     --only) ONLY="$2"; shift 2 ;;
     --seed) SEED="$2"; shift 2 ;;
+    --voice) VOICE="$2"; shift 2 ;;
+    --language) LANGUAGE="$2"; shift 2 ;;
     --list) LIST=1; shift ;;
     --no-publish) NO_PUBLISH=1; shift ;;
     --dry-run) DRY=1; shift ;;
@@ -130,7 +134,7 @@ if [ "$pending" = 0 ]; then
   say "All ${#ROWS[@]} chapter(s) already rendered; publishing only"
 else
   scripts/narrate-book.sh --book "$BOOK" --out "$OUT" --engine "$ENGINE" --seed "$SEED" \
-    ${ONLY:+--only "$ONLY"} \
+    ${ONLY:+--only "$ONLY"} ${VOICE:+--voice "$VOICE"} ${LANGUAGE:+--language "$LANGUAGE"} \
     || warn "some chapters failed; publishing whatever completed"
 fi
 
