@@ -83,7 +83,13 @@ The export embeds the orthography (`meta::scheme`), so the engine tokenizes as t
    with an English reference the adapter spoke Swahili with an English accent, and training could
    not undo it (items 5 and 6). `clone=xvector` (speaker embedding only) takes the accent from the
    adapter: `male-qwen3tts` CER 2.4% over 36 renders against 6.0%.
-8. **Loudness.** The model copies its reference's level: the owner's 16 s clip rendered chapters
+8. **Generic voices** (`voices/sw-male-qwen3tts`, `voices/sw-female-qwen3tts`): designed with
+   Qwen3-TTS VoiceDesign from a text description, spoken in Swahili through the adapter with
+   `clone=xvector`, and the most fluent take kept as the voice's own reference. They clone from
+   a Swahili clip, so nothing English is inherited: over three paragraphs, sentence-to-sentence
+   ECAPA 0.782 and 0.818 with CER 2.6 and 3.1%, against 0.672 and 0.699 for the English-reference
+   voices continuing their clips.
+9. **Loudness.** The model copies its reference's level: the owner's 16 s clip rendered chapters
    at -34.6 dB mean. The engine now lifts a request's median speech level to -20 dBFS after
    synthesis (`level_db`); a levelled re-export of the clip cost consistency (0.825 -> 0.795).
 

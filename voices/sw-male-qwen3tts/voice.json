@@ -1,0 +1,11 @@
+{
+  "engine": "qwen3tts",
+  "name": "sw-male-qwen3tts",
+  "text": "Habari za jioni. Leo tunaangazia mvua kubwa iliyonyesha katika maeneo ya milimani, bei ya mahindi sokoni, na barabara mpya itakayobadilisha maisha ya wakazi wa bonde hili. Pia tutazungumza na wafugaji wa ng'ombe kuhusu changamoto zao.",
+  "seconds": 15.22,
+  "notes": "A synthetic Kenyan Swahili voice: designed with Qwen3-TTS VoiceDesign, then given a Swahili reference spoken through the Swahili adapter in x-vector mode. No real person's voice.",
+  "language": "swahili",
+  "enc_dim": 2048,
+  "frames": 191,
+  "codebooks": 16
+}
