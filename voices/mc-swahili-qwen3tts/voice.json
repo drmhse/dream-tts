@@ -1,0 +1,11 @@
+{
+  "engine": "qwen3tts",
+  "name": "mc-swahili-qwen3tts",
+  "text": "Na Omari atatuletea ripoti kutoka pande za Eldoret ambapo helikopta ambayo ilikuwa imebeba wanasiasa imeweza kutua salama. Pia atatueleza kuhusu mipangilio ya wanafunzi wanaoenda kufanya mtihani wao wa kidato cha nne.",
+  "seconds": 16.085,
+  "notes": "Kenyan Swahili news read, 16 s, the owner's own voice. language=swahili turns on nasal-onset respelling.",
+  "language": "swahili",
+  "enc_dim": 2048,
+  "frames": 202,
+  "codebooks": 16
+}
