@@ -1,0 +1,21 @@
+{
+  "language": "swahili",
+  "row": 2074,
+  "vowels": "aeiou",
+  "apostrophes": "’‘ʼ`",
+  "map": {
+    "ng'": "ŋ"
+  },
+  "onsets": [
+    "mb",
+    "mv",
+    "nd",
+    "ng",
+    "nj",
+    "nz",
+    "j"
+  ],
+  "syllabic": "mn",
+  "glides": "wy",
+  "isolate_map": true
+}

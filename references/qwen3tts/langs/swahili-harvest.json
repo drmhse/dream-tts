@@ -1,0 +1,17 @@
+{
+  "language": "Swahili",
+  "code": "sw",
+  "region": "Kenyan",
+  "accents": [
+    "kenyan",
+    "tanzanian",
+    "other",
+    "unsure"
+  ],
+  "keep_accent": "kenyan",
+  "notes": "Keep ng' apostrophes.",
+  "channel": "",
+  "title_prefix": "",
+  "min_seconds": 900,
+  "queries": []
+}

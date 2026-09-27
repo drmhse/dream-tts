@@ -70,3 +70,6 @@ __pycache__/
 
 # Narration run logs from scripts/narrate-*.sh.
 *.log
+
+# A harvest config naming its sources; the tracked <language>-harvest.json is the template.
+/references/*/langs/*-harvest.local.json
