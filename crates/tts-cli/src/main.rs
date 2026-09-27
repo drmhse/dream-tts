@@ -94,6 +94,9 @@ struct Speak {
     /// already narration output.
     #[arg(long)]
     raw: bool,
+    /// Verbalisation rules when `--text-file` is narrated: english or swahili.
+    #[arg(long, default_value = "english")]
+    text_language: tts_narrate::Language,
     /// Where to write the WAV.
     #[arg(long, value_name = "PATH")]
     out: PathBuf,
@@ -534,7 +537,7 @@ fn cmd_speak(args: &Speak, cfg: &Config) -> Result<()> {
         (Some(t), _) => t.clone(),
         (None, Some(p)) => {
             let p = cfg.locate_or_err(p, "text file")?;
-            documents::text_for_speaking(&p, args.raw)?
+            documents::text_for_speaking(&p, args.raw, args.text_language)?
         }
         (None, None) => anyhow::bail!("pass --text or --text-file"),
     };

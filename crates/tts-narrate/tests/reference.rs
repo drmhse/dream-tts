@@ -347,7 +347,7 @@ fn code_blocks_are_dropped_unless_asked_for() {
         "```sh\nls\n```\n\nProse.\n",
         &Options {
             keep_code: true,
-            keep_captions: true,
+            ..Options::default()
         },
     );
     assert!(kept.contains("ls"), "{kept:?}");
@@ -362,8 +362,8 @@ fn a_figure_contributes_its_caption() {
     let dropped = convert(
         "{{< chapter-figure caption=\"The two paths\" >}}\n\nProse.\n",
         &Options {
-            keep_code: false,
             keep_captions: false,
+            ..Options::default()
         },
     );
     assert_eq!(dropped, "Prose.\n");

@@ -4,7 +4,7 @@
 //! paragraph because the engines insert a longer gap at a paragraph boundary than at a
 //! sentence one (320 ms against 90 ms), and that gap is the audible section break.
 
-use crate::inline::clean_inline;
+use crate::inline::clean_inline_in;
 use crate::math::drop_display_math;
 use crate::re::{self, compile};
 use crate::source::{
@@ -21,6 +21,25 @@ static BULLET: Lazy<Regex> = Lazy::new(|| compile(r"^\s*(?:[-*+]|\d+\.)\s+(.*)$"
 static TABLE_ROW: Lazy<Regex> = Lazy::new(|| compile(r"^\s*\|.*\|\s*$"));
 static TABLE_RULE: Lazy<Regex> = Lazy::new(|| compile(r"^\s*\|[\s|:\-]+\|\s*$"));
 
+/// Whose verbalisation rules apply to numbers, money, dates and symbols.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Language {
+    #[default]
+    English,
+    Swahili,
+}
+
+impl std::str::FromStr for Language {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "en" | "english" => Ok(Self::English),
+            "sw" | "swahili" | "kiswahili" => Ok(Self::Swahili),
+            other => Err(format!("no narration rules for `{other}`; use english or swahili")),
+        }
+    }
+}
+
 /// How much of the source survives into speech.
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
@@ -29,6 +48,7 @@ pub struct Options {
     /// Promote a figure's `caption=` to prose. The listener cannot see the figure, and the
     /// caption is usually the one sentence stating what it was for.
     pub keep_captions: bool,
+    pub language: Language,
 }
 
 impl Default for Options {
@@ -36,6 +56,7 @@ impl Default for Options {
         Self {
             keep_code: false,
             keep_captions: true,
+            language: Language::English,
         }
     }
 }
@@ -151,6 +172,11 @@ pub fn convert(text: &str, options: &Options) -> String {
         text = re::sub_str(&CODE_BLOCK, &text, "");
     }
 
+    let clean_inline = |s: &str| clean_inline_in(s, options.language);
+    let footnote = match options.language {
+        Language::English => "Footnote",
+        Language::Swahili => "Tanbihi",
+    };
     let mut paragraphs: Vec<String> = Vec::new();
     let mut buffer: Vec<String> = Vec::new();
 
@@ -167,7 +193,7 @@ pub fn convert(text: &str, options: &Options) -> String {
             flush(&mut buffer, &mut paragraphs);
             let body = clean_inline(&re::g(&caps, 2));
             if !body.is_empty() {
-                paragraphs.push(format!("Footnote {}. {}", re::g(&caps, 1), sentence(&body)));
+                paragraphs.push(format!("{footnote} {}. {}", re::g(&caps, 1), sentence(&body)));
             }
             continue;
         }

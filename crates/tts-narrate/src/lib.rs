@@ -20,13 +20,14 @@ pub mod math;
 pub mod numbers;
 pub mod page;
 pub mod source;
+pub mod swahili;
 pub mod tables;
 
 mod re;
 
-pub use blocks::{convert, Options};
+pub use blocks::{convert, Language, Options};
 pub use code::speak_code;
-pub use inline::clean_inline;
+pub use inline::{clean_inline, clean_inline_in};
 pub use math::speak_math;
 pub use numbers::speak_numbers;
 pub use page::page_text;

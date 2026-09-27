@@ -9,7 +9,8 @@ use crate::tables::{
     alternation_longest_first, map_of, GREEK_GLYPHS, MAGNITUDES, MANGLED_COMPOUNDS, NOT_A_NOUN,
     PROSE_CAPS_AS_WORDS, PROSE_SYMBOLS,
 };
-use crate::{abbrev, code, math, numbers};
+use crate::blocks::Language;
+use crate::{abbrev, code, math, numbers, swahili};
 use fancy_regex::Regex;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
@@ -189,7 +190,15 @@ fn split_mangled(line: &str) -> String {
 }
 
 pub fn clean_inline(line: &str) -> String {
+    clean_inline_in(line, Language::English)
+}
+
+pub fn clean_inline_in(line: &str, language: Language) -> String {
+    let swahili = language == Language::Swahili;
     let mut line = re::sub(&CODE_SPAN, line, |c| code::speak_code(&re::g(c, 1)));
+    if swahili {
+        line = swahili::speak_currency(&line);
+    }
     // Currency before maths, and both before anything else: a paragraph quoting two prices
     // looks exactly like one `$...$` span, so the prose between them would be swallowed.
     // "Level 2+" and "$100M+" are the same construction — a floor — and the plus has to be
@@ -216,13 +225,18 @@ pub fn clean_inline(line: &str) -> String {
     // A footnote marker is a superscript link on the page; spoken it is a caret and a digit
     // mid-clause. The note is narrated where it is defined.
     line = re::sub_str(&FOOTNOTE_REF, &line, "");
-    line = re::sub_str(&numbers::NUMERIC_INTERVAL, &line, "${1} to ${2}");
+    if !swahili {
+        line = re::sub_str(&numbers::NUMERIC_INTERVAL, &line, "${1} to ${2}");
+    }
     line = re::sub(&ANGLE_URL, &line, |c| speak_url(&re::g(c, 1)));
     line = re::sub(&BARE_URL, &line, |c| speak_url(&re::g(c, 0)));
     // A bare DOI, which the rule above never sees because it has no scheme. Twenty-six
     // characters of digits, dots and slashes is the input most likely to send the AR loop
     // into babble, and on a real paper's abstract it did. A narrator says "DOI" and moves on.
     line = re::sub_str(&BARE_DOI, &line, "DOI");
+    if swahili {
+        line = swahili::speak(&line);
+    }
     line = re::sub_str(&CHECKBOX_START, &line, "");
     line = re::sub_str(&CHECKBOX_MID, &line, "");
     // Bare square brackets are template notation — "move from [painful current state]". A

@@ -48,6 +48,9 @@ pub struct Narrate {
     /// Omit figure captions instead of narrating them.
     #[arg(long)]
     pub no_captions: bool,
+    /// Verbalisation rules for numbers, money and dates: english or swahili.
+    #[arg(long, default_value = "english")]
+    pub language: tts_narrate::Language,
     /// With --out-dir, also write the page-word maps.
     #[arg(long, requires = "out_dir")]
     pub maps: bool,
@@ -61,6 +64,7 @@ impl Narrate {
         Options {
             keep_code: self.keep_code,
             keep_captions: !self.no_captions,
+            language: self.language,
         }
     }
 }
@@ -231,7 +235,7 @@ fn report(args: &Narrate, name: &str, narration: &str, out: Option<&Path>) {
 /// Speaking raw markdown reads the syntax aloud, so a `.md` file goes through the converter
 /// by default; `.txt` is taken literally, which is what the benchmark fixtures in
 /// `examples/` depend on. `--raw` forces the literal reading for anything.
-pub fn text_for_speaking(path: &Path, raw: bool) -> Result<String> {
+pub fn text_for_speaking(path: &Path, raw: bool, language: tts_narrate::Language) -> Result<String> {
     let format = Format::of(path);
     if raw || matches!(format, Some(Format::Text) | None) {
         return std::fs::read_to_string(path)
@@ -244,7 +248,13 @@ pub fn text_for_speaking(path: &Path, raw: bool) -> Result<String> {
         .map(|c| c.markdown())
         .collect::<Vec<_>>()
         .join("\n\n");
-    let narration = tts_narrate::convert(&markdown, &Options::default());
+    let narration = tts_narrate::convert(
+        &markdown,
+        &Options {
+            language,
+            ..Options::default()
+        },
+    );
     if let Some(format) = format {
         ui::field_note(
             "input",
