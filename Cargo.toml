@@ -8,6 +8,8 @@ members = [
     "crates/tts-narrate",
     "crates/tts-phoneme",
     "crates/tts-import",
+    "crates/tts-doc",
+    "crates/tts-speech",
     "crates/tts-jobs",
     "crates/tts-cli",
     "crates/tts-serve",

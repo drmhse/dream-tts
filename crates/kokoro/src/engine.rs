@@ -51,6 +51,12 @@ pub struct KokoroEngine {
     model: Model,
     voices: Voices,
     g2p: tts_phoneme::g2p::G2P,
+    /// Whether `g2p` is the British frontend.
+    british: bool,
+    /// The other accent's frontend, loaded the first time a request's voice needs it.
+    other: std::sync::OnceLock<Option<tts_phoneme::g2p::G2P>>,
+    frontend: std::path::PathBuf,
+    fallback: bool,
     voice: String,
 }
 
@@ -102,14 +108,46 @@ impl KokoroEngine {
             "unknown voice `{voice}`; `--set voice=<name>` takes one of: {}",
             voices.names().join(", ")
         );
-        let g2p = tts_phoneme::g2p::G2P::load(&config.path("frontend", "frontend"), british)?;
+        // On unless asked off: a word misaki drops is silence in the middle of a sentence.
+        let fallback = match config.overrides.get("fallback").and_then(|p| p.to_str()) {
+            Some("off") => false,
+            Some("on") | None => true,
+            Some(other) => anyhow::bail!("--set fallback= takes on or off, got {other:?}"),
+        };
+        let frontend = config.path("frontend", "frontend");
+        let g2p = tts_phoneme::g2p::G2P::load(&frontend, british)?.with_fallback(fallback);
         mem_line("loaded", &device);
         Ok(Self {
             model,
             voices,
             g2p,
+            british,
+            other: std::sync::OnceLock::new(),
+            frontend,
+            fallback,
             voice,
         })
+    }
+
+    /// The voice a request speaks in, and the frontend for its accent: `bf_`/`bm_` read with
+    /// the British lexicon, as a voice chosen at load does.
+    fn voice_for<'a>(
+        &'a self,
+        request: &'a SynthesisRequest,
+    ) -> (&'a str, &'a tts_phoneme::g2p::G2P) {
+        // No speaker: the voice and frontend chosen at load, `--set british=` included.
+        let Some(voice) = request.speaker.as_deref() else {
+            return (&self.voice, &self.g2p);
+        };
+        if voice.starts_with('b') == self.british {
+            return (voice, &self.g2p);
+        }
+        let other = self.other.get_or_init(|| {
+            tts_phoneme::g2p::G2P::load(&self.frontend, !self.british)
+                .ok()
+                .map(|g| g.with_fallback(self.fallback))
+        });
+        (voice, other.as_ref().unwrap_or(&self.g2p))
     }
 }
 
@@ -124,6 +162,13 @@ impl Engine for KokoroEngine {
                 "engine `{ID}` cannot clone: its voices are fixed style tables, and there is \
                  no path from a reference clip to one of them. Pick one with \
                  `--set voice=<name>` instead of `--voice`"
+            );
+        }
+        if let Some(speaker) = &request.speaker {
+            anyhow::ensure!(
+                self.voices.names().contains(&speaker.as_str()),
+                "unknown voice `{speaker}`; engine `{ID}` carries: {}",
+                self.voices.names().join(", ")
             );
         }
         tts_core::engine::validate_against(&self.capabilities(), request)
@@ -152,7 +197,8 @@ impl Engine for KokoroEngine {
         let t0 = Instant::now();
 
         // The frontend runs a segment ahead on another thread, so the GPU never waits on it.
-        let (g2p, segments) = (&self.g2p, &flat);
+        let (voice, g2p) = self.voice_for(request);
+        let segments = &flat;
         let (tx, rx) = std::sync::mpsc::sync_channel(2);
         std::thread::scope(|sc| -> Result<()> {
             sc.spawn(move || {
@@ -176,7 +222,7 @@ impl Engine for KokoroEngine {
                 if ids.len() <= 2 {
                     continue;
                 }
-                let style = self.voices.style(&self.voice, ids.len() - 2)?;
+                let style = self.voices.style(voice, ids.len() - 2)?;
                 let (samples, timings, durations) = self
                     .model
                     .synthesize_aligned(&ids, &style, 1.0, &mut draws)?;

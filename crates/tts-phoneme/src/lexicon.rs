@@ -958,6 +958,64 @@ impl Lexicon {
         format!("{head}{}", apply_stress(tail, Some(-0.5)))
     }
 
+    /// A pronunciation for a word misaki has no entry or rule for, which misaki drops. Not
+    /// part of misaki, so the parity gate never sees it: a caller opts in.
+    ///
+    /// A short word with no vowel, or a short capitalised one, is initials and is spelled —
+    /// `png`, `npm`. A longer one is tried as a compound of known words — `mysite` as `my` +
+    /// `site` — in the fewest pieces. Anything else stays unknown: a guessed spelling read
+    /// with confidence is worse than a named gap.
+    pub fn approximate(&self, word: &str) -> Option<Hit> {
+        if word.is_empty() || !word.chars().all(|c| c.is_ascii_alphabetic()) {
+            return None;
+        }
+        let n = word.chars().count();
+        let lower = word.to_ascii_lowercase();
+        let vowelless = !lower.contains(['a', 'e', 'i', 'o', 'u', 'y']);
+        if n <= 4 && (vowelless || (n <= 3 && word == word.to_ascii_uppercase())) {
+            let letters: Option<Vec<String>> = word
+                .chars()
+                .map(|c| self.plain(&c.to_ascii_uppercase().to_string()))
+                .collect();
+            return letters.map(|l| (l.join(" "), 2));
+        }
+        // Fewest pieces over the lowercase word, each at least two letters and known.
+        let chars: Vec<char> = lower.chars().collect();
+        let mut best: Vec<Option<Vec<String>>> = vec![None; n + 1];
+        best[0] = Some(Vec::new());
+        for end in 2..=n {
+            for start in 0..=end - 2 {
+                let Some(before) = best[start].clone() else {
+                    continue;
+                };
+                if before.len() >= 3 {
+                    continue;
+                }
+                let piece: String = chars[start..end].iter().collect();
+                if let Some(ps) = self.plain(&piece) {
+                    let mut next = before;
+                    next.push(ps);
+                    if best[end].as_ref().is_none_or(|b| next.len() < b.len()) {
+                        best[end] = Some(next);
+                    }
+                }
+            }
+        }
+        best[n]
+            .take()
+            .filter(|pieces| pieces.len() >= 2)
+            .map(|pieces| (pieces.concat(), 2))
+    }
+
+    /// A word's entry as it stands: gold before silver, a homograph's default.
+    fn plain(&self, word: &str) -> Option<String> {
+        let entry = self.golds.get(word).or_else(|| self.silvers.get(word))?;
+        match entry {
+            Entry::Word(ps) => Some(ps.clone()),
+            Entry::Tagged(by_tag) => by_tag.get("DEFAULT").cloned().flatten(),
+        }
+    }
+
     pub fn derive(&self, word: &str) -> Option<Hit> {
         let lower = word.to_lowercase();
         if let Some(ps) = Self::particle(&lower) {

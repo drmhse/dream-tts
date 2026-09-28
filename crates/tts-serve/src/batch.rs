@@ -21,6 +21,8 @@ pub struct BatchRequest {
     #[serde(default)]
     voice: Option<String>,
     #[serde(default)]
+    speaker: Option<String>,
+    #[serde(default)]
     seed: Option<u64>,
 }
 
@@ -66,6 +68,7 @@ pub async fn post_batch(
         instruct_text: None,
         speed: 1.0,
         voice: req.voice.clone(),
+        speaker: req.speaker.clone(),
         seed: req.seed,
     };
     for t in &texts {

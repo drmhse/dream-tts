@@ -7,11 +7,14 @@ license.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 tts-core = { path = "../tts-core", default-features = false }
-audio8 = { path = "../audio8", default-features = false }
-cosyvoice = { path = "../cosyvoice", default-features = false }
-kokoro = { path = "../kokoro", default-features = false }
-qwen3tts = { path = "../qwen3tts", default-features = false }
+# Each optional, so a build can carry one engine: an app bundling Kokoro alone ships none of
+# the other three's code.
+audio8 = { path = "../audio8", default-features = false, optional = true }
+cosyvoice = { path = "../cosyvoice", default-features = false, optional = true }
+kokoro = { path = "../kokoro", default-features = false, optional = true }
+qwen3tts = { path = "../qwen3tts", default-features = false, optional = true }
 
 [features]
-default = ["metal"]
-metal = ["audio8/metal", "cosyvoice/metal", "kokoro/metal", "qwen3tts/metal", "tts-core/metal"]
+default = ["metal", "all"]
+all = ["audio8", "cosyvoice", "kokoro", "qwen3tts"]
+metal = ["audio8?/metal", "cosyvoice?/metal", "kokoro?/metal", "qwen3tts?/metal", "tts-core/metal"]

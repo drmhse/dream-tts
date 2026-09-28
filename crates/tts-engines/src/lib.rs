@@ -63,12 +63,17 @@ use tts_core::{Capabilities, Engine, EngineConfig};
 /// `kokoro` follows it rather than leads despite being the fastest here: it cannot clone,
 /// so defaulting to it would answer a request for a cloned voice with a stranger's.
 pub fn catalogue() -> Vec<Capabilities> {
-    vec![
-        qwen3tts::capabilities(),
-        kokoro::engine::capabilities(),
-        audio8::engine::capabilities(),
-        cosyvoice::capabilities(),
-    ]
+    #[allow(unused_mut)]
+    let mut out = Vec::new();
+    #[cfg(feature = "qwen3tts")]
+    out.push(qwen3tts::capabilities());
+    #[cfg(feature = "kokoro")]
+    out.push(kokoro::engine::capabilities());
+    #[cfg(feature = "audio8")]
+    out.push(audio8::engine::capabilities());
+    #[cfg(feature = "cosyvoice")]
+    out.push(cosyvoice::capabilities());
+    out
 }
 
 /// Ids a caller may pass to [`load`].
@@ -83,16 +88,25 @@ pub fn default_id() -> &'static str {
         .into_iter()
         .find(|c| c.available)
         .map(|c| c.id)
-        .unwrap_or(audio8::engine::ID)
+        .or_else(|| catalogue().first().map(|c| c.id))
+        .unwrap_or("none")
 }
 
 pub fn load(id: &str, config: &EngineConfig) -> Result<Box<dyn Engine>> {
+    let _ = config;
     match id {
+        #[cfg(feature = "audio8")]
         audio8::engine::ID => Ok(Box::new(audio8::engine::Audio8Engine::load(config)?)),
+        #[cfg(feature = "cosyvoice")]
         cosyvoice::ID => Ok(Box::new(cosyvoice::CosyVoiceEngine::load(config)?)),
+        #[cfg(feature = "qwen3tts")]
         qwen3tts::ID => Ok(Box::new(qwen3tts::Qwen3TtsEngine::load(config)?)),
+        #[cfg(feature = "kokoro")]
         kokoro::engine::ID => Ok(Box::new(kokoro::engine::KokoroEngine::load(config)?)),
-        other => anyhow::bail!("unknown engine `{other}`; available: {}", ids().join(", ")),
+        other => anyhow::bail!(
+            "engine `{other}` is not in this build; it carries: {}",
+            ids().join(", ")
+        ),
     }
 }
 
@@ -115,13 +129,13 @@ pub fn default_caveat() -> Option<String> {
 /// [`default_root`] — kept here so the CLI, the service and `scripts/bootstrap.sh` do
 /// not each carry their own copy of the mapping.
 pub fn default_voice(id: &str) -> &'static str {
+    // Names rather than each crate's `ID`, so the mapping holds in a build without them.
     match id {
-        audio8::engine::ID => "voices/cosy-default",
-        cosyvoice::ID => "voices/cosy-default-cosyvoice",
-        qwen3tts::ID => "voices/cosy-default-qwen3tts",
+        "audio8" => "voices/cosy-default",
+        "cosyvoice" => "voices/cosy-default-cosyvoice",
+        "qwen3tts" => "voices/cosy-default-qwen3tts",
         // kokoro is Cloning::None: its voices are inside the checkpoint, so there is no
         // asset to name. `every_id_has_conventions` skips it for that reason.
-        kokoro::engine::ID => "",
         _ => "",
     }
 }
@@ -133,6 +147,7 @@ pub fn default_voice(id: &str) -> &'static str {
 /// that are actually there. `Ok(vec![])` when the engine has none or the asset is absent.
 pub fn builtin_voices(id: &str, root: &std::path::Path) -> Result<Vec<String>> {
     match id {
+        #[cfg(feature = "kokoro")]
         kokoro::engine::ID => {
             let path = root.join("voices.safetensors");
             if !path.exists() {
@@ -140,7 +155,10 @@ pub fn builtin_voices(id: &str, root: &std::path::Path) -> Result<Vec<String>> {
             }
             kokoro::model::Voices::names_in(&path)
         }
-        _ => Ok(Vec::new()),
+        _ => {
+            let _ = root;
+            Ok(Vec::new())
+        }
     }
 }
 
@@ -148,17 +166,30 @@ pub fn builtin_voices(id: &str, root: &std::path::Path) -> Result<Vec<String>> {
 /// configuration, overridable through [`EngineConfig::overrides`].
 pub fn default_root(id: &str) -> &'static str {
     match id {
-        audio8::engine::ID => "references/audio8/weights",
-        cosyvoice::ID => "references/cosyvoice/weights",
-        qwen3tts::ID => "references/qwen3tts/weights",
-        kokoro::engine::ID => "references/kokoro/weights",
+        "audio8" => "references/audio8/weights",
+        "cosyvoice" => "references/cosyvoice/weights",
+        "qwen3tts" => "references/qwen3tts/weights",
+        "kokoro" => "references/kokoro/weights",
         _ => ".",
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "all"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_literal_names_are_the_crates_ids() {
+        assert_eq!(
+            [
+                audio8::engine::ID,
+                cosyvoice::ID,
+                qwen3tts::ID,
+                kokoro::engine::ID
+            ],
+            ["audio8", "cosyvoice", "qwen3tts", "kokoro"]
+        );
+    }
 
     #[test]
     fn default_is_qwen3tts() {

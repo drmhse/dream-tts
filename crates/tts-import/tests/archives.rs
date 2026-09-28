@@ -183,9 +183,9 @@ fn a_document_with_no_text_says_so_rather_than_yielding_nothing() {
 
 #[test]
 fn an_unknown_extension_lists_what_is_supported() {
-    let path = scratch("book.rtf");
-    std::fs::write(&path, "{\\rtf1}").expect("write");
-    let err = import(&path).expect_err("rtf is not supported");
+    let path = scratch("book.xlsx");
+    std::fs::write(&path, "not a spreadsheet").expect("write");
+    let err = import(&path).expect_err("a spreadsheet is not a document");
     let message = err.to_string();
     assert!(message.contains("epub"), "{message}");
 }

@@ -164,6 +164,9 @@ pub struct G2P {
     tagger: Tagger,
     lexicon: Lexicon,
     subtoken: Regex,
+    /// Approximate a word misaki would drop; see `Lexicon::approximate`. Off by default, so
+    /// the phoneme gate compares against misaki exactly.
+    fallback: bool,
 }
 
 impl G2P {
@@ -175,7 +178,13 @@ impl G2P {
             subtoken: Regex::new(
                 r"^['\u{2018}\u{2019}]+|\p{Lu}(?=\p{Lu}\p{Ll})|(?:^-)?(?:\d?[,.]?\d)+|[-_]+|['\u{2018}\u{2019}]{2,}|\p{L}*?(?:['\u{2018}\u{2019}]\p{L})*?\p{Ll}(?=\p{Lu})|\p{L}+(?:['\u{2018}\u{2019}]\p{L})*|[^-_\p{L}'\u{2018}\u{2019}\d]|['\u{2018}\u{2019}]+$",
             )?,
+            fallback: false,
         })
+    }
+
+    pub fn with_fallback(mut self, on: bool) -> Self {
+        self.fallback = on;
+        self
     }
 
     fn subtokenize(&self, word: &str) -> Vec<String> {
@@ -600,7 +609,11 @@ impl G2P {
         if !text.chars().any(char::is_alphabetic) {
             return None;
         }
-        match self.lexicon.derive(text) {
+        match self.lexicon.derive(text).or_else(|| {
+            self.fallback
+                .then(|| self.lexicon.approximate(text))
+                .flatten()
+        }) {
             Some(hit) => Some(hit),
             None => {
                 if !unknown.iter().any(|w| w == text) {

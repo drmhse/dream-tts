@@ -634,6 +634,7 @@ fn cmd_speak(args: &Speak, cfg: &Config) -> Result<()> {
     let request = SynthesisRequest {
         text,
         voice,
+        speaker: None,
         sampling: Sampling {
             temperature: args.temperature,
             top_p: args.top_p,

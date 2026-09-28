@@ -192,9 +192,10 @@ fn a_pdf_with_no_text_says_so_rather_than_yielding_an_empty_chapter() {
     write_pdf(&path, &[""], &[]);
     let err = import(&path).expect_err("a page of no text is an error");
     let message = err.to_string();
+    // Read from its pixels too, so a blank page is a blank page and not a missing OCR step.
     assert!(
-        message.contains("OCR"),
-        "the message must name the fix: {message}"
+        message.contains("no text") && message.contains("pixels"),
+        "the message must say what was tried: {message}"
     );
 }
 

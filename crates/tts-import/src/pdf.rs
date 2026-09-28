@@ -19,12 +19,11 @@ use crate::Chapter;
 use anyhow::{bail, Context, Result};
 use objc2::rc::Retained;
 use objc2::AnyThread;
-use objc2_foundation::{NSString, NSURL};
 use objc2_pdf_kit::{PDFDocument, PDFOutline};
 use std::path::Path;
 
 pub fn chapters(path: &Path) -> Result<Vec<Chapter>> {
-    let document = open(path)?;
+    let document = open_document(path)?;
     // SAFETY (every unsafe block in this module): PDFKit calls on a `Retained` handle we
     // own, on the calling thread. Nothing here escapes an autorelease pool boundary and no
     // returned object is used after its owner is dropped.
@@ -33,11 +32,26 @@ pub fn chapters(path: &Path) -> Result<Vec<Chapter>> {
         bail!("{} has no pages", path.display());
     }
 
-    let page_text: Vec<String> = (0..pages).map(|i| text_of_page(&document, i)).collect();
+    // A page with no text layer is a scan, and is read from its pixels. Per page, because a
+    // book is often typeset with scanned plates, or scanned with a typed cover.
+    let page_text: Vec<String> = (0..pages)
+        .map(|i| {
+            let text = text_of_page(&document, i);
+            if !text.trim().is_empty() {
+                return text;
+            }
+            match crate::ocr::pdf_page(path, &document, i) {
+                Ok(lines) => crate::ocr::paragraphs(&lines),
+                Err(e) => {
+                    eprintln!("ocr       page {}: {e:#}", i + 1);
+                    String::new()
+                }
+            }
+        })
+        .collect();
     if page_text.iter().all(|t| t.trim().is_empty()) {
         bail!(
-            "{} has {pages} page(s) and no extractable text, which means it is scanned images. \
-             This extracts text and does not perform OCR — run it through an OCR tool first.",
+            "{} has {pages} page(s) and no text, even read from its pixels",
             path.display()
         );
     }
@@ -51,14 +65,14 @@ pub fn chapters(path: &Path) -> Result<Vec<Chapter>> {
     }
 }
 
-fn open(path: &Path) -> Result<Retained<PDFDocument>> {
+pub fn open_document(path: &Path) -> Result<Retained<PDFDocument>> {
     let absolute =
         std::fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?;
     let as_string = absolute
         .to_str()
         .with_context(|| format!("{} is not valid UTF-8", absolute.display()))?;
     unsafe {
-        let url = NSURL::fileURLWithPath(&NSString::from_str(as_string));
+        let url = crate::file_url(Path::new(as_string))?;
         PDFDocument::initWithURL(PDFDocument::alloc(), &url).with_context(|| {
             format!(
                 "PDFKit could not open {} — encrypted, or not a PDF",

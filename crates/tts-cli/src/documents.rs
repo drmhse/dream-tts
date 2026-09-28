@@ -156,7 +156,7 @@ pub fn cmd_narrate(args: &Narrate) -> Result<()> {
     for path in &args.paths {
         let source =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let narration = tts_narrate::convert(&source, &args.options());
+        let narration = tts_speech::text::narration(&source, &args.options());
 
         // Always, not behind a flag: markup that reaches the voice is read aloud, and a
         // silent converter is how a chapter of "asterisk, asterisk, asterisk" shipped.
@@ -235,7 +235,11 @@ fn report(args: &Narrate, name: &str, narration: &str, out: Option<&Path>) {
 /// Speaking raw markdown reads the syntax aloud, so a `.md` file goes through the converter
 /// by default; `.txt` is taken literally, which is what the benchmark fixtures in
 /// `examples/` depend on. `--raw` forces the literal reading for anything.
-pub fn text_for_speaking(path: &Path, raw: bool, language: tts_narrate::Language) -> Result<String> {
+pub fn text_for_speaking(
+    path: &Path,
+    raw: bool,
+    language: tts_narrate::Language,
+) -> Result<String> {
     let format = Format::of(path);
     if raw || matches!(format, Some(Format::Text) | None) {
         return std::fs::read_to_string(path)
@@ -248,7 +252,7 @@ pub fn text_for_speaking(path: &Path, raw: bool, language: tts_narrate::Language
         .map(|c| c.markdown())
         .collect::<Vec<_>>()
         .join("\n\n");
-    let narration = tts_narrate::convert(
+    let narration = tts_speech::text::narration(
         &markdown,
         &Options {
             language,

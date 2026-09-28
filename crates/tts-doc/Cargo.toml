@@ -1,0 +1,16 @@
+[package]
+name = "tts-doc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+tts-narrate = { path = "../tts-narrate" }
+# Same version as tts-narrate's, so the `Lazy<Regex>` statics it exports are usable here
+# rather than re-declared. Re-declaring them is the drift this crate exists to avoid.
+fancy-regex = "0.19"
+
+[dev-dependencies]
+serde_json = "1"

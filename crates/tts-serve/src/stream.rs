@@ -62,6 +62,7 @@ pub async fn post_tts_stream(
 
     let (tx, rx) = mpsc::channel::<Result<Vec<u8>, String>>(CHUNK_QUEUE);
     let seed = req.seed;
+    let speaker = req.speaker.clone().filter(|s| !s.trim().is_empty());
     let worker = Arc::clone(&app);
 
     tokio::spawn(async move {
@@ -85,8 +86,10 @@ pub async fn post_tts_stream(
 
             let engine = Arc::clone(&worker);
             let voice = voice.clone();
+            let speaker = speaker.clone();
             let rendered = tokio::task::spawn_blocking(move || {
                 let mut request = crate::with_optional_voice(SynthesisRequest::new(text), voice);
+                request.speaker = speaker;
                 // One segment per call, so the engine must not split it again.
                 request.max_chars = usize::MAX;
                 if let Some(s) = seed {

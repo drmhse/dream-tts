@@ -14,6 +14,7 @@ fn main() -> anyhow::Result<()> {
     let out = engine.synthesize(&SynthesisRequest {
         text: text.clone(),
         voice: None,
+        speaker: None,
         sampling: Sampling::default(),
         max_chars: 400,
         max_new_tokens: usize::MAX,

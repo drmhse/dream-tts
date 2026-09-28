@@ -110,10 +110,17 @@ struct Args {
     /// Python service's `.api_key`.
     #[arg(long, default_value = ".api_key")]
     api_key_file: String,
+    /// Exit when the process that started this one goes away. For an app that owns its engine:
+    /// a crash or a force-quit ends the app without running its shutdown, and an engine left
+    /// behind holds the GPU and a port with a key nobody has.
+    #[arg(long)]
+    exit_with_parent: bool,
 }
 
 pub struct App {
     engine: Box<dyn Engine>,
+    /// The voices the engine carries, for a client choosing one per request.
+    speakers: Vec<String>,
     /// `None` for an engine that cannot clone: its voices are inside the checkpoint, so
     /// there is no asset to hold and a request must not be given one.
     voice: Option<Voice>,
@@ -214,6 +221,9 @@ pub struct TtsRequest {
     /// a voice asset directory per request instead of using the one this was started with.
     #[serde(default)]
     pub voice: Option<String>,
+    /// Also additive: a voice the engine carries, by name, for an engine that cannot clone.
+    #[serde(default)]
+    pub speaker: Option<String>,
     #[serde(default)]
     pub seed: Option<u64>,
 }
@@ -263,6 +273,7 @@ fn parse_request(headers: &HeaderMap, body: String) -> Result<TtsRequest, ApiErr
         instruct_text: None,
         speed: default_speed(),
         voice: header_str("x-voice"),
+        speaker: header_str("x-speaker"),
         seed,
     })
 }
@@ -380,6 +391,7 @@ async fn render(app: &Arc<App>, req: TtsRequest) -> Result<Rendered, ApiError> {
 
     let text = req.text.clone();
     let seed = req.seed;
+    let speaker = req.speaker.clone().filter(|s| !s.trim().is_empty());
 
     // One GPU: queue rather than contend. Held across the blocking call below, so the
     // permit — not the thread pool — is what bounds concurrent synthesis.
@@ -393,6 +405,7 @@ async fn render(app: &Arc<App>, req: TtsRequest) -> Result<Rendered, ApiError> {
     let started = Instant::now();
     let out = tokio::task::spawn_blocking(move || {
         let mut request = with_optional_voice(SynthesisRequest::new(text), voice);
+        request.speaker = speaker;
         request.max_chars = app2.segment_chars;
         if let Some(s) = seed {
             request.sampling = Sampling {
@@ -917,6 +930,9 @@ async fn get_capabilities(State(app): State<Arc<App>>) -> Json<serde_json::Value
     Json(json!({
         "apiVersion": "v1",
         "service": "dream-tts",
+        "version": env!("CARGO_PKG_VERSION"),
+        // Chosen per request as `speaker`; empty for an engine that clones instead.
+        "speakers": app.speakers,
         "engine": caps.id,
         "description": caps.description,
         "sampleRate": caps.sample_rate,
@@ -964,6 +980,17 @@ async fn not_implemented(Path(rest): Path<String>) -> ApiError {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if args.exit_with_parent {
+        let parent = std::os::unix::process::parent_id();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            // Reparented, to launchd or init: whoever started this has gone.
+            if std::os::unix::process::parent_id() != parent {
+                eprintln!("parent {parent} has gone; exiting");
+                std::process::exit(0);
+            }
+        });
+    }
     let cfg = tts_core::Config::load(args.config.as_deref())?;
     let serve = cfg.settings.serve.clone().unwrap_or_default();
 
@@ -1072,7 +1099,9 @@ async fn main() -> Result<()> {
         caps.sample_rate
     );
 
+    let speakers = tts_engines::builtin_voices(caps.id, &config.model_root).unwrap_or_default();
     let app = Arc::new(App {
+        speakers,
         engine_id: caps.id.to_string(),
         sample_rate: caps.sample_rate,
         engine,

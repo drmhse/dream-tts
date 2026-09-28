@@ -36,6 +36,7 @@ fn the_clock_lands_where_the_sound_is() {
         .synthesize(&SynthesisRequest {
             text: "The quick brown fox jumps over the lazy dog.".into(),
             voice: None,
+            speaker: None,
             sampling: Sampling::default(),
             max_chars: 400,
             max_new_tokens: usize::MAX,

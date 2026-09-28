@@ -56,6 +56,13 @@ stage, kept **separate from the misaki-identical core** so the byte-identity gat
 meaning: it only ever runs where misaki returned nothing, and `phoneme-validate` checks
 exactly that by comparing the strict path and the derived path separately.
 
+After it, and only in the engine (`G2P::with_fallback`; `--set fallback=off` disables it),
+`Lexicon::approximate` catches what is still unknown: a short vowelless or capitalised word is
+spelled from the letter entries (`png` as P N G), a longer one split into the fewest known
+words (`mysite` as my + site). Anything else is still dropped and named. The phoneme gate
+constructs its frontend without it, so misaki parity is measured on the strict path exactly as
+before (12,731 of 12,731 lines identical after the change).
+
 On a technical corpus — the worst case for a lexicon — it takes **2,037 unknown occurrences
 down to 612** out of 522,542 tokens. Four rule families do it: `-ied` and friends,
 comparatives, productive prefixes, and compound splitting. Two things that had to be right:

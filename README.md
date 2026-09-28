@@ -301,7 +301,8 @@ iSTFTNet decoder. What follows from that is most of what makes it worth having:
   reaches for espeak-ng on any word its lexicon misses. espeak-ng is GPL-3.0, so this port
   does not have it: `crates/tts-phoneme` is a lexicon, a tokenizer and a port of spaCy's POS
   tagger, **byte-identical to the pinned Python over 522,542 tokens** of real narration, and a
-  word it cannot pronounce is *named in a lint* rather than guessed at.
+  word it cannot pronounce is *named in a lint* rather than guessed at — unless it is initials
+  (`png`) or a compound of known words (`mysite`), which the engine approximates.
 
 Word error rate against the chapter, transcribed with the same Whisper settings as every other
 engine here, is **0.009** for `af_heart` — the lowest of the eight files on the demo page — and
@@ -421,12 +422,23 @@ and that is what decides which formats are easy:
 | DOCX / ODT | `w:pStyle` / `text:outline-level`, stated by the file |
 | HTML, Markdown | the heading levels |
 | PDF | the outline it declares, else one chapter — a wrong split is worse than none |
+| RTF | `\outlinelevel`, read natively |
+| FictionBook | nested `<section>` titles |
+| Word 97, RTFD, web archive | type size, through the system's text system (macOS) |
+| images, scanned PDF pages | none: one page each, read by Vision OCR (macOS) |
+| MOBI/AZW3, PPTX/Keynote/Pages, RST/Org/LaTeX/ipynb | converted first by Calibre, LibreOffice or Pandoc when installed; the error names the install when not |
+
+Formats are recognised by their contents before their extension, so a renamed file or one with
+no extension imports as what it is, and a text file is decoded as UTF-8, UTF-16 or Windows-1252.
+`tts_import::web::fetch` reads a web page's article the same way, and every importer ends in
+`tts-doc`'s block model, which DreamReader reads too.
 
 **PDF goes through PDFKit.** Reading order, column detection and de-hyphenation are a large
 body of work no pure-Rust extractor matches, and PDFKit lives in
 `/System/Library/Frameworks`, so it costs nothing to install and keeps the release audit's
-"system frameworks only" rule intact. A scanned document is refused with the fix named
-rather than silently yielding nothing — this extracts text and does not do OCR.
+"system frameworks only" rule intact. A page with no text layer is read from its pixels by
+Vision, a system framework as well; a page with nothing on it even then is reported, not
+passed as an empty chapter.
 
 `dream-tts speak --text-file` accepts the same formats and narrates them; a `.txt` file is
 spoken literally, and `--raw` forces that for anything.
@@ -442,8 +454,11 @@ curl -X POST localhost:3003/tts -H "X-API-Key: secret" \
      -o out.wav -D headers.txt
 ```
 
-One engine, loaded once, in 3.0 s. `voice` and `seed` are per request. The first selects a
-voice asset without a restart. The second makes a render reproducible. `--engine` and
+One engine, loaded once, in 3.0 s. `voice`, `speaker` and `seed` are per request. `voice`
+selects a voice asset for a cloning engine and `speaker` one of the voices an engine carries
+(Kokoro's `af_heart`; `/v1/capabilities` lists them as `speakers`), both without a restart.
+`seed` makes a render reproducible. `--exit-with-parent` ends the service with the process that
+started it, for an app that owns its engine. `--engine` and
 `--voice` default to whatever the registry says, so the service and `dream-tts engines`
 cannot drift apart.
 
@@ -641,7 +656,9 @@ crates/tts-serve/       the HTTP service: one engine, loaded once, behind a sema
 crates/tts-bench/       the thermally-honest measurement harness
 crates/tts-probe/       op-level benchmarks, one binary per question
 crates/tts-narrate/     markdown to speakable text: the verbalisation rules
-crates/tts-import/      any document to markdown, and the chapter split
+crates/tts-import/      any document to markdown, and the chapter split; OCR, conversion, web pages
+crates/tts-doc/         the block model and page geometry DreamTTS and DreamReader share
+crates/tts-speech/      speakable text and sentence chunking, shared with DreamReader
 crates/tts-jobs/        narration runs on disk: identity, resume, discovery
 crates/{audio8,cosyvoice,qwen3tts}/   one engine each, plus its fixture gate
 

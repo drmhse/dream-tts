@@ -1,0 +1,9 @@
+[package]
+name = "tts-speech"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tts-doc = { path = "../tts-doc" }
+tts-narrate = { path = "../tts-narrate" }

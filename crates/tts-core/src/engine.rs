@@ -154,6 +154,9 @@ impl std::error::Error for Interrupted {}
 pub struct SynthesisRequest {
     pub text: String,
     pub voice: Option<Voice>,
+    /// A voice the engine carries, by name — Kokoro's `af_heart` — for this request only. An
+    /// engine without built-in voices ignores it; `voice` is how those are chosen.
+    pub speaker: Option<String>,
     pub sampling: Sampling,
     /// Segment length budget in characters. Segmentation is what keeps prompts inside
     /// the model's context and bounds how much audio one AR run must stay coherent
@@ -172,6 +175,7 @@ impl SynthesisRequest {
         Self {
             text: text.into(),
             voice: None,
+            speaker: None,
             sampling: Sampling::default(),
             max_chars: 220,
             max_new_tokens: 512,
@@ -183,6 +187,11 @@ impl SynthesisRequest {
 
     pub fn with_voice(mut self, voice: Voice) -> Self {
         self.voice = Some(voice);
+        self
+    }
+
+    pub fn with_speaker(mut self, speaker: impl Into<String>) -> Self {
+        self.speaker = Some(speaker.into());
         self
     }
 

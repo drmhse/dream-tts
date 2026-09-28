@@ -10,6 +10,7 @@ anyhow = { workspace = true }
 # and neither pulls a C library — which is what keeps `bin/` free of non-system dylibs.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 quick-xml = "0.37"
+tts-doc = { path = "../tts-doc" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # PDF text extraction. PDFKit lives in /System/Library/Frameworks, so it costs nothing to
@@ -17,5 +18,12 @@ quick-xml = "0.37"
 # The pure-Rust extractors are poor on real book layouts and none of them read the outline,
 # which is where chapter boundaries actually are.
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL", "NSArray", "NSDictionary", "NSValue"] }
-objc2-pdf-kit = { version = "0.3", default-features = false, features = ["std", "PDFDocument", "PDFPage", "PDFOutline", "PDFDestination"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL", "NSArray", "NSDictionary", "NSValue", "NSAttributedString", "NSRange", "NSError", "NSEnumerator"] }
+# `.doc`, `.rtfd` and `.webarchive` through the system's text system: AppKit is a system
+# framework, so the audit against non-system dylibs still holds.
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSAttributedString", "NSFont", "NSText", "NSImage", "NSImageRep", "objc2-core-foundation"] }
+objc2-pdf-kit = { version = "0.3", default-features = false, features = ["std", "PDFDocument", "PDFPage", "PDFOutline", "PDFDestination", "objc2-core-graphics", "objc2-app-kit"] }
+# OCR, for a scanned page or a photograph. A system framework like PDFKit.
+objc2-vision = { version = "0.3", default-features = false, features = ["std", "VNRequest", "VNRequestHandler", "VNRecognizeTextRequest", "VNObservation", "VNTypes", "objc2-core-graphics", "objc2-core-foundation"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGContext", "CGColorSpace", "CGImage", "CGBitmapContext"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes"] }

@@ -31,6 +31,18 @@ impl Archive {
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }
 
+    /// One entry's bytes, or `None` when it is absent.
+    pub fn bytes(&mut self, name: &str) -> Option<Vec<u8>> {
+        let mut entry = self.inner.by_name(name).ok()?;
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf).ok()?;
+        Some(buf)
+    }
+
+    pub fn has(&self, name: &str) -> bool {
+        self.inner.index_for_name(name).is_some()
+    }
+
     /// One entry, as text, or `None` when it is absent. For parts a format only sometimes
     /// carries.
     pub fn read_opt(&mut self, name: &str) -> Option<String> {
