@@ -377,8 +377,8 @@ def _speak_url(url: str) -> str:
 # Order matters: the longest form is tried first, or `e.g.` is consumed by the `g.` half of a
 # shorter rule and `Ph.D.` by `D.`.
 ABBREVIATIONS: list[tuple[str, str]] = [
-    (r"\be\.\s*g\.(?=\s|$)", "for example"),
-    (r"\bi\.\s*e\.(?=\s|$)", "that is"),
+    (r"\be\.\s*g\.(?=[\s,;:)]|$)", "for example"),
+    (r"\bi\.\s*e\.(?=[\s,;:)]|$)", "that is"),
     (r"\ba\.\s*k\.\s*a\.(?=\s|$)", "also known as"),
     (r"\bw\.\s*r\.\s*t\.(?=\s|$)", "with respect to"),
     (r"\bet\s+al\.(?=[\s,;:)\]]|$)", "and colleagues"),
@@ -389,6 +389,7 @@ ABBREVIATIONS: list[tuple[str, str]] = [
     (r"\bapprox\.(?=\s|$)", "approximately"),
     (r"\bca\.(?=\s+\d)", "circa"),
     (r"\bFigs?\.(?=\s*\d)", "Figure"),
+    (r"\bFIG\.?(?=\s*\d)", "Figure"),
     (r"\bEqs?\.(?=\s*\(?\d)", "Equation"),
     (r"\bTabs?\.(?=\s*\d)", "Table"),
     (r"\bSecs?\.(?=\s*\d)", "Section"),
@@ -416,6 +417,12 @@ ABBREVIATIONS: list[tuple[str, str]] = [
                 "Dec": "December"}[m.group(1)]),
     (r"\b(Mar|Apr|Jun|Jul)\.(?=\s*\d)",
      lambda m: {"Mar": "March", "Apr": "April", "Jun": "June", "Jul": "July"}[m.group(1)]),
+    # A full date needs no period to be one: "Sep 28, 2026" is a web page's byline.
+    (r"\b(Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept?|Oct|Nov|Dec)(?=\s+\d{1,2},?\s+\d{4}\b)",
+     lambda m: {"Jan": "January", "Feb": "February", "Mar": "March", "Apr": "April",
+                "Jun": "June", "Jul": "July", "Aug": "August", "Sep": "September",
+                "Sept": "September", "Oct": "October", "Nov": "November",
+                "Dec": "December"}[m.group(1)]),
 ]
 
 MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August",
@@ -649,7 +656,7 @@ PROSE_CAPS_AS_WORDS = {
 CURRENCY = re.compile(
     r"(\b(?:a|an|the|[A-Za-z]+'s)\s+(?:[a-z]+\s+){0,2})?"
     r"\$(\d+(?:,\d{3})*)(?:\.(\d+))?"
-    r"(\s*(?:thousand|million|billion|trillion)\b|[KMBT]\b)?"
+    r"(\s*(?:thousand|million|billion|trillion)\b|(?:bn|tn|mn|[KMBT])\b)?"
     r"(\s+[a-z]+\b)?", re.I
 )
 
@@ -665,7 +672,9 @@ def _speak_currency(m: re.Match) -> str:
     det, whole, frac, scale, tail = m.groups()
     tail = tail or ""
     scale = (scale or "").strip()
-    scale = " " + MAGNITUDES.get(scale.upper(), scale.lower()) if scale else ""
+    # "$5.7bn" is news style for the letter form; read as "5 point 7 dollarsbn" without it.
+    key = scale.upper()[:1] if scale.upper() in ("BN", "TN", "MN") else scale.upper()
+    scale = " " + MAGNITUDES.get(key, scale.lower()) if scale else ""
     # Attributive use: "a $12 platform fee" is spoken "a 12 dollar platform fee", singular.
     # An article ahead of the amount and a noun behind it are the two cheap signals; either
     # one alone is wrong often enough to matter, since an article can belong to an earlier

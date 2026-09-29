@@ -50,6 +50,66 @@ pub fn flowing(narration: &str) -> String {
     out
 }
 
+/// A line set wholly in capitals is typography, not a run of acronyms, and this voice spells
+/// capitals: a web page's "EVAL DESIGN" heading was read letter by letter. Words of four or
+/// more letters with a vowel go to lower case; `API`, `HTTP` and the like stay spelled.
+pub fn unshouted(line: &str) -> String {
+    let letters = || line.chars().filter(|c| c.is_alphabetic());
+    let long_word = line
+        .split(|c: char| !c.is_alphabetic())
+        .any(|w| w.chars().count() >= 4 && has_vowel(w));
+    if letters().any(char::is_lowercase) || !long_word {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut word = String::new();
+    let mut first = true;
+    let flush = |word: &mut String, out: &mut String, first: &mut bool| {
+        if word.is_empty() {
+            return;
+        }
+        let lowered = if (word.chars().count() >= 4 && has_vowel(word))
+            || SHORT_WORDS.contains(&word.as_str())
+        {
+            let lower = word.to_lowercase();
+            if *first {
+                let mut c = lower.chars();
+                c.next()
+                    .map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
+            } else {
+                lower
+            }
+        } else {
+            word.clone()
+        };
+        out.push_str(&lowered);
+        *first = false;
+        word.clear();
+    };
+    for c in line.chars() {
+        if c.is_alphabetic() {
+            word.push(c);
+        } else {
+            flush(&mut word, &mut out, &mut first);
+            out.push(c);
+        }
+    }
+    flush(&mut word, &mut out, &mut first);
+    out
+}
+
+/// Short words a shouted heading is made of, which spelled would be nonsense.
+const SHORT_WORDS: &[&str] = &[
+    "A", "AN", "AS", "AT", "BE", "BY", "DO", "GO", "IF", "IN", "IS", "IT", "MY", "NO", "OF", "ON",
+    "OR", "SO", "TO", "UP", "WE", "ALL", "AND", "ARE", "BUT", "CAN", "FOR", "GET", "HAS", "HOW",
+    "ITS", "NEW", "NOT", "NOW", "ONE", "OUR", "OUT", "THE", "TWO", "USE", "WAS", "WHO", "WHY",
+    "YOU",
+];
+
+fn has_vowel(word: &str) -> bool {
+    word.chars().any(|c| "AEIOUYaeiouy".contains(c))
+}
+
 fn is_quote(c: char) -> bool {
     matches!(
         c,
@@ -75,7 +135,7 @@ pub fn narration(markdown: &str, options: &tts_narrate::Options) -> String {
             if line.trim().is_empty() {
                 String::new()
             } else {
-                flowing(line)
+                flowing(&unshouted(line))
             }
         })
         .collect::<Vec<_>>()
@@ -121,6 +181,21 @@ mod tests {
             "{out:?}"
         );
         assert!(out.contains("times"), "{out:?}");
+    }
+
+    #[test]
+    fn a_shouted_line_is_read_as_words() {
+        assert_eq!(unshouted("EVAL DESIGN"), "Eval design");
+        assert_eq!(
+            unshouted("/CLAUDE-API BUILD-EVAL"),
+            "/Claude-API build-eval"
+        );
+        assert_eq!(
+            unshouted("GETTING STARTED WITH THE API"),
+            "Getting started with the API"
+        );
+        assert_eq!(unshouted("HTTP"), "HTTP");
+        assert_eq!(unshouted("NASA and the API"), "NASA and the API");
     }
 
     #[test]

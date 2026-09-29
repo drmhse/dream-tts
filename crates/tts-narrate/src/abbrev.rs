@@ -12,8 +12,8 @@ use once_cell::sync::Lazy;
 /// Longest form first, or `e.g.` is consumed by the `g.` half of a shorter rule and `Ph.D.`
 /// by `D.`. The order of this list *is* the rule order.
 static PATTERNS: &[(&str, &str)] = &[
-    (r"\be\.\s*g\.(?=\s|$)", "for example"),
-    (r"\bi\.\s*e\.(?=\s|$)", "that is"),
+    (r"\be\.\s*g\.(?=[\s,;:)]|$)", "for example"),
+    (r"\bi\.\s*e\.(?=[\s,;:)]|$)", "that is"),
     (r"\ba\.\s*k\.\s*a\.(?=\s|$)", "also known as"),
     (r"\bw\.\s*r\.\s*t\.(?=\s|$)", "with respect to"),
     (r"\bet\s+al\.(?=[\s,;:)\]]|$)", "and colleagues"),
@@ -24,6 +24,7 @@ static PATTERNS: &[(&str, &str)] = &[
     (r"\bapprox\.(?=\s|$)", "approximately"),
     (r"\bca\.(?=\s+\d)", "circa"),
     (r"\bFigs?\.(?=\s*\d)", "Figure"),
+    (r"\bFIG\.?(?=\s*\d)", "Figure"),
     (r"\bEqs?\.(?=\s*\(?\d)", "Equation"),
     (r"\bTabs?\.(?=\s*\d)", "Table"),
     (r"\bSecs?\.(?=\s*\d)", "Section"),
@@ -68,6 +69,10 @@ static COMPILED: Lazy<Vec<(Regex, &'static str)>> =
 static MONTH_LONG: Lazy<Regex> =
     Lazy::new(|| compile(r"\b(Jan|Feb|Aug|Sept?|Oct|Nov|Dec)\.(?=\s*\d)"));
 static MONTH_SHORT: Lazy<Regex> = Lazy::new(|| compile(r"\b(Mar|Apr|Jun|Jul)\.(?=\s*\d)"));
+/// A full date needs no period to be one: "Sep 28, 2026" is a web page's byline.
+static MONTH_BARE: Lazy<Regex> = Lazy::new(|| {
+    compile(r"\b(Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept?|Oct|Nov|Dec)(?=\s+\d{1,2},?\s+\d{4}\b)")
+});
 
 /// A *run* of initials. "J. R. R. Tolkien" is three sentence boundaries to the segmenter and
 /// three falling cadences to the listener. A run is required, because a lone capital before a
@@ -89,7 +94,8 @@ pub fn expand(line: &str) -> String {
         line = re::sub_str(regex, &line, word);
     }
     line = re::sub(&MONTH_LONG, &line, |c| month(&re::g(c, 1)).to_string());
-    re::sub(&MONTH_SHORT, &line, |c| month(&re::g(c, 1)).to_string())
+    line = re::sub(&MONTH_SHORT, &line, |c| month(&re::g(c, 1)).to_string());
+    re::sub(&MONTH_BARE, &line, |c| month(&re::g(c, 1)).to_string())
 }
 
 pub fn collapse_initials(line: &str) -> String {

@@ -4,12 +4,12 @@
 //! removes, and the comments record only the cases where getting the order wrong shipped
 //! audible damage.
 
+use crate::blocks::Language;
 use crate::re::{self, compile};
 use crate::tables::{
     alternation_longest_first, map_of, GREEK_GLYPHS, MAGNITUDES, MANGLED_COMPOUNDS, NOT_A_NOUN,
     PROSE_CAPS_AS_WORDS, PROSE_SYMBOLS,
 };
-use crate::blocks::Language;
 use crate::{abbrev, code, math, numbers, swahili};
 use fancy_regex::Regex;
 use once_cell::sync::Lazy;
@@ -94,7 +94,7 @@ static CURRENCY: Lazy<Regex> = Lazy::new(|| {
     compile(concat!(
         r"(?i)(\b(?:a|an|the|[A-Za-z]+'s)\s+(?:[a-z]+\s+){0,2})?",
         r"\$(\d+(?:,\d{3})*)(?:\.(\d+))?",
-        r"(\s*(?:thousand|million|billion|trillion)\b|[KMBT]\b)?",
+        r"(\s*(?:thousand|million|billion|trillion)\b|(?:bn|tn|mn|[KMBT])\b)?",
         r"(\s+[a-z]+\b)?",
     ))
 });
@@ -127,6 +127,11 @@ fn speak_currency(
         String::new()
     } else {
         let upper = scale_raw.to_uppercase();
+        // "$5.7bn" is news style for the letter form.
+        let upper = match upper.as_str() {
+            "BN" | "TN" | "MN" => upper[..1].to_string(),
+            _ => upper,
+        };
         format!(
             " {}",
             MAGNITUDE_MAP

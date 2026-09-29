@@ -177,6 +177,11 @@ fn abbreviations_expand() {
         c("vol. 33, no. 2, pp. 2175–2183"),
         "volume 33, number 2, pages 2175 to 2183"
     );
+    assert_eq!(c("goals (e.g., cost)"), "goals (for example, cost)");
+    assert_eq!(c("FIG 1 The loop"), "Figure 1 The loop");
+    assert_eq!(c("Sep 28, 2026"), "September 28, 2026");
+    assert_eq!(c("Sep 28 people"), "Sep 28 people");
+    assert_eq!(c("pay $5.7bn after"), "pay 5.7 billion dollars after");
 }
 
 #[test]

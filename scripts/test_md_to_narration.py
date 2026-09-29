@@ -106,6 +106,11 @@ class Abbreviations(unittest.TestCase):
         self.assertEqual(clean("cf. Fig. 2 and Table 1"), "compare Figure 2 and Table 1")
         self.assertEqual(clean("vol. 33, no. 2, pp. 2175–2183"),
                          "volume 33, number 2, pages 2175 to 2183")
+        self.assertEqual(clean("goals (e.g., cost)"), "goals (for example, cost)")
+        self.assertEqual(clean("FIG 1 The loop"), "Figure 1 The loop")
+        self.assertEqual(clean("Sep 28, 2026"), "September 28, 2026")
+        self.assertEqual(clean("Sep 28 people"), "Sep 28 people")
+        self.assertEqual(clean("pay $5.7bn after"), "pay 5.7 billion dollars after")
 
     def test_an_abbreviation_can_close_a_line(self):
         self.assertEqual(clean("the Western vs."), "the Western versus")

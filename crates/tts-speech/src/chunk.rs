@@ -15,7 +15,7 @@
 //! A block that owns no words is not a chunk. Code is shown and never spoken.
 
 use crate::sentence;
-use crate::text::{flowing, operators};
+use crate::text::{flowing, operators, unshouted};
 use std::ops::Range;
 use tts_doc::Block;
 use tts_narrate::page::{normalize_word, words as tokenise};
@@ -66,7 +66,7 @@ pub fn plan(blocks: &[Block]) -> Vec<Chunk> {
         // chapter's worth of failures — a table that became babble, a lower-case opening that
         // came out as a different word.
         let narration = blocks::convert(&operators(&block.source), &Options::default());
-        let narration = flowing(narration.trim());
+        let narration = flowing(&unshouted(narration.trim()));
         if narration.is_empty() {
             continue;
         }
@@ -193,46 +193,80 @@ fn grouped(narration: &str) -> Vec<String> {
         .collect()
 }
 
-/// One group into pieces of at most `MAX_WORDS` words, split on whitespace — or, for a
-/// single token past bearing (a spaceless CJK run, a pasted URL), on char boundaries.
-/// Intra-token pieces join back with no space: they were one token, and a space inside a
-/// URL or a CJK run would be spoken, or misread, as content.
+/// One group into pieces of at most `MAX_WORDS` words and `MAX_CHARS` chars, split on
+/// whitespace — or, for a single token past bearing (a spaceless CJK run, a pasted URL), on
+/// char boundaries. Intra-token pieces join back with no space: they were one token, and a
+/// space inside a URL or a CJK run would be spoken, or misread, as content.
 fn cap_group(group: &str) -> Vec<String> {
-    const MAX_CHARS: usize = 400;
     let mut pieces = Vec::new();
-    let mut current = String::new();
-    let mut words = 0usize;
+    let mut run: Vec<&str> = Vec::new();
     for token in group.split_whitespace() {
         if token.chars().count() > MAX_CHARS {
-            if !current.is_empty() {
-                pieces.push(std::mem::take(&mut current));
-                words = 0;
-            }
+            pieces.extend(balanced(&std::mem::take(&mut run)));
             let chars: Vec<char> = token.chars().collect();
             pieces.extend(
                 chars
                     .chunks(MAX_CHARS)
                     .map(|part| part.iter().collect::<String>()),
             );
-            continue;
+        } else {
+            run.push(token);
         }
-        if words > 0 && (words + 1 > MAX_WORDS || current.len() + 1 + token.len() > MAX_CHARS) {
-            pieces.push(std::mem::take(&mut current));
-            words = 0;
-        }
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(token);
-        words += 1;
     }
-    if !current.is_empty() {
-        pieces.push(current);
-    }
+    pieces.extend(balanced(&run));
     if pieces.is_empty() {
         pieces.push(group.to_string());
     }
     pieces
+}
+
+const MAX_CHARS: usize = 400;
+
+/// Tokens cut into as few pieces as the limits allow, of even size, each ending at a clause
+/// mark near its share where there is one. Greedy filling left "the current ones." as a
+/// three-word request of its own, with no sentence prosody at all.
+fn balanced(tokens: &[&str]) -> Vec<String> {
+    let chars = |t: &[&str]| t.iter().map(|w| w.len()).sum::<usize>() + t.len().saturating_sub(1);
+    let mut out = Vec::new();
+    let mut rest = tokens;
+    while !rest.is_empty() {
+        let total = chars(rest);
+        let left = rest
+            .len()
+            .div_ceil(MAX_WORDS)
+            .max(total.div_ceil(MAX_CHARS));
+        if left <= 1 {
+            out.push(rest.join(" "));
+            break;
+        }
+        let target = total / left;
+        let mut fit = 0;
+        let mut size = 0;
+        let mut cuts = Vec::new();
+        for (i, w) in rest.iter().enumerate() {
+            size += w.len() + usize::from(i > 0);
+            if i + 1 > MAX_WORDS || size > MAX_CHARS {
+                break;
+            }
+            fit = i + 1;
+            cuts.push(size);
+        }
+        let fit = fit.max(1);
+        let distance = |n: usize| cuts.get(n - 1).map_or(usize::MAX, |c| c.abs_diff(target));
+        let clause = (1..=fit)
+            .filter(|&n| {
+                rest[n - 1].ends_with([',', ';', ':'])
+                    && cuts.get(n - 1).is_some_and(|c| c * 2 >= target)
+            })
+            .min_by_key(|&n| distance(n));
+        let even = (1..=fit).min_by_key(|&n| distance(n)).unwrap_or(fit);
+        let at = clause
+            .filter(|&n| distance(n) <= target / 3)
+            .unwrap_or(even);
+        out.push(rest[..at].join(" "));
+        rest = &rest[at..];
+    }
+    out
 }
 
 /// Rough speech duration from a word count, for a document nothing has synthesised yet.
@@ -249,6 +283,24 @@ pub fn estimate_seconds(words: usize) -> f64 {
 mod tests {
     use super::*;
     use tts_doc::layout;
+
+    #[test]
+    fn a_long_sentence_is_cut_evenly_at_a_clause() {
+        let sentence = format!(
+            "{}, {} end.",
+            "alpha ".repeat(34).trim(),
+            "beta ".repeat(30).trim()
+        );
+        let pieces = balanced(&sentence.split_whitespace().collect::<Vec<_>>());
+        assert_eq!(pieces.len(), 2, "{pieces:?}");
+        assert!(pieces[0].ends_with("alpha,"), "{pieces:?}");
+        let tail = format!("{} tail words here.", "word ".repeat(59).trim());
+        let pieces = balanced(&tail.split_whitespace().collect::<Vec<_>>());
+        assert!(
+            pieces.iter().all(|p| p.split(' ').count() >= 20),
+            "{pieces:?}"
+        );
+    }
 
     #[test]
     fn a_chunk_is_a_block_that_owns_words() {
