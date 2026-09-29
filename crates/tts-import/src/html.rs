@@ -206,14 +206,18 @@ fn heading_level(name: &str) -> Option<usize> {
     rest.parse::<usize>().ok().filter(|n| (1..=6).contains(n))
 }
 
-/// Append text, collapsing whitespace across the tag boundaries it crosses. Markup routinely
-/// splits a sentence across elements, and joining without this gives "onetwo".
+/// Append text, collapsing whitespace across the tag boundaries it crosses. A space is
+/// kept only where the markup had one: "<b>thinking</b>." is "thinking.", not "thinking .".
 fn push_text(line: &mut String, text: &str) {
-    for word in text.split_whitespace() {
-        if !line.is_empty() && !line.ends_with(' ') {
+    for (i, word) in text.split_whitespace().enumerate() {
+        let spaced = i > 0 || text.starts_with(char::is_whitespace);
+        if spaced && !line.is_empty() && !line.ends_with(' ') {
             line.push(' ');
         }
         line.push_str(word);
+    }
+    if text.ends_with(char::is_whitespace) && !line.is_empty() && !line.ends_with(' ') {
+        line.push(' ');
     }
 }
 
@@ -263,6 +267,13 @@ mod tests {
     fn malformed_markup_yields_what_it_can() {
         let md = to_markdown("<p>kept<p>also kept<span>and this").unwrap();
         assert!(md.contains("kept"), "{md:?}");
+    }
+
+    #[test]
+    fn punctuation_after_a_tag_is_not_spaced_off() {
+        let md =
+            to_markdown("<p><strong>More thinking</strong>. And <a>a link</a>, then</p>").unwrap();
+        assert_eq!(md, "More thinking. And a link, then\n");
     }
 
     #[test]
