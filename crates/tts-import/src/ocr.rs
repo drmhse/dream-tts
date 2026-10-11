@@ -120,6 +120,7 @@ pub fn pdf_page(path: &Path, document: &PDFDocument, index: usize) -> Result<Vec
 }
 
 /// The lines in an image file, in its pixels; `(width, height)` of the image comes back too.
+#[cfg(target_os = "macos")]
 pub fn image(path: &Path) -> Result<(Vec<Line>, (f64, f64))> {
     let (w, h) = image_size(path)?;
     let lines = cached(&key(path, 0), || {
@@ -137,6 +138,7 @@ pub fn image(path: &Path) -> Result<(Vec<Line>, (f64, f64))> {
     Ok((lines, (w, h)))
 }
 
+#[cfg(target_os = "macos")]
 fn image_size(path: &Path) -> Result<(f64, f64)> {
     let url = crate::file_url(path)?;
     let image = objc2_app_kit::NSImage::initByReferencingURL(objc2_app_kit::NSImage::alloc(), &url);

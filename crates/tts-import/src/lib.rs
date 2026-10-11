@@ -24,10 +24,10 @@ pub mod docx;
 pub mod epub;
 pub mod fb2;
 pub mod html;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod ocr;
 pub mod odt;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod pdf;
 pub mod rtf;
 pub mod sniff;
@@ -39,7 +39,7 @@ mod xml;
 mod zipped;
 
 /// A path as the file URL every system framework here takes.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(crate) fn file_url(path: &Path) -> Result<objc2::rc::Retained<objc2_foundation::NSURL>> {
     let path = path
         .to_str()
@@ -285,11 +285,11 @@ pub fn import_as(path: &Path, format: Format) -> Result<Document> {
         Format::Image | Format::Ebook | Format::Presentation | Format::IWork | Format::Pandoc => {
             unreachable!("converted above")
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         Format::Pdf => pdf::chapters(path)?,
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         Format::Pdf => bail!(
-            "PDF import needs PDFKit and this is not macOS. Convert it first, or use one of: {}",
+            "PDF import needs PDFKit, which only Apple platforms have. Convert it first, or use one of: {}",
             Format::supported().join(", ")
         ),
     };

@@ -13,7 +13,7 @@ anyhow = { workspace = true }
 # Only for `im2col`, which reuses candle's own Metal gather kernel rather than shipping
 # new shader source. Must be the exact version candle-core depends on, so that the
 # `metal::Buffer`/`Device` types are the same instance and not two copies of one crate.
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 candle-metal-kernels = { workspace = true }
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSDictionary", "NSValue"] }
