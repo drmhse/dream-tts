@@ -5,8 +5,9 @@
 //! else the body — with the page's furniture taken out: navigation, headers, footers, asides,
 //! forms. The result is saved as HTML and read by the HTML importer like any file.
 
-use anyhow::{bail, Context, Result};
-use std::path::PathBuf;
+use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "ios"))]
 use std::process::Command;
 
 pub fn is_url(text: &str) -> bool {
@@ -25,27 +26,7 @@ pub fn fetch(url: &str) -> Result<(PathBuf, String)> {
     let raw = dir.join(format!("{:016x}.raw.html", hasher.finish()));
     let out = dir.join(format!("{:016x}.html", hasher.finish()));
 
-    let status = Command::new("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--max-time",
-            "60",
-        ])
-        .args(["--user-agent", "Mozilla/5.0 (Macintosh) DreamReader/1"])
-        .arg("--output")
-        .arg(&raw)
-        .arg(url.trim())
-        .output()
-        .context("running curl")?;
-    if !status.status.success() {
-        bail!(
-            "could not fetch {url}: {}",
-            String::from_utf8_lossy(&status.stderr).trim()
-        );
-    }
+    download(url.trim(), &raw)?;
     let bytes = std::fs::read(&raw)?;
     let html = crate::text::decode(&bytes);
     let title = title(&html).unwrap_or_else(|| url.trim().to_string());
@@ -63,6 +44,43 @@ pub fn fetch(url: &str) -> Result<(PathBuf, String)> {
     std::fs::write(&out, page).with_context(|| format!("writing {}", out.display()))?;
     let _ = std::fs::remove_file(&raw);
     Ok((out, title))
+}
+
+#[cfg(not(target_os = "ios"))]
+fn download(url: &str, to: &Path) -> Result<()> {
+    let status = Command::new("curl")
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--max-time",
+            "60",
+        ])
+        .args(["--user-agent", "Mozilla/5.0 (Macintosh) DreamReader/1"])
+        .arg("--output")
+        .arg(to)
+        .arg(url)
+        .output()
+        .context("running curl")?;
+    if !status.status.success() {
+        anyhow::bail!(
+            "could not fetch {url}: {}",
+            String::from_utf8_lossy(&status.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// iOS runs no other programs, so no curl: Foundation's loader instead.
+#[cfg(target_os = "ios")]
+fn download(url: &str, to: &Path) -> Result<()> {
+    use objc2_foundation::{NSData, NSDataReadingOptions, NSString, NSURL};
+    let address = NSURL::URLWithString(&NSString::from_str(url))
+        .with_context(|| format!("{url} is not a web address"))?;
+    let data = NSData::dataWithContentsOfURL_options_error(&address, NSDataReadingOptions::empty())
+        .map_err(|e| anyhow::anyhow!("could not fetch {url}: {}", e.localizedDescription()))?;
+    std::fs::write(to, data.to_vec()).with_context(|| format!("writing {}", to.display()))
 }
 
 fn escape(text: &str) -> String {

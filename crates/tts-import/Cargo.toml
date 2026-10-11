@@ -18,7 +18,7 @@ tts-doc = { path = "../tts-doc" }
 # The pure-Rust extractors are poor on real book layouts and none of them read the outline,
 # which is where chapter boundaries actually are.
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL", "NSArray", "NSDictionary", "NSValue", "NSAttributedString", "NSRange", "NSError", "NSEnumerator"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL", "NSArray", "NSDictionary", "NSValue", "NSAttributedString", "NSRange", "NSError", "NSEnumerator", "NSData"] }
 objc2-pdf-kit = { version = "0.3", default-features = false, features = ["std", "PDFDocument", "PDFPage", "PDFOutline", "PDFDestination", "objc2-core-graphics"] }
 # OCR, for a scanned page or a photograph. A system framework like PDFKit.
 objc2-vision = { version = "0.3", default-features = false, features = ["std", "VNRequest", "VNRequestHandler", "VNRecognizeTextRequest", "VNObservation", "VNTypes", "objc2-core-graphics", "objc2-core-foundation"] }
