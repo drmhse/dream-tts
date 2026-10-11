@@ -161,8 +161,7 @@ const ABBREVIATIONS: &[&str] = &[
     "fig", "figs", "eq", "eqs", "tab", "sec", "secs", "ch", "chs", "no", "nos", "vol", "vols",
     "pp", "p", "al", "cf", "eg", "ie", "dr", "mr", "mrs", "ms", "prof", "st", "approx", "ca",
     "etc", "vs", "resp", "inc", "ltd", "co", "est", "jan", "feb", "mar", "apr", "jun", "jul",
-    "aug", "sep", "sept", "oct", "nov", "dec",
-    // Swahili titles, which precede a name.
+    "aug", "sep", "sept", "oct", "nov", "dec", // Swahili titles, which precede a name.
     "dkt", "dk", "bw", "bi", "mh", "mhe",
 ];
 

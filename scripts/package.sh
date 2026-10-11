@@ -43,6 +43,7 @@ cargo build --release -p tts-cli   --bin dream-tts
 cargo build --release -p tts-serve --bin dream-tts-serve
 cargo build --release -p audio8    --bin audio8-validate
 cargo build --release -p cosyvoice --bin cosyvoice-validate
+cargo build --release -p kokoro    --bin kokoro-validate
 cargo build --release -p qwen3tts  --bin qwen3tts-validate
 
 # A Homebrew dylib linked in on a build machine would break every machine but that one.

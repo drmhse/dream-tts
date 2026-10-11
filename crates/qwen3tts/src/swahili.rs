@@ -13,7 +13,11 @@ fn nasal_onset(w: &[char]) -> bool {
 }
 
 fn opens_on_nasal(w: &[char]) -> bool {
-    nasal_onset(w) || (w.len() > 2 && w[0].eq_ignore_ascii_case(&'n') && w[1] == 'g' && matches!(w[2], '\'' | '’'))
+    nasal_onset(w)
+        || (w.len() > 2
+            && w[0].eq_ignore_ascii_case(&'n')
+            && w[1] == 'g'
+            && matches!(w[2], '\'' | '’'))
 }
 
 /// Nothing but spaces, quotes or brackets since the segment start or a `.!?`.
@@ -53,10 +57,22 @@ mod tests {
 
     #[test]
     fn hyphenates_prenasal_onsets() {
-        assert_eq!(respell("Mbuzi na ndege. Ndege ni ndogo.", "... "), "... M-buzi na ndege. N-dege ni ndogo.");
-        assert_eq!(respell("Ng'ombe, nguo! Njia? Mvua.", "... "), "... Ng'ombe, nguo! N-jia? M-vua.");
-        assert_eq!(respell("Kwa kweli mbinu hii.", "... "), "Kwa kweli mbinu hii.");
-        assert_eq!(respell("Omba, mtu, nyumba, simba.", "... "), "Omba, mtu, nyumba, simba.");
+        assert_eq!(
+            respell("Mbuzi na ndege. Ndege ni ndogo.", "... "),
+            "... M-buzi na ndege. N-dege ni ndogo."
+        );
+        assert_eq!(
+            respell("Ng'ombe, nguo! Njia? Mvua.", "... "),
+            "... Ng'ombe, nguo! N-jia? M-vua."
+        );
+        assert_eq!(
+            respell("Kwa kweli mbinu hii.", "... "),
+            "Kwa kweli mbinu hii."
+        );
+        assert_eq!(
+            respell("Omba, mtu, nyumba, simba.", "... "),
+            "Omba, mtu, nyumba, simba."
+        );
         assert_eq!(respell("“Mbwa”", "— "), "— “M-bwa”");
     }
 }

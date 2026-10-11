@@ -274,8 +274,14 @@ mod tests {
 
     #[test]
     fn html_entities_and_bare_ampersands_read_as_a_browser_shows_them() {
-        let md = to_markdown("<p>It&rsquo;s &ldquo;Q&A&rdquo; &mdash; AT&T &amp; co &#8212; &#x2014;</p>").unwrap();
-        assert_eq!(md.trim(), "It\u{2019}s \u{201c}Q&A\u{201d} \u{2014} AT&T & co \u{2014} \u{2014}");
+        let md = to_markdown(
+            "<p>It&rsquo;s &ldquo;Q&A&rdquo; &mdash; AT&T &amp; co &#8212; &#x2014;</p>",
+        )
+        .unwrap();
+        assert_eq!(
+            md.trim(),
+            "It\u{2019}s \u{201c}Q&A\u{201d} \u{2014} AT&T & co \u{2014} \u{2014}"
+        );
     }
 
     #[test]

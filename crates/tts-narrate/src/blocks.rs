@@ -35,7 +35,9 @@ impl std::str::FromStr for Language {
         match s.to_ascii_lowercase().as_str() {
             "en" | "english" => Ok(Self::English),
             "sw" | "swahili" | "kiswahili" => Ok(Self::Swahili),
-            other => Err(format!("no narration rules for `{other}`; use english or swahili")),
+            other => Err(format!(
+                "no narration rules for `{other}`; use english or swahili"
+            )),
         }
     }
 }
@@ -193,7 +195,11 @@ pub fn convert(text: &str, options: &Options) -> String {
             flush(&mut buffer, &mut paragraphs);
             let body = clean_inline(&re::g(&caps, 2));
             if !body.is_empty() {
-                paragraphs.push(format!("{footnote} {}. {}", re::g(&caps, 1), sentence(&body)));
+                paragraphs.push(format!(
+                    "{footnote} {}. {}",
+                    re::g(&caps, 1),
+                    sentence(&body)
+                ));
             }
             continue;
         }

@@ -62,9 +62,20 @@ pub fn page(url: &str, bytes: &[u8]) -> Result<(String, String)> {
 /// An error page sent as a success: a soft 404, or a bot check in front of the article.
 fn refused(title: &str, text: &str) -> bool {
     const SAYS: &[&str] = &[
-        "404", "not found", "attention required", "just a moment", "access denied", "forbidden",
-        "are you a robot", "are you human", "captcha", "security check", "too many requests",
-        "service unavailable", "bad gateway", "page unavailable",
+        "404",
+        "not found",
+        "attention required",
+        "just a moment",
+        "access denied",
+        "forbidden",
+        "are you a robot",
+        "are you human",
+        "captcha",
+        "security check",
+        "too many requests",
+        "service unavailable",
+        "bad gateway",
+        "page unavailable",
     ];
     let title = title.to_lowercase();
     let short = text.split(' ').count() < 250;
@@ -118,7 +129,8 @@ fn download(url: &str, to: &Path) -> Result<()> {
     let done = RcBlock::new(
         move |data: *mut NSData, response: *mut NSURLResponse, error: *mut NSError| {
             // SAFETY: Foundation passes each argument valid or null, for the call's duration.
-            let (data, response, error) = unsafe { (data.as_ref(), response.as_ref(), error.as_ref()) };
+            let (data, response, error) =
+                unsafe { (data.as_ref(), response.as_ref(), error.as_ref()) };
             let status = response
                 .and_then(|r| r.downcast_ref::<NSHTTPURLResponse>())
                 .map_or(200, |r| r.statusCode());
@@ -170,7 +182,11 @@ fn read(html: &str) -> Reading {
     doc.select(FURNITURE).remove();
     let anchor = anchor(&doc, head.as_deref(), site.as_deref());
     let title = match (&anchor, head) {
-        (Some(h), Some(head)) if head.to_lowercase().contains(&words(&h.text()).to_lowercase()) => {
+        (Some(h), Some(head))
+            if head
+                .to_lowercase()
+                .contains(&words(&h.text()).to_lowercase()) =>
+        {
             Some(words(&h.text()))
         }
         (_, head) => head,
@@ -267,7 +283,8 @@ fn read(html: &str) -> Reading {
         above_headline(&chosen, &h1, &kept, total);
         let headline = words(&h1.text());
         for node in chosen.descendants() {
-            if node.id != h1.id && heading_level(&node).is_some() && words(&node.text()) == headline {
+            if node.id != h1.id && heading_level(&node).is_some() && words(&node.text()) == headline
+            {
                 node.remove_from_parent();
             }
         }
@@ -346,13 +363,21 @@ fn anchor<'a>(doc: &'a Document, head: Option<&str>, site: Option<&str>) -> Opti
     let banner = |h: &NodeRef| {
         let text = words(&h.text()).to_lowercase();
         site.as_ref().is_some_and(|s| *s == text)
-            || head.as_ref().is_some_and(|t| t != &text && t.ends_with(&text))
+            || head
+                .as_ref()
+                .is_some_and(|t| t != &text && t.ends_with(&text))
     };
     let inside = |h: &NodeRef| {
         h.ancestors_it(None)
             .any(|a| matches!(a.node_name().as_deref(), Some("article" | "main")))
     };
-    let h1s: Vec<NodeRef> = doc.select("h1").nodes().iter().copied().filter(|h| !banner(h)).collect();
+    let h1s: Vec<NodeRef> = doc
+        .select("h1")
+        .nodes()
+        .iter()
+        .copied()
+        .filter(|h| !banner(h))
+        .collect();
     let h2s: Vec<NodeRef> = doc.select("h2").nodes().to_vec();
     let pick = |headings: &[NodeRef<'a>]| {
         let named: Vec<NodeRef> = headings.iter().copied().filter(|h| named(h)).collect();
@@ -379,8 +404,18 @@ fn standfirst<'a>(h1: &NodeRef<'a>) -> Option<NodeRef<'a>> {
 }
 
 const DEKS: &[&str] = &[
-    "standfirst", "dek", "deck", "subtitle", "subheadline", "subhead", "summary", "lede",
-    "excerpt", "description", "strapline", "teaser",
+    "standfirst",
+    "dek",
+    "deck",
+    "subtitle",
+    "subheadline",
+    "subhead",
+    "summary",
+    "lede",
+    "excerpt",
+    "description",
+    "strapline",
+    "teaser",
 ];
 
 /// Characters of text, of linked text, and of prose — text whose nearest block is a
@@ -393,8 +428,29 @@ struct Counts {
 
 const PROSE: &[&str] = &["p", "li", "blockquote", "pre", "dd", "td"];
 const BLOCK: &[&str] = &[
-    "p", "li", "blockquote", "pre", "dd", "td", "div", "section", "article", "main", "body",
-    "ul", "ol", "dl", "table", "figure", "figcaption", "h1", "h2", "h3", "h4", "h5", "h6",
+    "p",
+    "li",
+    "blockquote",
+    "pre",
+    "dd",
+    "td",
+    "div",
+    "section",
+    "article",
+    "main",
+    "body",
+    "ul",
+    "ol",
+    "dl",
+    "table",
+    "figure",
+    "figcaption",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
 ];
 
 impl Counts {
@@ -477,18 +533,81 @@ enum Strength {
 }
 
 /// Comment threads: removed even when they outweigh the article.
-const THREADS: &[&str] = &["comment", "comments", "discussion", "disqus", "replies", "responses"];
+const THREADS: &[&str] = &[
+    "comment",
+    "comments",
+    "discussion",
+    "disqus",
+    "replies",
+    "responses",
+];
 
 /// Chrome that names itself. Words, not substrings: "ad" is not "header" or "shadow".
 const CHROME: &[&str] = &[
-    "related", "recommended", "recommendations", "share", "sharing", "sharebar", "social",
-    "newsletter", "subscribe", "subscription", "signup", "promo", "promotion", "advert",
-    "advertisement", "ad", "ads", "adslot", "sponsor", "sponsored", "breadcrumb", "breadcrumbs",
-    "tag", "tags", "taglist", "topics", "popup", "modal", "cookie", "cookies", "consent", "gdpr",
-    "paywall", "sidebar", "widget", "skip", "enlarge", "credit", "credits", "copyright",
-    "toolbar", "feedback", "masthead", "menu", "menubar", "dropdown", "flyout", "lightbox",
-    "pagination", "pager", "outbrain", "taboola", "bio", "rail", "offscreen", "visuallyhidden",
-    "embed", "audio", "player", "byline", "date", "dateline", "dateblock", "timestamp",
+    "related",
+    "recommended",
+    "recommendations",
+    "share",
+    "sharing",
+    "sharebar",
+    "social",
+    "newsletter",
+    "subscribe",
+    "subscription",
+    "signup",
+    "promo",
+    "promotion",
+    "advert",
+    "advertisement",
+    "ad",
+    "ads",
+    "adslot",
+    "sponsor",
+    "sponsored",
+    "breadcrumb",
+    "breadcrumbs",
+    "tag",
+    "tags",
+    "taglist",
+    "topics",
+    "popup",
+    "modal",
+    "cookie",
+    "cookies",
+    "consent",
+    "gdpr",
+    "paywall",
+    "sidebar",
+    "widget",
+    "skip",
+    "enlarge",
+    "credit",
+    "credits",
+    "copyright",
+    "toolbar",
+    "feedback",
+    "masthead",
+    "menu",
+    "menubar",
+    "dropdown",
+    "flyout",
+    "lightbox",
+    "pagination",
+    "pager",
+    "outbrain",
+    "taboola",
+    "bio",
+    "rail",
+    "offscreen",
+    "visuallyhidden",
+    "embed",
+    "audio",
+    "player",
+    "byline",
+    "date",
+    "dateline",
+    "dateblock",
+    "timestamp",
     "pubdate",
 ];
 
@@ -542,11 +661,29 @@ fn linky(node: &NodeRef, counts: &Counts) -> bool {
 /// Sections after the article that are not read: its sources, links out, and the site's
 /// suggestions. Notes stay; an essay's notes are part of it.
 const BACK_MATTER: &[&str] = &[
-    "references", "citations", "sources", "bibliography", "works cited", "external links",
-    "further reading", "see also", "related", "related articles", "related posts",
-    "related stories", "related reading", "comments", "responses", "you may also like",
-    "you might also like", "recommended", "read next", "more stories", "most read",
-    "most popular", "trending",
+    "references",
+    "citations",
+    "sources",
+    "bibliography",
+    "works cited",
+    "external links",
+    "further reading",
+    "see also",
+    "related",
+    "related articles",
+    "related posts",
+    "related stories",
+    "related reading",
+    "comments",
+    "responses",
+    "you may also like",
+    "you might also like",
+    "recommended",
+    "read next",
+    "more stories",
+    "most read",
+    "most popular",
+    "trending",
 ];
 
 fn cut_back_matter(body: &NodeRef) {
@@ -609,24 +746,72 @@ fn boilerplate(node: &NodeRef) -> bool {
     }
     // A date on its own line, not one inside a sentence.
     if node.node_name().as_deref() == Some("time") {
-        let around = node.parent().map_or(0, |p| words(&p.text()).split(' ').count());
+        let around = node
+            .parent()
+            .map_or(0, |p| words(&p.text()).split(' ').count());
         return around <= text.split(' ').count() + 2;
     }
     const SAID: &[&str] = &[
-        "read more", "learn more", "enlarge this image", "advertisement", "share", "copy link",
-        "subscribers only", "back to top", "back to full list", "skip to content",
-        "skip to main content", "continue reading", "story continues below advertisement",
-        "image", "image caption", "toggle caption", "hide caption", "listen to this article",
-        "sign up", "subscribe", "print", "email", "share this article", "getty images",
-        "shutterstock", "reuters", "associated press", "afp", "alamy", "epa", "read later",
-        "transcript", "download", "embed", "listen", "save", "bookmark",
+        "read more",
+        "learn more",
+        "enlarge this image",
+        "advertisement",
+        "share",
+        "copy link",
+        "subscribers only",
+        "back to top",
+        "back to full list",
+        "skip to content",
+        "skip to main content",
+        "continue reading",
+        "story continues below advertisement",
+        "image",
+        "image caption",
+        "toggle caption",
+        "hide caption",
+        "listen to this article",
+        "sign up",
+        "subscribe",
+        "print",
+        "email",
+        "share this article",
+        "getty images",
+        "shutterstock",
+        "reuters",
+        "associated press",
+        "afp",
+        "alamy",
+        "epa",
+        "read later",
+        "transcript",
+        "download",
+        "embed",
+        "listen",
+        "save",
+        "bookmark",
     ];
     const OPENS: &[&str] = &[
-        "image source,", "image caption,", "media caption,", "photo:", "photo by ",
-        "photo illustration by ", "illustration by ", "credit:", "image credit", "courtesy of ",
-        "view full discussion", "view all comments",
+        "image source,",
+        "image caption,",
+        "media caption,",
+        "photo:",
+        "photo by ",
+        "photo illustration by ",
+        "illustration by ",
+        "credit:",
+        "image credit",
+        "courtesy of ",
+        "view full discussion",
+        "view all comments",
     ];
-    const AGENCIES: &[&str] = &["getty images", "ap", "reuters", "afp", "npr", "shutterstock"];
+    const AGENCIES: &[&str] = &[
+        "getty images",
+        "ap",
+        "reuters",
+        "afp",
+        "npr",
+        "shutterstock",
+    ];
     SAID.contains(&text)
         || OPENS.iter().any(|o| text.starts_with(o))
         || AGENCIES.iter().any(|a| text.ends_with(&format!("/{a}")))
@@ -638,9 +823,9 @@ fn boilerplate(node: &NodeRef) -> bool {
 /// The language named over a code sample — "http", "js" — which the sample does not need.
 fn label(node: &NodeRef) -> bool {
     let text = words(&node.text());
-    let precedes_code = node
-        .next_element_sibling()
-        .is_some_and(|n| n.node_name().as_deref() == Some("pre") || n.is("div:has(> pre:first-child)"));
+    let precedes_code = node.next_element_sibling().is_some_and(|n| {
+        n.node_name().as_deref() == Some("pre") || n.is("div:has(> pre:first-child)")
+    });
     precedes_code && !text.is_empty() && !text.contains(' ') && text.len() <= 16
 }
 
@@ -679,7 +864,10 @@ fn counted(text: &str) -> bool {
         return false;
     };
     n.replace(',', "").parse::<u32>().is_ok()
-        && matches!(what, "comment" | "comments" | "reply" | "replies" | "response" | "responses")
+        && matches!(
+            what,
+            "comment" | "comments" | "reply" | "replies" | "response" | "responses"
+        )
 }
 
 /// "Post / Blog", "Post | Blog": the site's name, which a title read aloud should not carry.
@@ -753,19 +941,25 @@ mod tests {
 
     #[test]
     fn comments_go_even_when_they_outweigh_the_article() {
-        let comment = "<p>A reader's reply, long enough to read as prose on its own here.</p>".repeat(20);
+        let comment =
+            "<p>A reader's reply, long enough to read as prose on its own here.</p>".repeat(20);
         let html = format!(
             "<html><body><article><h1>Post</h1><p>The post itself, which is short.</p></article>\
              <section id=\"comments\">{comment}</section></body></html>"
         );
         let body = article(&html);
-        assert!(body.contains("The post itself") && !body.contains("reply"), "{body}");
+        assert!(
+            body.contains("The post itself") && !body.contains("reply"),
+            "{body}"
+        );
     }
 
     #[test]
     fn an_introduction_in_a_section_of_its_own_is_kept() {
-        let intro = "<p>The opening, set apart in a section of its own above the rest.</p>".repeat(3);
-        let rest = "<p>The body of the piece, which holds most of what there is to read.</p>".repeat(14);
+        let intro =
+            "<p>The opening, set apart in a section of its own above the rest.</p>".repeat(3);
+        let rest =
+            "<p>The body of the piece, which holds most of what there is to read.</p>".repeat(14);
         let html = format!(
             "<html><body><h1>Piece</h1><section><div>{intro}</div></section>\
              <section><div><div>{rest}</div></div></section></body></html>"
@@ -781,12 +975,16 @@ mod tests {
              <pre><code><span>foo</span><span>(</span><span>)</span></code></pre></div></article></body></html>"
         );
         let body = article(&html);
-        assert!(body.contains("<span>(</span><span>)</span>") && !body.contains(">js<"), "{body}");
+        assert!(
+            body.contains("<span>(</span><span>)</span>") && !body.contains(">js<"),
+            "{body}"
+        );
     }
 
     #[test]
     fn a_book_title_over_a_chapter_is_not_the_title() {
-        let prose = "<p>The chapter's text, long enough to count as prose on its own.</p>".repeat(8);
+        let prose =
+            "<p>The chapter's text, long enough to count as prose on its own.</p>".repeat(8);
         let html = format!(
             "<html><head><title>Ownership - The Book</title></head><body>\
              <div class=\"menu\"><h1>The Book</h1></div><main><h2>Ownership</h2>{prose}</main></body></html>"
@@ -802,12 +1000,16 @@ mod tests {
              <h2>References</h2><ol><li>Smith, 2020.</li></ol></article></body></html>"
         );
         let body = article(&html);
-        assert!(body.contains("worth hearing") && !body.contains("Smith"), "{body}");
+        assert!(
+            body.contains("worth hearing") && !body.contains("Smith"),
+            "{body}"
+        );
     }
 
     #[test]
     fn an_error_page_sent_as_a_success_is_refused() {
-        let page = b"<html><head><title>Page not found</title></head><body><p>Sorry.</p></body></html>";
+        let page =
+            b"<html><head><title>Page not found</title></head><body><p>Sorry.</p></body></html>";
         assert!(page_of(page).is_err());
         let bot = b"<html><head><title>Just a moment...</title></head><body><p>Checking.</p></body></html>";
         assert!(page_of(bot).is_err());

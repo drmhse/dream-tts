@@ -88,7 +88,11 @@ impl Scheme {
         Ok(Self {
             language: s.language.to_lowercase(),
             row: s.row,
-            vowels: s.vowels.chars().flat_map(|c| [c].into_iter().chain(c.to_uppercase())).collect(),
+            vowels: s
+                .vowels
+                .chars()
+                .flat_map(|c| [c].into_iter().chain(c.to_uppercase()))
+                .collect(),
             apostrophes: s.apostrophes.chars().collect(),
             map,
             onsets,
@@ -101,7 +105,13 @@ impl Scheme {
     pub fn pieces(&self, text: &str) -> Vec<String> {
         let folded: String = text
             .chars()
-            .map(|c| if self.apostrophes.contains(&c) { '\'' } else { c })
+            .map(|c| {
+                if self.apostrophes.contains(&c) {
+                    '\''
+                } else {
+                    c
+                }
+            })
             .collect();
         cut(&folded, |c| self.vowels.contains(&c))
             .iter()
@@ -119,9 +129,16 @@ impl Scheme {
             if low.starts_with(k.as_str()) {
                 let n = k.chars().count();
                 let mut out = if self.isolate_map {
-                    [ws.to_string(), v.clone()].into_iter().filter(|p| !p.is_empty()).collect()
+                    [ws.to_string(), v.clone()]
+                        .into_iter()
+                        .filter(|p| !p.is_empty())
+                        .collect()
                 } else {
-                    let v = if chars[0].is_uppercase() { v.to_uppercase() } else { v.clone() };
+                    let v = if chars[0].is_uppercase() {
+                        v.to_uppercase()
+                    } else {
+                        v.clone()
+                    };
                     vec![format!("{ws}{v}")]
                 };
                 if chars.len() > n {
@@ -133,7 +150,10 @@ impl Scheme {
         for o in &self.onsets {
             let n = o.chars().count();
             if low.starts_with(o.as_str()) && chars.len() > n {
-                return vec![format!("{ws}{}", chars[..n].iter().collect::<String>()), rest(n)];
+                return vec![
+                    format!("{ws}{}", chars[..n].iter().collect::<String>()),
+                    rest(n),
+                ];
             }
         }
         let lc: Vec<char> = low.chars().collect();
@@ -158,7 +178,10 @@ mod tests {
     #[test]
     fn open_syllables() {
         assert_eq!(pieces("ubunifu"), ["u", "bu", "ni", "fu"]);
-        assert_eq!(pieces("Ng'ombe wa maarifa."), ["Ng'o", "mbe", " wa", " ma", "a", "ri", "fa."]);
+        assert_eq!(
+            pieces("Ng'ombe wa maarifa."),
+            ["Ng'o", "mbe", " wa", " ma", "a", "ri", "fa."]
+        );
         assert_eq!(pieces("mtu, nchi"), ["mtu,", " nchi"]);
         assert_eq!(pieces("a  b"), ["a", "  b"]);
     }
@@ -168,15 +191,27 @@ mod tests {
         let s = Scheme::from_json(SWAHILI.as_bytes()).unwrap();
         assert_eq!((s.language.as_str(), s.row), ("swahili", 2074));
         let p = |t: &str| s.pieces(t);
-        assert_eq!(p("Ng'ombe wa mbili ndani."), ["ŋ", "o", "mb", "e", " wa", " mb", "i", "li", " nd", "a", "ni."]);
+        assert_eq!(
+            p("Ng'ombe wa mbili ndani."),
+            ["ŋ", "o", "mb", "e", " wa", " mb", "i", "li", " nd", "a", "ni."]
+        );
         assert_eq!(
             p("mtoto nchi mwana nyumba mvua"),
             ["m", "to", "to", " n", "chi", " mwa", "na", " nyu", "mb", "a", " mv", "u", "a"]
         );
-        assert_eq!(p("Nzuri, wangu mbwa"), ["Nz", "u", "ri,", " wa", "ng", "u", " mb", "wa"]);
-        assert_eq!(p("ng’ambo kung'ata"), ["ŋ", "a", "mb", "o", " ku", "ŋ", "a", "ta"]);
+        assert_eq!(
+            p("Nzuri, wangu mbwa"),
+            ["Nz", "u", "ri,", " wa", "ng", "u", " mb", "wa"]
+        );
+        assert_eq!(
+            p("ng’ambo kung'ata"),
+            ["ŋ", "a", "mb", "o", " ku", "ŋ", "a", "ta"]
+        );
         assert_eq!(p("Nina ng'ombe"), ["Ni", "na", " ", "ŋ", "o", "mb", "e"]);
-        assert_eq!(p("Jana kijiji njia"), ["J", "a", "na", " ki", "j", "i", "j", "i", " nj", "i", "a"]);
+        assert_eq!(
+            p("Jana kijiji njia"),
+            ["J", "a", "na", " ki", "j", "i", "j", "i", " nj", "i", "a"]
+        );
     }
 
     /// `PIECES_PARITY=file.jsonl` of {scheme, text, pieces} from `orthography.py parity`.
@@ -198,7 +233,9 @@ mod tests {
 
     #[test]
     fn vowels_beyond_ascii() {
-        let s = Scheme::from_json(r#"{"language":"Kikuyu","row":2075,"vowels":"aeiouĩũ"}"#.as_bytes()).unwrap();
+        let s =
+            Scheme::from_json(r#"{"language":"Kikuyu","row":2075,"vowels":"aeiouĩũ"}"#.as_bytes())
+                .unwrap();
         assert_eq!(s.pieces("mũtĩ"), ["mũ", "tĩ"]);
     }
 }

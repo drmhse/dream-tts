@@ -569,7 +569,13 @@ pub struct Talker {
 
 impl Talker {
     /// `adapter_scale` multiplies the adapter's LoRA deltas (1.0: as exported).
-    pub fn load(path: &str, adapter: Option<&str>, adapter_scale: f32, how: Weight, device: &Device) -> Result<Self> {
+    pub fn load(
+        path: &str,
+        adapter: Option<&str>,
+        adapter_scale: f32,
+        how: Weight,
+        device: &Device,
+    ) -> Result<Self> {
         let mut w = Weights::load(path, device)?;
         if let Some(a) = adapter {
             w = w.with_adapter(a, adapter_scale)?;
@@ -635,7 +641,11 @@ impl Talker {
 
     /// A tag's embedding row, for blending into a [`Language::Vector`].
     pub fn codec_row_f32(&self, id: u32) -> Result<Vec<f32>> {
-        Ok(self.codec_row(id)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?)
+        Ok(self
+            .codec_row(id)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?)
     }
 
     /// Embed one frame of 16 codes and sum at talker width — codebook 0 from the talker's
@@ -689,7 +699,12 @@ impl Talker {
             Language::Auto => None,
             Language::Tag(id) => Some(self.codec_row(*id)?),
             Language::Vector(v) => {
-                anyhow::ensure!(v.len() == tk::DIM, "language vector is {} wide, not {}", v.len(), tk::DIM);
+                anyhow::ensure!(
+                    v.len() == tk::DIM,
+                    "language vector is {} wide, not {}",
+                    v.len(),
+                    tk::DIM
+                );
                 let dtype = self.codec_embed.dtype();
                 Some(Tensor::from_slice(v, (1, 1, tk::DIM), &self.device)?.to_dtype(dtype)?)
             }
@@ -917,7 +932,10 @@ impl Talker {
 
         let trailing_len = trailing.dim(1)?;
         // See `generate`: `tts_pad`, not trailing's last row.
-        let pad = self.text_hidden(&[tk::TTS_PAD])?.broadcast_as((b, 1, tk::DIM))?.contiguous()?;
+        let pad = self
+            .text_hidden(&[tk::TTS_PAD])?
+            .broadcast_as((b, 1, tk::DIM))?
+            .contiguous()?;
         let sub = Sampling::subtalker(s.greedy);
         let banned = |i: usize| i >= tk::VOCAB - 1024 && i != tk::CODEC_EOS as usize;
 

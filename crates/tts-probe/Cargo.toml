@@ -13,6 +13,10 @@ audio8 = { path = "../audio8", default-features = false }
 cosyvoice = { path = "../cosyvoice", default-features = false }
 tts-core = { path = "../tts-core", default-features = false }
 tts-nn = { path = "../tts-nn", default-features = false }
+
+# Metal microbenchmarks: Apple-only by definition. Gated so the Linux
+# `--no-default-features` port-honesty job never compiles `objc2` there.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSDictionary", "NSValue"] }
 objc2-metal = "0.3.2"

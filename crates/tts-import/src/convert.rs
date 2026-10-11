@@ -61,7 +61,9 @@ pub fn cache_root() -> PathBuf {
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);
     match home {
-        Some(h) if cfg!(any(target_os = "macos", target_os = "ios")) => h.join("Library/Caches/dream-tts"),
+        Some(h) if cfg!(any(target_os = "macos", target_os = "ios")) => {
+            h.join("Library/Caches/dream-tts")
+        }
         Some(h) => h.join(".cache/dream-tts"),
         None => std::env::temp_dir().join("dream-tts"),
     }

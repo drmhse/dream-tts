@@ -42,8 +42,8 @@ pub mod tapconv;
 pub mod topk;
 pub mod upconv;
 
-use std::collections::HashMap;
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 
 /// A Metal device that can actually run this crate's kernels, or `None`.
 ///
@@ -157,7 +157,10 @@ impl Weights {
             .with_context(|| format!("loading adapter {path}"))?;
         for key in t.keys().filter(|k| !k.starts_with("meta::")) {
             let base = key.rsplit_once("::").map_or(key.as_str(), |(b, _)| b);
-            anyhow::ensure!(self.has(base), "adapter {path} adapts `{base}`, which is not in the checkpoint");
+            anyhow::ensure!(
+                self.has(base),
+                "adapter {path} adapts `{base}`, which is not in the checkpoint"
+            );
         }
         if scale != 1.0 {
             for (k, v) in t.iter_mut().filter(|(k, _)| k.ends_with("::lora_b")) {
@@ -245,9 +248,16 @@ impl Weights {
     /// that is large and sparsely read: the rows cost a copy each, and the rest stays clean
     /// file-backed pages that count against nothing.
     pub fn rows(&self, name: &str, ids: &[u32]) -> Result<Tensor> {
-        if self.adapter.keys().any(|k| k.starts_with(&format!("{name}::"))) {
+        if self
+            .adapter
+            .keys()
+            .any(|k| k.starts_with(&format!("{name}::")))
+        {
             let idx = Tensor::from_vec(ids.to_vec(), ids.len(), &Device::Cpu)?;
-            return Ok(self.cpu(name)?.index_select(&idx, 0)?.to_device(&self.device)?);
+            return Ok(self
+                .cpu(name)?
+                .index_select(&idx, 0)?
+                .to_device(&self.device)?);
         }
         let view = self
             .file

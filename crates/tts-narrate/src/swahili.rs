@@ -9,8 +9,16 @@ const UNITS: [&str; 10] = [
     "sifuri", "moja", "mbili", "tatu", "nne", "tano", "sita", "saba", "nane", "tisa",
 ];
 const TENS: [&str; 10] = [
-    "", "kumi", "ishirini", "thelathini", "arobaini", "hamsini", "sitini", "sabini",
-    "themanini", "tisini",
+    "",
+    "kumi",
+    "ishirini",
+    "thelathini",
+    "arobaini",
+    "hamsini",
+    "sitini",
+    "sabini",
+    "themanini",
+    "tisini",
 ];
 const MONTHS: [&str; 12] = [
     "Januari", "Februari", "Machi", "Aprili", "Mei", "Juni", "Julai", "Agosti", "Septemba",
@@ -62,9 +70,13 @@ static DOLLAR: Lazy<Regex> = Lazy::new(|| compile(&format!(r"\$\s?({NUM})")));
 static EURO: Lazy<Regex> = Lazy::new(|| compile(&format!(r"€\s?({NUM})")));
 static POUND: Lazy<Regex> = Lazy::new(|| compile(&format!(r"£\s?({NUM})")));
 static PERCENT: Lazy<Regex> = Lazy::new(|| compile(&format!(r"({NUM})\s?%")));
-static DATE: Lazy<Regex> = Lazy::new(|| compile(r"(?:tarehe\s+)?\b(\d{1,2})[/.](\d{1,2})[/.](\d{4})\b"));
+static DATE: Lazy<Regex> =
+    Lazy::new(|| compile(r"(?:tarehe\s+)?\b(\d{1,2})[/.](\d{1,2})[/.](\d{4})\b"));
 static DAY_MONTH: Lazy<Regex> = Lazy::new(|| {
-    compile(&format!(r"(?:tarehe\s+)?\b(\d{{1,2}})\s+({})\b", MONTHS.join("|")))
+    compile(&format!(
+        r"(?:tarehe\s+)?\b(\d{{1,2}})\s+({})\b",
+        MONTHS.join("|")
+    ))
 });
 static RANGE: Lazy<Regex> = Lazy::new(|| compile(&format!(r"\b({NUM})\s?[-–]\s?({NUM})\b")));
 static MEASURE: Lazy<Regex> = Lazy::new(|| {
@@ -211,7 +223,9 @@ pub fn speak_currency(line: &str) -> String {
 pub fn speak(line: &str) -> String {
     let mut s = expand_abbreviations(line);
     s = re::sub_str(&TILDE, &s, "takriban ");
-    s = re::sub(&PERCENT, &s, |c| format!("asilimia {}", number(&re::g(c, 1))));
+    s = re::sub(&PERCENT, &s, |c| {
+        format!("asilimia {}", number(&re::g(c, 1)))
+    });
     s = re::sub(&DATE, &s, |c| {
         let month: usize = re::g(c, 2).parse().unwrap_or(0);
         if !(1..=12).contains(&month) {
@@ -271,18 +285,33 @@ mod tests {
     #[test]
     fn money_leads_with_the_unit() {
         assert_eq!(speak_currency("KSh 1,500"), "shilingi elfu moja mia tano");
-        assert_eq!(speak_currency("$12.50"), "dola kumi na mbili na senti hamsini");
-        assert_eq!(speak_currency("Sh200 milioni"), "shilingi mia mbili milioni");
-        assert_eq!(speak_currency("KSh 180.50"), "shilingi mia moja na themanini na senti hamsini");
+        assert_eq!(
+            speak_currency("$12.50"),
+            "dola kumi na mbili na senti hamsini"
+        );
+        assert_eq!(
+            speak_currency("Sh200 milioni"),
+            "shilingi mia mbili milioni"
+        );
+        assert_eq!(
+            speak_currency("KSh 180.50"),
+            "shilingi mia moja na themanini na senti hamsini"
+        );
         assert_eq!(speak_currency("$3.00"), "dola tatu");
     }
 
     #[test]
     fn prose() {
         for (src, want) in [
-            ("Mwaka 1960, watu 1,250.", "Mwaka elfu moja mia tisa na sitini, watu elfu moja mia mbili na hamsini."),
+            (
+                "Mwaka 1960, watu 1,250.",
+                "Mwaka elfu moja mia tisa na sitini, watu elfu moja mia mbili na hamsini.",
+            ),
             ("punguzo la 15%", "punguzo la asilimia kumi na tano"),
-            ("tarehe 25/09/2026", "tarehe ishirini na tano Septemba elfu mbili na ishirini na sita"),
+            (
+                "tarehe 25/09/2026",
+                "tarehe ishirini na tano Septemba elfu mbili na ishirini na sita",
+            ),
             ("walifika 12 Machi", "walifika tarehe kumi na mbili Machi"),
             ("tarehe 12 Machi", "tarehe kumi na mbili Machi"),
             ("umbali wa 42 km", "umbali wa kilomita arobaini na mbili"),

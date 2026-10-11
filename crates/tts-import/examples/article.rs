@@ -12,7 +12,11 @@ fn main() -> anyhow::Result<()> {
     let document = tts_import::import(&out)?;
     println!("TITLE {title}");
     for chapter in document.chapters {
-        println!("\n## {}\n{}", chapter.title.unwrap_or_default(), chapter.body);
+        println!(
+            "\n## {}\n{}",
+            chapter.title.unwrap_or_default(),
+            chapter.body
+        );
     }
     Ok(())
 }

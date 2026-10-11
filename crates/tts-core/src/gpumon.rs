@@ -24,7 +24,6 @@ mod imp {
     type CFStringRef = *const c_void;
 
     #[link(name = "IOKit", kind = "framework")]
-    #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
         fn IOServiceMatching(name: *const c_char) -> CFMutableDictionaryRef;
         fn IOServiceGetMatchingServices(
@@ -40,6 +39,10 @@ mod imp {
             allocator: CFTypeRef,
             options: u32,
         ) -> i32;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
         fn CFDictionaryGetValue(dict: CFDictionaryRef, key: CFStringRef) -> CFTypeRef;
         fn CFStringCreateWithCString(
             alloc: CFTypeRef,
