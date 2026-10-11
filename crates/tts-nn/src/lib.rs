@@ -95,6 +95,11 @@ pub(crate) fn usable_metal() -> Option<Device> {
 #[cfg(all(test, feature = "metal"))]
 pub(crate) fn usable_metal() -> Option<Device> {
     use std::sync::OnceLock;
+    // CI's Macs are virtual: their GPU runs a kernel, approximates its transcendentals and
+    // throws from MPSGraph, so the probe passes and the tests then measure the VM.
+    if std::env::var_os("DREAM_TTS_VIRTUAL_GPU").is_some() {
+        return None;
+    }
     static PROBE: OnceLock<Option<Device>> = OnceLock::new();
 
     PROBE
