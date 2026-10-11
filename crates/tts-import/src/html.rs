@@ -94,9 +94,7 @@ pub fn to_markdown(html: &str) -> Result<String> {
                 }
             }
             Ok(Event::Text(t)) if pre.is_some() => {
-                if let Ok(text) = t.unescape() {
-                    pre.as_mut().unwrap().1.push_str(&text);
-                }
+                pre.as_mut().unwrap().1.push_str(&decoded(&t));
             }
             Ok(Event::Start(e)) => {
                 let name = local(e.name().as_ref());
@@ -143,9 +141,7 @@ pub fn to_markdown(html: &str) -> Result<String> {
                 }
             }
             Ok(Event::Text(t)) if skip_depth == 0 => {
-                if let Ok(text) = t.unescape() {
-                    push_text(&mut line, &text);
-                }
+                push_text(&mut line, &decoded(&t));
             }
             Ok(Event::CData(t)) if skip_depth == 0 => {
                 push_text(&mut line, &String::from_utf8_lossy(&t));
@@ -158,6 +154,50 @@ pub fn to_markdown(html: &str) -> Result<String> {
         out.push(block);
     }
     Ok(markdown::document(&out))
+}
+
+/// A bare `&`, as in "Q&A", is not an entity; a browser shows it as written, and so does this.
+fn decoded(text: &quick_xml::events::BytesText) -> String {
+    match text.unescape() {
+        Ok(t) => t.into_owned(),
+        Err(_) => lenient(&String::from_utf8_lossy(text)),
+    }
+}
+
+fn lenient(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let entity = rest[1..]
+            .find(';')
+            .filter(|&end| end <= 32)
+            .and_then(|end| Some((resolve(&rest[1..=end])?, end + 2)));
+        match entity {
+            Some((text, len)) => {
+                out.push_str(&text);
+                rest = &rest[len..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn resolve(name: &str) -> Option<String> {
+    if let Some(number) = name.strip_prefix('#') {
+        let code = match number.strip_prefix(['x', 'X']) {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => number.parse().ok()?,
+        };
+        return char::from_u32(code).map(String::from);
+    }
+    quick_xml::escape::resolve_predefined_entity(name).map(String::from)
 }
 
 /// `<?…>` outside XML is a comment that ends at the first `>`, and Lit writes `<?>` between
@@ -231,6 +271,12 @@ fn flush(out: &mut Vec<String>, line: &mut String, heading: Option<usize>, list_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_entities_and_bare_ampersands_read_as_a_browser_shows_them() {
+        let md = to_markdown("<p>It&rsquo;s &ldquo;Q&A&rdquo; &mdash; AT&T &amp; co &#8212; &#x2014;</p>").unwrap();
+        assert_eq!(md.trim(), "It\u{2019}s \u{201c}Q&A\u{201d} \u{2014} AT&T & co \u{2014} \u{2014}");
+    }
 
     #[test]
     fn headings_become_hashes() {
