@@ -139,7 +139,7 @@ mod imp {
                     return None;
                 }
             };
-            Some(Self {
+            let sampler = Self {
                 service: svc,
                 stats_key,
                 device_key: cfstr("Device Utilization %"),
@@ -147,7 +147,11 @@ mod imp {
                 tiler_key: cfstr("Tiler Utilization %"),
                 alloc_key: cfstr("Alloc system memory"),
                 in_use_key: cfstr("In use system memory"),
-            })
+            };
+            // A virtual GPU has the node and not every counter: no monitor, rather than one
+            // that never answers.
+            sampler.sample()?;
+            Some(sampler)
         }
 
         fn find_service(stats_key: CFStringRef) -> Option<u32> {

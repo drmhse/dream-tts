@@ -166,7 +166,8 @@ const TRUNCATION_MIN_CHARS: usize = 40;
 
 impl CosyVoiceEngine {
     pub fn load(config: &EngineConfig) -> Result<Self> {
-        let device = if config.cpu {
+        // Built without Metal there is only the CPU to ask.
+        let device = if config.cpu || !cfg!(feature = "metal") {
             Device::Cpu
         } else {
             Device::new_metal(0).context("opening the Metal device")?

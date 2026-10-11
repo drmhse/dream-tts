@@ -77,7 +77,8 @@ fn parse_quant(s: Option<&str>) -> Result<Option<GgmlDType>> {
 
 impl Audio8Engine {
     pub fn load(config: &EngineConfig) -> Result<Self> {
-        let device = if config.cpu {
+        // Built without Metal there is only the CPU to ask.
+        let device = if config.cpu || !cfg!(feature = "metal") {
             Device::Cpu
         } else {
             Device::new_metal(0).context("opening the Metal device")?

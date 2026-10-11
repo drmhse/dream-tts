@@ -11,8 +11,8 @@ candle-core.workspace = true
 candle-nn.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tts-core = { path = "../tts-core" }
-tts-nn = { path = "../tts-nn" }
+tts-core = { path = "../tts-core", default-features = false }
+tts-nn = { path = "../tts-nn", default-features = false }
 tts-phoneme = { path = "../tts-phoneme" }
 
 [features]

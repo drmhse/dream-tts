@@ -25,12 +25,23 @@
 //!   original1}` at load time. Both engines' vocoders ship weight-normalised convs and
 //!   neither needs the parametrisation at inference.
 
+// Custom ops keep the parameters their `metal_fwd` reads; built without Metal, only the CPU
+// refusal is left to read none of them.
+#![cfg_attr(not(feature = "metal"), allow(dead_code, unused_imports))]
+
 pub mod attn;
 pub mod fused;
 pub mod im2col;
+#[cfg(feature = "metal")]
 pub mod mpsblock;
+#[cfg(feature = "metal")]
 pub mod mpsconv;
+#[cfg(feature = "metal")]
 pub mod mpsnlc;
+#[cfg(not(feature = "metal"))]
+mod nometal;
+#[cfg(not(feature = "metal"))]
+pub use nometal::{mpsblock, mpsconv, mpsnlc};
 pub(crate) mod mtl;
 pub mod nlc;
 mod nlcconv;
@@ -73,6 +84,12 @@ use std::collections::HashMap;
 pub(crate) fn gpu_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Without Metal no test has a GPU to compare against, and each skips its Metal arm.
+#[cfg(all(test, not(feature = "metal")))]
+pub(crate) fn usable_metal() -> Option<Device> {
+    None
 }
 
 #[cfg(all(test, feature = "metal"))]

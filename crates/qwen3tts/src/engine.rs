@@ -525,7 +525,8 @@ impl Qwen3TtsEngine {
         paths
             .check()
             .with_context(|| format!("loading engine `{ID}`"))?;
-        let device = if config.cpu {
+        // Built without Metal there is only the CPU to ask.
+        let device = if config.cpu || !cfg!(feature = "metal") {
             Device::Cpu
         } else {
             Device::new_metal(0).context("opening the Metal device")?

@@ -26,3 +26,9 @@ objc2-metal-performance-shaders-graph = { version = "0.3.2", features = ["MPSGra
 [features]
 default = ["metal"]
 metal = ["candle-core/metal", "candle-nn/metal", "tts-bench/metal", "audio8/metal", "cosyvoice/metal", "tts-core/metal", "tts-nn/metal"]
+
+# Measures MPSGraph against candle's own buffers: nothing to probe without Metal.
+[[bin]]
+name = "mpsconv"
+path = "src/bin/mpsconv.rs"
+required-features = ["metal"]
