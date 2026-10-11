@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 252" width="620" height="252" role="img" aria-label="Time to narrate a 1612-word chapter, per engine, against the length of the speech">
+<style>
+  text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .surface { fill: #fcfcfb; }
+  .title   { fill: #0b0b0b; font-size: 15px; font-weight: 600; }
+  .sub     { fill: #52514e; font-size: 11.5px; }
+  .name    { fill: #0b0b0b; font-size: 12.5px; font-weight: 600; }
+  .note    { fill: #52514e; font-size: 11px; }
+  .axis    { fill: #898781; font-size: 11px; }
+  .value   { fill: #0b0b0b; font-size: 11.5px; font-weight: 600; }
+  .grid    { stroke: #e1e0d9; stroke-width: 1; }
+  .speech  { fill: #e1e0d9; }
+  .work    { fill: #2a78d6; }
+  @media (prefers-color-scheme: dark) {
+    .surface { fill: #1a1a19; }
+    .title, .name, .value { fill: #ffffff; }
+    .sub, .note { fill: #c3c2b7; }
+    .grid    { stroke: #2c2c2a; }
+    .speech  { fill: #383835; }
+    .work    { fill: #3987e5; }
+  }
+</style>
+<rect class="surface" width="620" height="252" rx="6"/>
+<text class="title" x="20" y="26">Narrating a 1612-word chapter</text>
+<text class="sub" x="20" y="44">Blue is the time it took; grey is the speech it produced. M4 / 16 GB.</text>
+<line class="grid" x1="150.0" y1="64" x2="150.0" y2="230"/>
+<text class="axis" x="150.0" y="246" text-anchor="middle">0 min</text>
+<line class="grid" x1="218.0" y1="64" x2="218.0" y2="230"/>
+<text class="axis" x="218.0" y="246" text-anchor="middle">2 min</text>
+<line class="grid" x1="286.0" y1="64" x2="286.0" y2="230"/>
+<text class="axis" x="286.0" y="246" text-anchor="middle">4 min</text>
+<line class="grid" x1="354.0" y1="64" x2="354.0" y2="230"/>
+<text class="axis" x="354.0" y="246" text-anchor="middle">6 min</text>
+<line class="grid" x1="422.0" y1="64" x2="422.0" y2="230"/>
+<text class="axis" x="422.0" y="246" text-anchor="middle">8 min</text>
+<line class="grid" x1="490.0" y1="64" x2="490.0" y2="230"/>
+<text class="axis" x="490.0" y="246" text-anchor="middle">10 min</text>
+<line class="grid" x1="558.0" y1="64" x2="558.0" y2="230"/>
+<text class="axis" x="558.0" y="246" text-anchor="middle">12 min</text>
+<text class="name" x="20" y="83">kokoro</text>
+<text class="note" x="20" y="97">built-in voices</text>
+<rect class="speech" x="150" y="72" width="416.5" height="24" rx="3"/>
+<rect class="work" x="150" y="72" width="15.2" height="24" rx="3"/>
+<text class="value" x="173.2" y="88">27 s  ·  27× realtime</text>
+<text class="name" x="20" y="123">qwen3tts</text>
+<text class="note" x="20" y="137">the default, clones</text>
+<rect class="speech" x="150" y="112" width="393.8" height="24" rx="3"/>
+<rect class="work" x="150" y="112" width="40.8" height="24" rx="3"/>
+<text class="value" x="198.8" y="128">1m 12s  ·  9.7× realtime</text>
+<text class="name" x="20" y="163">audio8</text>
+<text class="note" x="20" y="177">clones, 44.1 kHz</text>
+<rect class="speech" x="150" y="152" width="373.4" height="24" rx="3"/>
+<rect class="work" x="150" y="152" width="196.6" height="24" rx="3"/>
+<text class="value" x="354.6" y="168">5m 47s  ·  1.9× realtime</text>
+<text class="name" x="20" y="203">cosyvoice</text>
+<text class="note" x="20" y="217">clones, most languages</text>
+<rect class="speech" x="150" y="192" width="398.9" height="24" rx="3"/>
+<rect class="work" x="150" y="192" width="280.5" height="24" rx="3"/>
+<text class="value" x="438.5" y="208">8m 15s  ·  1.4× realtime</text>
+</svg>

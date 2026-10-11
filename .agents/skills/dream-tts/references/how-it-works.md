@@ -76,8 +76,9 @@ format changes what the engine needs.
 
 ## Where to read further
 
-- `README.md` — the guide, with the measured numbers and the diagram.
-- `docs/reference.md#performance` — every measurement and how it was taken.
+- `README.md` — the front page, with the engine table.
+- `docs/reference.md#performance` — every measurement and how it was taken, and the qwen3tts
+  pipeline diagram.
 - `docs/reference.md#what-did-not-work` — ONNX, CoreML, a custom q8_0 GEMM, f32 weights, int8
   KV, and several allocation schemes. Read this before proposing an optimisation; most obvious
   ideas here have been measured and rejected with numbers.

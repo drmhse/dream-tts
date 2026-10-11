@@ -87,7 +87,7 @@
     Local text-to-speech in Rust. Four speech models ported from PyTorch — three that clone
     a voice from a ten-second clip, one that does not — validated stage by stage against fp32
     activations dumped from their references. A 1612-word chapter becomes eleven minutes of
-    speech in about 1m 15s with a cloned voice, or twelve minutes in 31 seconds without.
+    speech in about 1m 15s with a cloned voice, or twelve minutes in 27 seconds without.
     One process, no Python at runtime.
   </p>
   <p class="caveat">
@@ -201,8 +201,8 @@
       the checkpoint, so this row answers &ldquo;what does it sound like&rdquo; and not
       &ldquo;how well does it clone&rdquo;. It is the only engine here with no
       token-by-token loop: a duration is predicted for every phoneme at once and one
-      iSTFTNet pass produces the waveform, which is where <strong>23× realtime in
-      1.7&nbsp;GB</strong> comes from. Word error rate against the chapter text is
+      iSTFTNet pass produces the waveform, which is where <strong>27× realtime in
+      2.0&nbsp;GB</strong> comes from. Word error rate against the chapter text is
       <b>0.009</b> for <code>af_heart</code> — the lowest of the eight files on this page —
       and 0.042 for <code>am_michael</code>.
     </p>
@@ -211,7 +211,7 @@
   <p class="headline">
     A chapter becomes <strong>11 minutes of speech in about 1m 15s</strong> in a cloned voice, on a
     laptop — 9× faster than realtime, so a 16-hour book is about <strong>1.7 hours</strong>
-    of compute rather than 11.5. Without cloning it is <strong>31 seconds</strong>.
+    of compute rather than 11.5. Without cloning it is <strong>27 seconds</strong>.
   </p>
 
   <h2>Try it</h2>
@@ -441,7 +441,7 @@ curl -X POST localhost:3003/v1/jobs/&lt;id&gt;/cancel    -H 'X-API-Key: secret'<
       <tr><td class="mono">qwen3tts</td><td class="num">0.104–0.114</td><td class="num">1m 12s–1m 19s</td><td>yes, 48 lanes</td><td>the default. Best quality here, and the only one that makes a book practical</td></tr>
       <tr><td class="mono">cosyvoice</td><td class="num">0.703–0.718</td><td class="num">8m 15s</td><td>no</td><td>you want the widest language coverage</td></tr>
       <tr><td class="mono">audio8</td><td class="num">0.527–0.536</td><td class="num">5m 47s</td><td>no</td><td>you want 44.1 kHz, the highest-fidelity output here</td></tr>
-      <tr><td class="mono">kokoro</td><td class="num">0.034–0.036</td><td class="num">27s</td><td>n/a, no loop</td><td>English, no cloning, and you want it now — or you have 2&nbsp;GB rather than 12</td></tr>
+      <tr><td class="mono">kokoro</td><td class="num">0.034–0.036</td><td class="num">27s</td><td>n/a, no loop</td><td>English, no cloning, and you want it now — or you have 2&nbsp;GB rather than 9</td></tr>
     </tbody>
   </table>
   </div>

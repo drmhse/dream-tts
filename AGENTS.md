@@ -9,9 +9,9 @@ the task.
 
 ## Where the truth lives
 
-- `README.md` — the guide, with the measured numbers and the pipeline diagram.
-- `docs/reference.md` — setup detail, every measurement and how it was taken, the porting traps,
-  and **what did not work**.
+- `README.md` — the front page: install, the engine table, the commands.
+- `docs/reference.md` — setup detail, every measurement and how it was taken, the qwen3tts
+  pipeline diagram and memory analysis, the porting traps, and **what did not work**.
 - The code's own comments. Constants carry the measurement that chose them, and kernels carry
   the versions that lost. Read them before changing a number.
 

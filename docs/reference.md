@@ -326,7 +326,7 @@ adds the transposed convs rewritten as one conv and `tts_nn::skinny`, the decode
 those two were measured interleaved against their own alternatives in one thermal state, at
 2.14x on the transposed convs and 0.162 → 0.148 end to end. On a 4838-word article the shipped
 configuration measured **0.144** against 0.193. Peak footprint was 12.7–13.3 GB then and is
-9.2 GB now; `README.md` has the memory analysis — it is candle's buffer pool, not the lane
+9.2 GB now; the memory analysis is [below](#memory-is-candles-buffer-pool-not-the-lane-count) — it is candle's buffer pool, not the lane
 count.
 
 ### The next third: prefill, sampling, three kernels and the load path
@@ -389,6 +389,163 @@ being the slowest of the cloning engines on a short passage. Reproduce with:
 An RTF of **0.253** was previously quoted for this configuration with no fixture behind it and
 no end-to-end render supporting it. The measurement above is what replaced it; the claim turned
 out to be close to right, which is luck rather than evidence.
+
+### What `qwen3tts` needs to be this fast
+
+**16 GB, with room to spare.** `qwen3tts` peaks at 6.7 GB on a short passage and 9.2 GB on a
+chapter: 3.4 GB of weights, the 48 lanes' KV cache, and the codec's activations, which are 3.0 GB
+at their widest. It was 12.0 and 12.5 before the load path moved to the host — see
+[below](#memory-is-candles-buffer-pool-not-the-lane-count). Below 16 GB the engine says so on
+load and keeps going, which is the honest option: it will swap, and swapping presents as the
+model being slow rather than as a mistake. So does a 16 GB machine running a browser and an
+editor beside a render — that is what the lower peak buys.
+
+**`--quant q8_0` is not the fix for a smaller machine**, though it looks like one. It halves the
+weight read, which matters only where nothing batches, and it does not touch the floor: on that
+132-word passage it peaked at 11.72 GB against f16's 12.30 — 0.58 GB — while running at 62% of
+f16's speed (RTF 0.642 against 0.397), both before the memory work below. On a chapter the gap
+is 4.5×. Reach for it to fit a single short render into a machine that misses by half a
+gigabyte, and for nothing else.
+
+What does help a smaller machine is a different engine. Same passage, same measurement:
+
+| engine | peak footprint | RTF |
+|---|---|---|
+| `kokoro` | **1.6 GB** | 0.036 |
+| `cosyvoice` | 5.0 GB | 0.716 |
+| `audio8` | 9.7 GB | 0.544 |
+| `qwen3tts` | 6.7 GB | 0.314 |
+
+`kokoro` is an order of magnitude below the rest and faster than all of them, and the price is
+stated plainly: it cannot clone a voice, and it speaks English only. A chapter takes it to
+2.0 GB.
+
+`QWEN3TTS_MAX_BATCH` trades lanes for footprint if you want to stay on this engine: a lane is
+about 77 MB of KV cache.
+
+### What makes `qwen3tts` fast, and where the 9× comes from
+
+![qwen3tts speedup components](qwen3tts-speedup.png)
+
+Every green component above is measured; together they took this engine to **RTF 0.144-0.148 —
+6.8× to 6.9× realtime** across corpora between 1612 and 4838 words. A second round, not in the
+diagram, took the chapter to **0.104–0.114, about 9×**: prefill done once per voice for the
+positions every segment shares, sampling moved to the device, a faster decode GEMM, fused decode
+attention and QK-norm/rope, and the codec's activations fused into its convs.
+[The next third](#the-next-third-prefill-sampling-three-kernels-and-the-load-path), above,
+has each one's measurement. The first round's four that carry most of it, two of them kernels:
+
+- **f16 weights, and they are the default.** Only a dense GEMM shares one weight read across
+  lanes; candle's quantized `mm_t` re-reads per row, so q8_0 amortises 1.1× against f16's 7.4×.
+- **The codec's convolutions gather their taps inside the GEMM.** Both conv-as-GEMM routes were
+  losing to *assembling* the operand rather than multiplying it — 85.8 ms to build the im2col
+  against 8.2 ms for the GEMM consuming it — so the tap index moved into the kernel, where the
+  tile is already in threadgroup memory. 1.70× on a codec chunk, and bit-identical output. The
+  transposed convs are the same conv with their tap groups reversed, which is one GEMM instead
+  of `m` plus a shifted copy each: 172.0 ms to 80.3.
+- **A GEMM shaped like a decode step.** `m` is the lane count, and candle reaches 3.64 TFLOP/s
+  on a 2048-cube but 1.07–2.34 at m = 48. A 48×64 tile — the batch, not a slice of it — beats
+  it on all seven of the talker's projections, 1.08× to 1.46×. Rounding the batch up into a
+  64-row tile instead gives a quarter of the matrix-unit work to padding and *loses*.
+- **48 batched lanes, sorted longest-first, shedding each finished tail.** A group runs as long
+  as its longest lane, so ordering decides how much of the batch is real work: 68-70% of
+  lane-steps were useful before, 79-90% now. Only a contiguous *tail* can be dropped — a prefix
+  narrow shares the caches' storage — which is why the sort order is what makes it work.
+
+| corpus | segments | was (24 lanes) | 48 lanes | first round | shipped | |
+|---|---|---|---|---|---|---|
+| Pixel Watch article, 4838 words | 203 | | 0.193 | 0.144 | — | 6.9× |
+| `examples/chapter.txt`, 1612 words | 100 | 0.260 | 0.186 | 0.148 | **0.104–0.114** | **9×** |
+
+**Shedding pays most where segment lengths vary most**, so these are a floor rather than a best
+case: the article's segment lengths have the narrower spread of the two and it gains the least.
+
+**Quality is checked on the audio, not on the codes**, because token identity is the wrong metric
+for a sampled model — two of the four changes above move the logits, and a sampled model then
+takes a different path through the same text. Against the article, WER is **0.036** where the
+release before it was 0.038 (176 against 184 errors in 4838 words), and median F0 and LTAS cosine
+against the clip this voice was cloned from are **175.8 Hz and 0.9974**, unchanged to the digits
+that mean anything. `references/cosyvoice/wer.py` and `references/audio8/verify_voice.py` are the
+tools. The fused conv is stronger than that: its render is bit-identical to the one before it
+across all 42,454,560 samples.
+
+#### Memory is candle's buffer pool, not the lane count
+
+Peak footprint is now **9.2 GB** on a chapter and 6.7 on a short passage, from 12.5 and 12.0, and
+14.2-14.8 before that. The lever is not obvious, so it is worth
+stating plainly: `vmmap` attributes a render to GPU allocations far exceeding its ~4.5 GB of
+weights. The mechanism, read from candle 0.10.2's source and confirmed by measurement: every
+op's output buffer goes into a pool candle never trims, rounded up to a power of two, while a
+buffer uploaded from host data is exact and is released when dropped. Loading a model and then
+dropping it left 6.64 GB allocated. So every tensor a device op ever produced at a given size is
+permanent, and most memory wins here are a *shape removed* — or work moved to the host —
+rather than bytes shaved:
+
+- **The codec decodes a uniform span, padded on the right.** The natural loop runs two lengths —
+  300 frames for the first chunk, which has no history to spend, then 325 — and one 300-frame
+  chunk is **5.55 GB** of activations, so the second length cost about that again. Extending each
+  window *rightwards* is free because the decoder is causal, and the gate confirms the audio is
+  unchanged. Moving the seams instead is *not* free: `codec.long.wav_chunked` fails at rel 3.4e-1,
+  because the reference's own chunked output differs from its unchunked one.
+- **Weights are mmapped and fetched per tensor.** `safetensors::load` was uploading the whole
+  3.86 GB checkpoint to the GPU beside the f16 copies. A one-sentence render's floor went 9.24 →
+  8.09 GB and a chapter's RSS 7.79 → 4.32 GB, at no cost in throughput.
+- **Load-time work is done on the host.** A weight cast to f16 and transposed on the device left
+  both intermediates pooled for good: the talker allocated 6.76 GB for 3.37 GB of weights. Cast,
+  transposed and concatenated on the host and uploaded once, it allocates 3.37. The text
+  embedding table — 622 MB, a 1 GiB buffer after rounding, of which a request reads a few hundred
+  rows — is now read from the mapping row by row. Chapter peak 12.5 → 9.2 GB.
+- **The codec's activations fold into its convs.** A residual unit's second SnakeBeta and its
+  residual add ride inside the k=1 conv, so neither is a full-size tensor: the codec alone went
+  5.29 → 3.0 GB.
+- **Prefill runs in 8-lane windows and shed widths are multiples of 8.** Prefill attention is
+  `b × heads × L²` — 748 MB of scores at 48 lanes — and narrowing 48 → 47 → 46 minted a new width,
+  hence new buffer sizes, every step.
+
+A lane itself is cheap: **13 MB** of peak footprint between 24 and 48 lanes, against the 77 MB its
+KV cache implies. So the 16 GB machine runs out because of the floor, not the lanes.
+
+![RTF by lane count](qwen3tts-lanes-rtf.svg)
+
+**Past 48 lanes it used to swap.** It no longer does — 64 lanes peaks at 12.4 GB — but it is not
+faster yet (0.107 against 0.100): `skinny`'s tile is 48 rows, and a 64-lane KV layer rounds up
+from 87.8 MB to 128 MiB. The history, for whoever takes that on:
+
+**Past 48 lanes it swapped, and that was not one allocation anyone could move.** The obvious
+suspect is that a 100-segment document splits 64 + 36, so the KV cache is allocated at two
+widths and the pool keeps both. It is not enough: four separate attempts at freeing 64 lanes
+are recorded in [what did not work](#what-did-not-work), and the closest —
+slicing the codec's waveform stack, which is *exact*, since every conv below the pre-transformer
+is causal — bought 1.08 GB for 9% more time and still swapped at 64. Peak goes 12.7 to 15.8 GB
+between 48 lanes and 64, and it is spread across the run rather than sitting in one buffer. The
+codec's activations are the floor, and the only lever on those costs more than the lanes return.
+
+There is no arithmetic saturation to find before that wall. An added lane costs about 0.4 ms
+from 16 to 64, and per-lane cost is still falling where the engine has already run out of
+memory — 1.615 ms at 48 against 1.460 at 64, because 64 fills the 8×8 matrix tiles that 48
+leaves ragged. Only past that does the curve turn: 96 lanes costs 17.4 ms per lane and 128
+costs 31.3, which is the VM compressor rather than arithmetic.
+
+![cost per lane](qwen3tts-lanes-perlane.svg)
+
+A machine with more memory should sweep `QWEN3TTS_MAX_BATCH` again — the cliff moves, and the
+curve above it has not flattened. Regenerate both charts with `python3 scripts/plot-lanes.py`;
+the measurements are inline in that script.
+
+The two amber components are what a *seventh* multiple would need, and neither has a fixture
+behind it: refilling an interior lane the moment it hits `codec_eos` rather than only shedding
+tails, and closing what the codec still gives away to torch. The codec is 26% of the total now,
+down from 40%, and does not batch by construction — with a free talker the floor is RTF 0.038,
+or 26×, so the ceiling has moved back to the talker.
+
+The paths already refuted — f32 weights, batched q8_0, device-side sampling, an f16 codec,
+ONNX, CoreML — are in [what did not work](#what-did-not-work).
+
+Regenerate the diagram after any change to those numbers:
+
+```sh
+plantuml -tpng docs/qwen3tts-speedup.puml
+```
 
 ### Chapter, the other three engines
 
@@ -457,6 +614,65 @@ One caveat on the tables. CosyVoice's reference is CPU-only because upstream's
 MPS service reaches ~0.76, which this beats by 5% rather than by 6×. And model load is
 1.0–1.5 s for Audio8 including quantizing 417 M params, against 15–17 s for the PyTorch
 service's reload path.
+
+### `kokoro`, and what dropping the autoregressive loop buys
+
+Every other engine here generates audio tokens one step at a time, and that loop is what the
+whole `qwen3tts` section above is about. Kokoro-82M does not have one. It predicts a duration
+for *every phoneme at once*, stretches the encoding to match, and runs a single pass through an
+iSTFTNet decoder. What follows from that is most of what makes it worth having:
+
+- **RTF 0.036, and it does not depend on length.** 12m 15s of speech in 27 seconds, 27×
+  realtime — and 0.036 on a 132-word passage, where `qwen3tts` needs a long document to reach
+  about 0.11. There is no batch to fill, so a single sentence runs at the same rate as a chapter:
+  4.5 s of it in 0.45 s from a cold process, 0.15 s from a running server. See
+  [below](#kokoro-second-pass-the-per-length-compile-the-recurrences-the-load-path).
+- **1.6 GB of peak footprint** on a short passage and 2.0 on a chapter, against 6.7 and 9.2 for the default. 82M parameters and no KV cache.
+- **No sampler, so no length drift.** Two renders of the same text are the same length; the
+  only stochastic stage is the decoder's excitation noise, which is seeded.
+- **It cannot clone.** Its voices are 28 style tables of `[510, 256]` shipped inside the
+  checkpoint — there is no path from a reference clip to one of them. `--set voice=<name>`
+  picks one; `--voice` is an error rather than a silent fallback.
+- **English only, and no GPL in the frontend.** Kokoro takes IPA from `misaki`, which
+  reaches for espeak-ng on any word its lexicon misses. espeak-ng is GPL-3.0, so this port
+  does not have it: `crates/tts-phoneme` is a lexicon, a tokenizer and a port of spaCy's POS
+  tagger, **byte-identical to the pinned Python over 522,542 tokens** of real narration. A
+  word outside the lexicon is derived by rule, approximated if it is initials (`png`) or a
+  compound of known words (`mysite`), and otherwise, in American English, guessed by g2p_en's
+  3 MB model (Apache-2.0, trained on CMUdict): a 23.9% phoneme error on 44,320 words it never
+  saw, where before the word was silence. See
+  [docs/kokoro-frontend.md](kokoro-frontend.md#out-of-lexicon-words).
+
+Word error rate against the chapter, transcribed with the same Whisper settings as every other
+engine here, is **0.009** for `af_heart` — the lowest of the eight files on the demo page — and
+0.042 for `am_michael`. The full table, and the caveat that WER is comparing renders against
+each other rather than reporting a publishable figure, is in
+[word error rate, all eight demo renders](#word-error-rate-all-eight-demo-renders).
+
+**Where the time goes: 80% is the decoder**, and inside it the generator's convolutions. Those
+run through MPSGraph rather than candle, which materialises no im2col matrix — 1.7× on the
+shape that dominates. MPSGraph compiles a graph afresh for every input length, ~4 ms each and
+~26 of them, which on a chapter was a third of the decoder: the generator pads to one of eight
+lengths per octave, exactly, and the graphs a length needs are compiled on other threads while
+the GPU is still on the prosody stage.
+The recurrences are the other half of the story: Metal compiles with fast math on by default,
+and an LSTM multiplies its own rounding, which was enough here to move the predicted durations
+and *halve the length of the audio*. `lstm_gates` uses `precise::exp` and `precise::tanh` for
+that reason and no other.
+
+The gate is `cargo run -p kokoro --release --bin kokoro-validate`, and its last row is the one
+worth reading: the excitation phase accumulates to 165,303 radians, where one f32 ulp is 0.0156
+— so upstream is not reproducible against *itself* at fp32. The criterion is therefore that
+this port sits closer to the reference than the reference sits to itself under a different
+noise draw: **25.3 dB against upstream's own 19.7 and 20.7**. `docs/kokoro-model.md` and
+`docs/kokoro-frontend.md` carry that and the other nine traps.
+
+```sh
+./scripts/bootstrap.sh kokoro              # ~0.7 GB, and a torch venv for the conversion
+./dream-tts speak --engine kokoro --set voice=af_heart \
+    --text-file examples/chapter.txt --out chapter.wav
+./dream-tts engines                        # every voice name it will take
+```
 
 ### Kokoro's decoder, and what is left in it
 
