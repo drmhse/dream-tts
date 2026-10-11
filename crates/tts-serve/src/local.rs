@@ -27,11 +27,11 @@ pub struct Said {
 }
 
 impl Local {
-    pub fn load(engine: &str, model_root: &Path, segment_chars: usize) -> Result<Self> {
+    pub fn load(engine: &str, model_root: &Path, segment_chars: usize, cpu: bool) -> Result<Self> {
         let config = EngineConfig {
             model_root: model_root.to_path_buf(),
             quant: None,
-            cpu: false,
+            cpu,
             overrides: Default::default(),
         };
         let started = Instant::now();
