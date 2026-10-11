@@ -248,15 +248,30 @@ fi
 # ------------------------------------------------------------------ 4c. Kokoro
 #
 # The checkpoint is curl; the conversion is `torch.load` and a weight_norm fold, so it wants
-# the venv. The frontend — the exported spaCy tagger and the two lexicons — is fetched as an
+# the venv — but only the first time. The finished safetensors are published in the assets
+# dataset alongside the frontend, so fresh checkouts pull them below and never need torch.
+# The frontend — the exported spaCy tagger and the two lexicons — is fetched as an
 # asset in step 5, because exporting it needs spaCy and misaki rather than torch.
 
 KOKORO_W="$ROOT/references/kokoro/weights"
 if ! wants kokoro; then
   say "Skipping the Kokoro checkpoint (not selected)"
-elif [ -f "$KOKORO_W/kokoro.safetensors" ] && [ -f "$KOKORO_W/voices.safetensors" ] && [ -z "$FORCE" ]; then
+elif [ -f "$KOKORO_W/kokoro.safetensors" ] && [ -f "$KOKORO_W/voices.safetensors" ] && [ -f "$KOKORO_W/config.json" ] && [ -z "$FORCE" ]; then
   say "Kokoro checkpoint already converted — skipping (pass --force to redo)"
 else
+  # Pre-converted, curl-only path: pull the finished weights; never needs torch.
+  ASSETS_REPO="${DREAM_TTS_ASSETS_REPO:-drmhse/tts-rs-assets}"
+  ASSETS_BASE="https://huggingface.co/datasets/$ASSETS_REPO/resolve/main/kokoro"
+  if [ -z "$FORCE" ] && mkdir -p "$KOKORO_W" \
+    && curl -sSfL --retry 3 -o "$KOKORO_W/kokoro.safetensors.part" "$ASSETS_BASE/kokoro.safetensors" \
+    && curl -sSfL --retry 3 -o "$KOKORO_W/voices.safetensors.part" "$ASSETS_BASE/voices.safetensors" \
+    && curl -sSfL --retry 3 -o "$KOKORO_W/config.json.part" "$ASSETS_BASE/config.json"; then
+    mv "$KOKORO_W/kokoro.safetensors.part" "$KOKORO_W/kokoro.safetensors"
+    mv "$KOKORO_W/voices.safetensors.part" "$KOKORO_W/voices.safetensors"
+    mv "$KOKORO_W/config.json.part" "$KOKORO_W/config.json"
+    say "Kokoro converted weights pulled from $ASSETS_REPO — no torch needed"
+  else
+    rm -f "$KOKORO_W"/*.part
   # The 26 voicepacks this omits are the Spanish, French, Hindi, Italian, Japanese,
   # Portuguese and Chinese ones. The frontend is an English lexicon, so they have no
   # faithful path through it — shipping them would only offer a wrong pronunciation in a
@@ -277,6 +292,7 @@ else
   need_python
   say "Folding weight_norm and packing the voicepacks into safetensors"
   ( cd "$ROOT/references/kokoro" && "$VENV/bin/python" convert.py )
+  fi
 fi
 
 # ------------------------------------------------------------------ 5. derived assets
