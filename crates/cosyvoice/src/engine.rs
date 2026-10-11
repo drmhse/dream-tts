@@ -39,8 +39,7 @@ use std::time::Instant;
 use tokenizers::Tokenizer;
 use tts_core::rng::Rng;
 use tts_core::{
-    text, wav, Audio, Capabilities, Cloning, Engine, EngineConfig, Stats, Synthesis,
-    SynthesisRequest,
+    text, Audio, Capabilities, Cloning, Engine, EngineConfig, Stats, Synthesis, SynthesisRequest,
 };
 
 pub const ID: &str = "cosyvoice";

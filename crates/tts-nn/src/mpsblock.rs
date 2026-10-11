@@ -440,17 +440,17 @@ mod tests {
                 ));
             }
             let mut want = x.clone();
-            for i in 0..3 {
+            for (i, &dl) in dils.iter().enumerate() {
                 let conv = |x: &Tensor, j: usize, dl: usize| -> anyhow::Result<Tensor> {
                     let (w, b) = &convs[j];
-                    Ok(crate::centered_conv1d_gemm(
+                    crate::centered_conv1d_gemm(
                         x,
                         &w.reshape((k * c, c))?.t()?,
                         Some(b),
                         k,
                         dl,
                         (k - 1) * dl / 2,
-                    )?)
+                    )
                 };
                 let a = crate::fused::adain_snake_masked(
                     &want,
@@ -459,7 +459,7 @@ mod tests {
                     eps as f64,
                     valid,
                 )?;
-                let t = conv(&a, 2 * i, dils[i])?;
+                let t = conv(&a, 2 * i, dl)?;
                 let a = crate::fused::adain_snake_masked(
                     &t,
                     &gb.get(2 * i + 1)?,

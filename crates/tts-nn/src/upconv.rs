@@ -369,6 +369,7 @@ mod tests {
     use super::*;
     use candle_core::Device;
 
+    #[allow(clippy::too_many_arguments)]
     fn check(
         dev: &Device,
         cout: usize,

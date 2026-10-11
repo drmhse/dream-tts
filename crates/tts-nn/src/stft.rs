@@ -132,7 +132,7 @@ pub fn inverse(stacked: &Tensor, frames: usize, t: &Tables) -> Result<Tensor> {
     let sv: Vec<f32> = stacked.flatten_all()?.to_vec1()?;
     let mut dst = vec![0f32; out_len];
     cpu_inverse(&sv, frames, t, &mut dst);
-    Ok(Tensor::from_vec(dst, out_len, stacked.device())?)
+    Tensor::from_vec(dst, out_len, stacked.device())
 }
 
 fn cpu_forward(x: &[f32], t: &Tables, frames: usize, dst: &mut [f32]) {
@@ -162,7 +162,7 @@ fn cpu_forward(x: &[f32], t: &Tables, frames: usize, dst: &mut [f32]) {
 fn cpu_inverse(stacked: &[f32], frames: usize, t: &Tables, dst: &mut [f32]) {
     let out_len = (frames - 1) * t.hop;
     let at = |row: usize, f: usize| stacked[row * frames + f];
-    for tt in 0..out_len {
+    for (tt, slot) in dst.iter_mut().enumerate().take(out_len) {
         let g = t.pad + tt;
         let f_lo = if g < t.n_fft {
             0
@@ -184,7 +184,7 @@ fn cpu_inverse(stacked: &[f32], frames: usize, t: &Tables, dst: &mut [f32]) {
             acc += v * w;
             env += w * w;
         }
-        dst[tt] = if env > 1e-11 { acc / env } else { 0.0 };
+        *slot = if env > 1e-11 { acc / env } else { 0.0 };
     }
 }
 
@@ -242,7 +242,7 @@ impl CustomOp2 for Forward {
         encoder.set_buffer(0, Some(s1.buffer()), l1.start_offset() * 4);
         // Tables pack as [tre | tim | win]; the kernel splits them by size.
         let bn = (self.bins * self.n_fft) as u32;
-        encoder.set_buffer(1, Some(s2.buffer()), (l2.start_offset() + 0) * 4);
+        encoder.set_buffer(1, Some(s2.buffer()), l2.start_offset() * 4);
         encoder.set_buffer(2, Some(s2.buffer()), (l2.start_offset() + bn as usize) * 4);
         encoder.set_buffer(
             3,
@@ -344,8 +344,8 @@ impl CustomOp2 for Inverse {
         encoder.set_buffer(0, Some(s1.buffer()), l1.start_offset() * 4);
         encoder.set_buffer(1, Some(s1.buffer()), (l1.start_offset() + bf) * 4);
         // Tables pack as [tc | ts | win].
-        let bn = (self.bins * self.n_fft) as usize;
-        encoder.set_buffer(2, Some(s2.buffer()), (l2.start_offset() + 0) * 4);
+        let bn = self.bins * self.n_fft;
+        encoder.set_buffer(2, Some(s2.buffer()), l2.start_offset() * 4);
         encoder.set_buffer(3, Some(s2.buffer()), (l2.start_offset() + bn) * 4);
         encoder.set_buffer(4, Some(s2.buffer()), (l2.start_offset() + 2 * bn) * 4);
         encoder.set_buffer(5, Some(dst.as_ref()), 0);
@@ -438,7 +438,7 @@ mod tests {
         let got_a = inverse(&got_s, frames, &t)?
             .to_device(&cpu)?
             .to_vec1::<f32>()?;
-        let want_a = inverse(&want_s, frames, &t)?.to_vec1::<f32>()?;
+        let _want_a = inverse(&want_s, frames, &t)?.to_vec1::<f32>()?;
         // Phase compares through the complex spectrum: values near an atan2
         // branch cut differ by whole turns, which is not an error.
         let complex = |s: &Tensor| -> anyhow::Result<Tensor> {

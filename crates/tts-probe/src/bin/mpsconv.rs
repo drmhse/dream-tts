@@ -68,6 +68,7 @@ struct GraphConv {
 }
 
 impl GraphConv {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         dev: &ProtocolObject<dyn MTLDevice>,
         cin: usize,
@@ -137,7 +138,7 @@ impl GraphConv {
                 self.dt,
             );
             let feeds = NSDictionary::from_retained_objects(&[&*self.src, &*self.wts], &[xd, wd]);
-            let targets = NSArray::from_retained_slice(&[self.out.clone()]);
+            let targets = NSArray::from_retained_slice(std::slice::from_ref(&self.out));
             let _ = self
                 .graph
                 .runWithMTLCommandQueue_feeds_targetTensors_targetOperations(

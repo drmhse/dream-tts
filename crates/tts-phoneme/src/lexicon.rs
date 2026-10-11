@@ -796,9 +796,9 @@ impl Lexicon {
                 } else {
                     num2words::cardinal(v)
                 }
-            } else if plain.starts_with('.') {
+            } else if let Some(rest) = plain.strip_prefix('.') {
                 let mut s = String::from("point");
-                for c in plain[1..].chars() {
+                for c in rest.chars() {
                     s.push(' ');
                     s.push_str(&num2words::cardinal(c.to_digit(10)? as i64));
                 }

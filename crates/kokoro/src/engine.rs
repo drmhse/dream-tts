@@ -12,8 +12,8 @@ use anyhow::{Context, Result};
 use candle_core::Device;
 use std::time::Instant;
 use tts_core::{
-    text, wav, Audio, Capabilities, Cloning, Engine, EngineConfig, Stats, Synthesis,
-    SynthesisRequest, WordTime,
+    text, Audio, Capabilities, Cloning, Engine, EngineConfig, Stats, Synthesis, SynthesisRequest,
+    WordTime,
 };
 
 pub const ID: &str = crate::ID;

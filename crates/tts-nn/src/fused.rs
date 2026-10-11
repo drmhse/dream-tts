@@ -946,7 +946,7 @@ pub fn sub_sqr(x: &Tensor, m: &Tensor) -> Result<Tensor> {
             .contiguous()?
             .apply_op2_no_bwd(&m.flatten_all()?.contiguous()?, &op);
     }
-    Ok(x.broadcast_sub(&m.reshape((1, c, 1))?)?.sqr()?)
+    x.broadcast_sub(&m.reshape((1, c, 1))?)?.sqr()
 }
 
 /// `out = (x - mean) * rsqrt(var + eps) * (gamma + 1) + beta`, per channel.
@@ -1075,7 +1075,7 @@ pub fn adain_apply(
         if t.elem_count() != c {
             candle_core::bail!("adain_apply: parameter has wrong size");
         }
-        Ok(t.flatten_all()?.contiguous()?)
+        t.flatten_all()?.contiguous()
     };
     if b == 1
         && x.device().is_metal()

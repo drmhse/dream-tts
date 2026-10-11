@@ -320,7 +320,7 @@ fn cmd_config(cfg: &Config) -> Result<()> {
     // An engine that cannot clone has no asset path to resolve, and printing the repo root
     // as its "voice" would be a plausible-looking lie.
     match tts_engines::default_voice(&id) {
-        "" => ui::field_note("voice", "—".to_string(), "built into the checkpoint"),
+        "" => ui::field_note("voice", "—", "built into the checkpoint"),
         shipped => {
             let voice = match &cfg.settings.voice {
                 Some(v) => cfg.root_path(v),

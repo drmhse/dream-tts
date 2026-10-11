@@ -1221,6 +1221,67 @@ pub fn abs_and_rel(a: &Tensor, b: &Tensor) -> Result<(f32, f32)> {
     Ok((abs, if scale > 0.0 { abs / scale } else { 0.0 }))
 }
 
+/// `[out, in]` as `[in, out]` in `dtype` on `device`, the cast and transpose done on the host
+/// so the device sees a single exact upload; see [`Weights::get`].
+fn host_layout(t: &Tensor, dtype: DType, device: &Device) -> Result<Tensor> {
+    let t = t.to_device(&Device::Cpu)?.to_dtype(dtype)?;
+    let (rows, cols) = t.dims2()?;
+    let out = match dtype {
+        DType::F32 => Tensor::from_vec(
+            transpose(&t.flatten_all()?.to_vec1::<f32>()?, rows, cols),
+            (cols, rows),
+            &Device::Cpu,
+        )?,
+        DType::F16 => Tensor::from_vec(
+            transpose(&t.flatten_all()?.to_vec1::<half::f16>()?, rows, cols),
+            (cols, rows),
+            &Device::Cpu,
+        )?,
+        _ => t.t()?.contiguous()?,
+    };
+    Ok(out.to_device(device)?)
+}
+
+/// `[rows, cols]` to `[cols, rows]` in 64-square tiles, a band of output rows per thread.
+/// candle's strided copy of a transposed view was most of a checkpoint's load time.
+fn transpose<T: Copy + Default + Send + Sync>(src: &[T], rows: usize, cols: usize) -> Vec<T> {
+    const TILE: usize = 64;
+    let mut dst = vec![T::default(); src.len()];
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(8);
+    let band = cols.div_ceil(threads).div_ceil(TILE).max(1) * TILE;
+    std::thread::scope(|sc| {
+        for (b, out) in dst.chunks_mut(band * rows).enumerate() {
+            sc.spawn(move || {
+                let c0 = b * band;
+                let c1 = (c0 + band).min(cols);
+                for rt in (0..rows).step_by(TILE) {
+                    for ct in (c0..c1).step_by(TILE) {
+                        for c in ct..(ct + TILE).min(c1) {
+                            for r in rt..(rt + TILE).min(rows) {
+                                out[(c - c0) * rows + r] = src[r * cols + c];
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    dst
+}
+
+/// Bytes the Metal device has allocated for this process, pool included; `None` off Metal.
+pub fn allocated_bytes(device: &Device) -> Option<u64> {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        use objc2_metal::MTLDevice;
+        return Some(m.device().as_ref().currentAllocatedSize() as u64);
+    }
+    let _ = device;
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1384,65 +1445,4 @@ mod tests {
         }
         Ok(())
     }
-}
-
-/// `[out, in]` as `[in, out]` in `dtype` on `device`, the cast and transpose done on the host
-/// so the device sees a single exact upload; see [`Weights::get`].
-fn host_layout(t: &Tensor, dtype: DType, device: &Device) -> Result<Tensor> {
-    let t = t.to_device(&Device::Cpu)?.to_dtype(dtype)?;
-    let (rows, cols) = t.dims2()?;
-    let out = match dtype {
-        DType::F32 => Tensor::from_vec(
-            transpose(&t.flatten_all()?.to_vec1::<f32>()?, rows, cols),
-            (cols, rows),
-            &Device::Cpu,
-        )?,
-        DType::F16 => Tensor::from_vec(
-            transpose(&t.flatten_all()?.to_vec1::<half::f16>()?, rows, cols),
-            (cols, rows),
-            &Device::Cpu,
-        )?,
-        _ => t.t()?.contiguous()?,
-    };
-    Ok(out.to_device(device)?)
-}
-
-/// `[rows, cols]` to `[cols, rows]` in 64-square tiles, a band of output rows per thread.
-/// candle's strided copy of a transposed view was most of a checkpoint's load time.
-fn transpose<T: Copy + Default + Send + Sync>(src: &[T], rows: usize, cols: usize) -> Vec<T> {
-    const TILE: usize = 64;
-    let mut dst = vec![T::default(); src.len()];
-    let threads = std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
-        .min(8);
-    let band = cols.div_ceil(threads).div_ceil(TILE).max(1) * TILE;
-    std::thread::scope(|sc| {
-        for (b, out) in dst.chunks_mut(band * rows).enumerate() {
-            sc.spawn(move || {
-                let c0 = b * band;
-                let c1 = (c0 + band).min(cols);
-                for rt in (0..rows).step_by(TILE) {
-                    for ct in (c0..c1).step_by(TILE) {
-                        for c in ct..(ct + TILE).min(c1) {
-                            for r in rt..(rt + TILE).min(rows) {
-                                out[(c - c0) * rows + r] = src[r * cols + c];
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
-    dst
-}
-
-/// Bytes the Metal device has allocated for this process, pool included; `None` off Metal.
-pub fn allocated_bytes(device: &Device) -> Option<u64> {
-    #[cfg(feature = "metal")]
-    if let Device::Metal(m) = device {
-        use objc2_metal::MTLDevice;
-        return Some(m.device().as_ref().currentAllocatedSize() as u64);
-    }
-    let _ = device;
-    None
 }

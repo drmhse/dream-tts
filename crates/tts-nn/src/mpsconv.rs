@@ -504,7 +504,6 @@ pub fn centered_conv1d_residual(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
 
     /// Against the gather route, at the generator's shapes and every dilation it uses.
     #[test]

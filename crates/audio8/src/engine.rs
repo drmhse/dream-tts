@@ -15,8 +15,7 @@ use candle_core::Device;
 use std::sync::Mutex;
 use std::time::Instant;
 use tts_core::{
-    text, wav, Audio, Capabilities, Cloning, Engine, EngineConfig, Stats, Synthesis,
-    SynthesisRequest,
+    text, Audio, Capabilities, Cloning, Engine, EngineConfig, Stats, Synthesis, SynthesisRequest,
 };
 
 pub const ID: &str = "audio8";

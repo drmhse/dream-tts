@@ -294,7 +294,7 @@ impl Generator {
     pub fn excitation(&self, f0: &[f32], draws: &mut (dyn Draws + Send)) -> Vec<f32> {
         let mut upsampled = Vec::with_capacity(f0.len() * self.upsample);
         for v in f0 {
-            upsampled.extend(std::iter::repeat(*v).take(self.upsample));
+            upsampled.extend(std::iter::repeat_n(*v, self.upsample));
         }
         source::excitation(
             &upsampled,

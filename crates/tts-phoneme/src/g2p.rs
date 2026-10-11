@@ -350,8 +350,7 @@ impl G2P {
     fn lexicon_lookup(&self, tk: &MToken, ctx: &TokenContext) -> Option<Hit> {
         let source = tk.alias.as_deref().unwrap_or(&tk.text);
         let word: String = source
-            .replace('\u{2018}', "'")
-            .replace('\u{2019}', "'")
+            .replace(['\u{2018}', '\u{2019}'], "'")
             .nfkc()
             .map(numeric_if_needed)
             .collect();
@@ -401,22 +400,21 @@ impl G2P {
         let prespace = text.contains(' ') || text.contains('/') || classes.len() > 1;
 
         let n = tokens.len();
-        for i in 0..n {
-            if tokens[i].phonemes.is_none() {
+        for (i, tk) in tokens.iter_mut().enumerate() {
+            if tk.phonemes.is_none() {
                 if i == n - 1
-                    && tokens[i].text.chars().count() == 1
-                    && tokens[i].text.chars().all(non_quote_punct)
+                    && tk.text.chars().count() == 1
+                    && tk.text.chars().all(non_quote_punct)
                 {
-                    tokens[i].phonemes = Some(tokens[i].text.clone());
-                    tokens[i].rating = Some(3);
-                } else if !tokens[i].text.is_empty()
-                    && tokens[i].text.chars().all(|c| SUBTOKEN_JUNKS.contains(c))
+                    tk.phonemes = Some(tk.text.clone());
+                    tk.rating = Some(3);
+                } else if !tk.text.is_empty() && tk.text.chars().all(|c| SUBTOKEN_JUNKS.contains(c))
                 {
-                    tokens[i].phonemes = Some(String::new());
-                    tokens[i].rating = Some(3);
+                    tk.phonemes = Some(String::new());
+                    tk.rating = Some(3);
                 }
             } else if i > 0 {
-                tokens[i].prespace = prespace;
+                tk.prespace = prespace;
             }
         }
         if prespace {
@@ -439,7 +437,7 @@ impl G2P {
             return;
         }
         let stressed = indices.iter().filter(|(b, _, _)| *b).count();
-        if indices.len() < 2 || stressed <= (indices.len() + 1) / 2 {
+        if indices.len() < 2 || stressed <= indices.len().div_ceil(2) {
             return;
         }
         indices.sort();
@@ -532,8 +530,8 @@ impl G2P {
                             let derived = {
                                 let tk = &group[right];
                                 if tk.phonemes.is_none()
-                                    && !(!tk.text.is_empty()
-                                        && tk.text.chars().all(|c| SUBTOKEN_JUNKS.contains(c)))
+                                    && (tk.text.is_empty()
+                                        || !tk.text.chars().all(|c| SUBTOKEN_JUNKS.contains(c)))
                                 {
                                     self.derive(&tk.text, derive_unknown, &mut unknown)
                                 } else {

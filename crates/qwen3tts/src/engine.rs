@@ -29,8 +29,7 @@ use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 use tokenizers::{SplitDelimiterBehavior, Tokenizer};
 use tts_core::rng::Rng;
 use tts_core::{
-    text, wav, Audio, Capabilities, Cloning, Engine, EngineConfig, Stats, Synthesis,
-    SynthesisRequest,
+    text, Audio, Capabilities, Cloning, Engine, EngineConfig, Stats, Synthesis, SynthesisRequest,
 };
 use tts_nn::Weight;
 

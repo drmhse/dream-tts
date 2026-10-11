@@ -39,7 +39,7 @@ struct Maxout {
 
 impl Maxout {
     fn apply(&self, x: &[f32], out: &mut [f32]) {
-        for o in 0..self.n_o {
+        for (o, slot) in out.iter_mut().enumerate().take(self.n_o) {
             let mut best = f32::NEG_INFINITY;
             for p in 0..self.n_p {
                 let row = &self.w[(o * self.n_p + p) * self.n_i..][..self.n_i];
@@ -49,7 +49,7 @@ impl Maxout {
                 }
                 best = best.max(acc);
             }
-            out[o] = best;
+            *slot = best;
         }
     }
 }

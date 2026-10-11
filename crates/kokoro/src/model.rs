@@ -10,6 +10,10 @@ use crate::text_encoder::TextEncoder;
 use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
 use std::collections::HashMap;
+
+/// Named stage timings: `(stage, seconds)`. Aliased so the synthesis
+/// signatures stay under the complexity lint.
+type Timings = Vec<(&'static str, f64)>;
 use std::path::Path;
 use tts_nn::Weights;
 
@@ -104,7 +108,7 @@ impl Model {
         style: &Tensor,
         speed: f32,
         draws: &mut (dyn Draws + Send),
-    ) -> Result<(Vec<f32>, Vec<(&'static str, f64)>)> {
+    ) -> Result<(Vec<f32>, Timings)> {
         let (audio, timings, _) = self.synthesize_aligned(ids, style, speed, draws)?;
         Ok((audio, timings))
     }
@@ -122,13 +126,13 @@ impl Model {
         style: &Tensor,
         speed: f32,
         draws: &mut (dyn Draws + Send),
-    ) -> Result<(Vec<f32>, Vec<(&'static str, f64)>, Vec<usize>)> {
-        let mut timings: Vec<(&'static str, f64)> = Vec::new();
+    ) -> Result<(Vec<f32>, Timings, Vec<usize>)> {
+        let mut timings: Timings = Vec::new();
         // Metal dispatch is asynchronous: a timer that stops when a stage returns measures
         // enqueue time and bills the work to whatever is timed next.
         let mut mark = std::time::Instant::now();
         let mut lap = |name: &'static str,
-                       timings: &mut Vec<(&'static str, f64)>,
+                       timings: &mut Timings,
                        mark: &mut std::time::Instant,
                        device: &Device|
          -> Result<()> {

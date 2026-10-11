@@ -62,6 +62,7 @@ use tts_core::{Capabilities, Engine, EngineConfig};
 ///
 /// `kokoro` follows it rather than leads despite being the fastest here: it cannot clone,
 /// so defaulting to it would answer a request for a cloned voice with a stranger's.
+#[allow(clippy::vec_init_then_push)]
 pub fn catalogue() -> Vec<Capabilities> {
     #[allow(unused_mut)]
     let mut out = Vec::new();

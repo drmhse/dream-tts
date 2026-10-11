@@ -185,7 +185,6 @@ pub fn centered_conv1d_fused_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
 
     /// Against the gather route it replaces, at the generator's own shapes plus the
     /// awkward ones: a length that is not a multiple of the tile, and every dilation.
