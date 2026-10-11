@@ -51,7 +51,7 @@ runs and is wrong on every token.
 
 ## Out-of-lexicon words
 
-There is no espeak fallback and there will not be one. What there is instead is a derivation
+There is no espeak fallback and there will not be one: it is GPL. What there is instead is a derivation
 stage, kept **separate from the misaki-identical core** so the byte-identity gate keeps
 meaning: it only ever runs where misaki returned nothing, and `phoneme-validate` checks
 exactly that by comparing the strict path and the derived path separately.
@@ -59,7 +59,7 @@ exactly that by comparing the strict path and the derived path separately.
 After it, and only in the engine (`G2P::with_fallback`; `--set fallback=off` disables it),
 `Lexicon::approximate` catches what is still unknown: a short vowelless or capitalised word is
 spelled from the letter entries (`png` as P N G), a longer one split into the fewest known
-words (`mysite` as my + site). Anything else is still dropped and named. The phoneme gate
+words (`mysite` as my + site). The phoneme gate
 constructs its frontend without it, so misaki parity is measured on the strict path exactly as
 before (12,731 of 12,731 lines identical after the change).
 
@@ -74,8 +74,24 @@ comparatives, productive prefixes, and compound splitting. Two things that had t
   confidently and audibly wrong. Compound splits prefer the most balanced, then the shorter
   head, which is what makes "namespace" name+space rather than names+pace.
 
-What remains needs letter-to-sound, not more rules, and is reported by name rather than
-guessed at. The lexicon itself is training data for that, if it is ever worth doing.
+What remains needs letter-to-sound, not more rules. In American English it gets it from
+g2p_en (Kyubyong Park, Apache-2.0): a GRU encoder over the letters and a GRU decoder over
+ARPAbet, trained on CMUdict, 3.3 MB. `references/kokoro/export_g2p.py` pulls the pinned wheel
+from PyPI with the standard library alone and writes `g2p.safetensors` and its licence beside
+the lexicons; without them the word is named instead. `tts_phoneme::guess` runs it last, after
+`approximate`, rated 1. The Rust port gives the same ARPAbet as g2p_en's own `predict`.
+
+ARPAbet then has to be written as misaki writes it. Over the 33,322 words in both CMUdict and
+misaki's gold lexicon, a plain table agrees exactly on 55.7%; four rules take it to **63.7%**:
+the flap (`water` wˈɔɾəɹ), the glottal stop (`button` bˈʌʔn), syllabic l and n (`bottle`,
+`lesson`, only where misaki does it: l at the end after a consonant, n after t d s z), and the
+reduced vowel of `-ed` and `-est` (which needs the spelling, since `-ist` is not reduced).
+Turning every unstressed ɪ into ə, which misaki often does, lowered agreement and is not done.
+The rest is secondary stress and unstressed vowel colour.
+
+On the 44,320 gold words CMUdict lacks, so the model never saw them, the guess matches misaki
+exactly on 25.4% and has a **23.9%** phoneme error ignoring stress: near misses
+(`hexadecimal` hˌɛksədˈɪsmᵊl against hˌɛksədˈɛsəmᵊl) where before there was silence.
 
 ## What is not done
 

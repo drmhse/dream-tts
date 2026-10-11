@@ -4,6 +4,7 @@
 //! of them moved: spaCy's tokenizer, spaCy's POS tagger, and misaki's lexicon and rules.
 
 pub mod g2p;
+pub mod guess;
 pub mod lexicon;
 pub mod murmur;
 pub mod num2words;

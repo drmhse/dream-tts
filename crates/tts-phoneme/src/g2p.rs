@@ -167,6 +167,8 @@ pub struct G2P {
     /// Approximate a word misaki would drop; see `Lexicon::approximate`. Off by default, so
     /// the phoneme gate compares against misaki exactly.
     fallback: bool,
+    /// The last resort under `fallback`, for American English, whose phonemes it writes.
+    guesser: Option<crate::guess::Guesser>,
 }
 
 impl G2P {
@@ -179,6 +181,11 @@ impl G2P {
                 r"^['\u{2018}\u{2019}]+|\p{Lu}(?=\p{Lu}\p{Ll})|(?:^-)?(?:\d?[,.]?\d)+|[-_]+|['\u{2018}\u{2019}]{2,}|\p{L}*?(?:['\u{2018}\u{2019}]\p{L})*?\p{Ll}(?=\p{Lu})|\p{L}+(?:['\u{2018}\u{2019}]\p{L})*|[^-_\p{L}'\u{2018}\u{2019}\d]|['\u{2018}\u{2019}]+$",
             )?,
             fallback: false,
+            guesser: if british {
+                None
+            } else {
+                crate::guess::Guesser::load(dir)?
+            },
         })
     }
 
@@ -607,9 +614,13 @@ impl G2P {
         if !text.chars().any(char::is_alphabetic) {
             return None;
         }
+        let guessed = || {
+            let guesser = self.guesser.as_ref()?;
+            guesser.phonemes(text).map(|ps| (ps, 1))
+        };
         match self.lexicon.derive(text).or_else(|| {
             self.fallback
-                .then(|| self.lexicon.approximate(text))
+                .then(|| self.lexicon.approximate(text).or_else(guessed))
                 .flatten()
         }) {
             Some(hit) => Some(hit),

@@ -305,6 +305,15 @@ say "Fetching the derived assets"
    skipped, and CosyVoice will not start. Rerun ./scripts/fetch-assets.sh, or regenerate
    from source: docs/reference.md#setup."
 
+# Kokoro's guess at words no lexicon has, from PyPI rather than the dataset: a pinned wheel,
+# read with the standard library alone.
+G2P="$ROOT/references/kokoro/weights/frontend/g2p.safetensors"
+if wants kokoro && { [ ! -f "$G2P" ] || [ -n "$FORCE" ]; }; then
+  say "Exporting g2p_en for words outside Kokoro's lexicon"
+  python3 -I "$ROOT/references/kokoro/export_g2p.py" --out "$G2P" \
+    || warn "g2p_en export failed — unknown words will be named rather than guessed"
+fi
+
 # ------------------------------------------------------------------ 6. build
 
 if [ "$BUILD_MODE" = build ]; then

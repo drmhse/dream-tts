@@ -258,8 +258,7 @@ impl Engine for KokoroEngine {
         if !unknown.is_empty() {
             unknown.sort_unstable();
             unknown.dedup();
-            // The lexicon is the whole frontend — there is no espeak fallback to guess
-            // with — so an unpronounceable word is dropped rather than approximated, and
+            // What neither the lexicon, the rules nor the guesser could say is dropped, and
             // naming it is the only way a caller can find that out.
             eprintln!(
                 "engine {ID}: {} word(s) not in the lexicon: {}",

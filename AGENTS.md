@@ -28,9 +28,10 @@ cargo run -p kokoro --release --bin kokoro-validate
 
 `kokoro` is the fourth engine and the only non-autoregressive one. It cannot clone — its
 voices are 28 style tables inside the checkpoint, picked with `--set voice=<name>` — and its
-English frontend is a lexicon with no espeak fallback: an unknown word that is initials or a
-compound of known words is approximated (off with `--set fallback=off`), and anything else is
-named in a lint rather than guessed. `docs/kokoro-frontend.md` and `docs/kokoro-model.md` carry its traps and
+English frontend is a lexicon with no espeak fallback (GPL): an unknown word that is initials or
+a compound of known words is approximated, and in American English anything else is guessed by
+g2p_en's small Apache-2.0 model (both off with `--set fallback=off`); what is left is named in a
+lint. `docs/kokoro-frontend.md` and `docs/kokoro-model.md` carry its traps and
 its measurements. On Metal its generator runs padded to length buckets (`KOKORO_BUCKETS`, 0 to
 disable), so an A/B of a generator change has to render several lengths, not one utterance
 repeated: a repeated utterance never pays MPSGraph's per-length compile. Each resblock runs as
