@@ -93,14 +93,42 @@ pub async fn post_batch(
     }))
 }
 
-/// Cut the joined audio back into one part per paragraph. A paragraph starts wherever the
-/// silence before a segment is the paragraph gap rather than the segment gap.
+/// Cut the joined audio back into one part per paragraph.
 fn split(
     audio: &Audio,
     segments: &[SegmentTime],
     words: Option<&[WordTime]>,
     expected: usize,
 ) -> Option<Vec<Part>> {
+    let triples = |t: &[(String, f64, f64)]| t.to_vec();
+    Some(
+        pieces(audio, segments, words, expected)?
+            .into_iter()
+            .map(|p| Part {
+                seconds: p.audio.seconds(),
+                audio: base64(&tts_core::wav::to_bytes(&p.audio)),
+                words: p.words.as_deref().map(triples),
+                segments: triples(&p.segments),
+            })
+            .collect(),
+    )
+}
+
+/// One paragraph of a batch, timed from its own start.
+pub struct Piece {
+    pub audio: Audio,
+    pub words: Option<Vec<(String, f64, f64)>>,
+    pub segments: Vec<(String, f64, f64)>,
+}
+
+/// A paragraph starts wherever the silence before a segment is the paragraph gap rather than
+/// the segment gap.
+pub fn pieces(
+    audio: &Audio,
+    segments: &[SegmentTime],
+    words: Option<&[WordTime]>,
+    expected: usize,
+) -> Option<Vec<Piece>> {
     let gaps = tts_core::Gaps::default();
     let threshold = (gaps.segment_ms + gaps.paragraph_ms) as f64 / 2000.0;
     let mut groups: Vec<Vec<&SegmentTime>> = Vec::new();
@@ -120,14 +148,12 @@ fn split(
             .iter()
             .map(|g| {
                 let (start, end) = (g[0].start, g[g.len() - 1].end);
-                let samples = audio.samples[at(start)..at(end)].to_vec();
                 let shifted = |text: &str, s: f64, e: f64| (text.to_string(), s - start, e - start);
-                Part {
-                    seconds: samples.len() as f64 / rate,
-                    audio: base64(&tts_core::wav::to_bytes(&Audio {
-                        samples: samples.clone(),
+                Piece {
+                    audio: Audio {
+                        samples: audio.samples[at(start)..at(end)].to_vec(),
                         sample_rate: audio.sample_rate,
-                    })),
+                    },
                     words: words.map(|w| {
                         w.iter()
                             .filter(|w| w.start >= start - 1e-6 && w.start < end)

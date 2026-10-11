@@ -43,7 +43,11 @@
 
 mod batch;
 mod jobs;
+mod local;
 mod stream;
+
+pub use batch::Piece;
+pub use local::{Local, Said};
 
 use anyhow::{Context, Result};
 use axum::extract::{Path, State};
@@ -977,7 +981,7 @@ async fn not_implemented(Path(rest): Path<String>) -> ApiError {
 
 // ---------------------------------------------------------------- main
 
-/// For hosts that can't spawn a process (iOS). `args` include the program name.
+/// The server, for a host that runs it on a thread. `args` include the program name.
 pub fn run<I, T>(args: I) -> Result<()>
 where
     I: IntoIterator<Item = T>,
