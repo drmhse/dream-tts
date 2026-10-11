@@ -121,7 +121,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "audio8"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -524,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "cosyvoice"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -1616,7 +1616,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "kokoro"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -2306,7 +2306,7 @@ dependencies = [
 
 [[package]]
 name = "qwen3tts"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3098,7 +3098,7 @@ dependencies = [
 
 [[package]]
 name = "tts-bench"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3107,7 +3107,7 @@ dependencies = [
 
 [[package]]
 name = "tts-cli"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3125,7 +3125,7 @@ dependencies = [
 
 [[package]]
 name = "tts-core"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3136,7 +3136,7 @@ dependencies = [
 
 [[package]]
 name = "tts-doc"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "fancy-regex 0.19.0",
@@ -3147,7 +3147,7 @@ dependencies = [
 
 [[package]]
 name = "tts-engines"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "audio8",
@@ -3159,7 +3159,7 @@ dependencies = [
 
 [[package]]
 name = "tts-import"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "block2",
@@ -3178,7 +3178,7 @@ dependencies = [
 
 [[package]]
 name = "tts-jobs"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -3189,7 +3189,7 @@ dependencies = [
 
 [[package]]
 name = "tts-narrate"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "fancy-regex 0.19.0",
@@ -3199,7 +3199,7 @@ dependencies = [
 
 [[package]]
 name = "tts-nn"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3215,7 +3215,7 @@ dependencies = [
 
 [[package]]
 name = "tts-phoneme"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3228,7 +3228,7 @@ dependencies = [
 
 [[package]]
 name = "tts-probe"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "audio8",
@@ -3247,7 +3247,7 @@ dependencies = [
 
 [[package]]
 name = "tts-serve"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3264,7 +3264,7 @@ dependencies = [
 
 [[package]]
 name = "tts-speech"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "tts-doc",
  "tts-narrate",
