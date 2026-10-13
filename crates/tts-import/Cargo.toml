@@ -20,7 +20,7 @@ tts-doc = { path = "../tts-doc" }
 # which is where chapter boundaries actually are.
 objc2 = "0.6"
 block2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL", "NSArray", "NSDictionary", "NSValue", "NSAttributedString", "NSRange", "NSError", "NSEnumerator", "NSData", "NSURLSession", "NSURLRequest", "NSURLResponse", "NSDate", "block2"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL", "NSArray", "NSDictionary", "NSValue", "NSAttributedString", "NSRange", "NSError", "NSEnumerator", "NSData", "NSURLSession", "NSURLRequest", "NSURLResponse", "NSDate", "NSLocale", "block2"] }
 objc2-pdf-kit = { version = "0.3", default-features = false, features = ["std", "PDFDocument", "PDFPage", "PDFOutline", "PDFDestination", "objc2-core-graphics"] }
 # OCR, for a scanned page or a photograph. A system framework like PDFKit.
 objc2-vision = { version = "0.3", default-features = false, features = ["std", "VNRequest", "VNRequestHandler", "VNRecognizeTextRequest", "VNObservation", "VNTypes", "objc2-core-graphics", "objc2-core-foundation"] }

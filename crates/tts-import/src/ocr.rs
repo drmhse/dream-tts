@@ -15,7 +15,7 @@ use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGBitmapContextCreateImage, CGColorSpace, CGContext, CGImageAlphaInfo,
 };
-use objc2_foundation::{NSArray, NSDictionary, NSRange};
+use objc2_foundation::{NSArray, NSDictionary, NSLocale, NSRange, NSString};
 use objc2_pdf_kit::{PDFDisplayBox, PDFDocument};
 use objc2_vision::{
     VNImageRequestHandler, VNRecognizeTextRequest, VNRecognizedTextObservation, VNRequest,
@@ -178,11 +178,62 @@ fn bitmap(width: usize, height: usize) -> Result<CFRetained<CGContext>> {
     Ok(context)
 }
 
+/// The reader's preferred languages that Vision can read, in their order; English failing that.
+fn languages(request: &VNRecognizeTextRequest) -> &'static [String] {
+    static LANGUAGES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LANGUAGES.get_or_init(|| {
+        let supported: Vec<String> =
+            unsafe { request.supportedRecognitionLanguagesAndReturnError() }
+                .map(|all| all.iter().map(|l| l.to_string()).collect())
+                .unwrap_or_default();
+        let base = |tag: &str| tag.split(['-', '_']).next().unwrap_or("").to_lowercase();
+        let mut chosen: Vec<String> = Vec::new();
+        for preferred in NSLocale::preferredLanguages().iter().map(|l| l.to_string()) {
+            let exact = supported
+                .iter()
+                .find(|s| s.eq_ignore_ascii_case(&preferred));
+            let close = || supported.iter().find(|s| base(s) == base(&preferred));
+            if let Some(found) = exact.or_else(close) {
+                if !chosen.contains(found) {
+                    chosen.push(found.clone());
+                }
+            }
+        }
+        if chosen.is_empty() {
+            chosen.push("en-US".to_string());
+        }
+        chosen
+    })
+}
+
+/// Load the recognition models now, so the first scanned page is not where the wait falls. On a
+/// fresh install that is ~25 s, spent once per app; later it is a fraction of a second.
+pub fn warm() -> Result<()> {
+    let context = bitmap(64, 32)?;
+    let image = CGBitmapContextCreateImage(Some(&context)).context("a blank image")?;
+    // SAFETY: a CGImage we own and empty options.
+    let handler = unsafe {
+        VNImageRequestHandler::initWithCGImage_options(
+            VNImageRequestHandler::alloc(),
+            &image,
+            &NSDictionary::new(),
+        )
+    };
+    recognise(&handler, 64.0, 32.0).map(drop)
+}
+
 fn recognise(handler: &VNImageRequestHandler, width: f64, height: f64) -> Result<Vec<Line>> {
     let request = unsafe { VNRecognizeTextRequest::init(VNRecognizeTextRequest::alloc()) };
     request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
     request.setUsesLanguageCorrection(true);
-    request.setAutomaticallyDetectsLanguage(true);
+    // Not detected per page: each language detection settles on loads its own model, and on a
+    // fresh install that was ~14 s a page. The Mac's own languages load once, and `warm` can
+    // load them before anyone is waiting.
+    let languages: Vec<Retained<NSString>> = languages(&request)
+        .iter()
+        .map(|l| NSString::from_str(l))
+        .collect();
+    request.setRecognitionLanguages(&NSArray::from_retained_slice(&languages));
     let as_request: Retained<VNRequest> =
         Retained::into_super(Retained::into_super(request.clone()));
     let requests = NSArray::from_retained_slice(&[as_request]);
