@@ -549,32 +549,7 @@ impl<'a> Converter<'a> {
     }
 
     fn write_table(&mut self, table: Table) {
-        let columns = table.rows.iter().map(Vec::len).max().unwrap_or(0);
-        let long = table.rows.iter().flatten().any(|c| c.chars().count() > 300);
-        // A table that lays out a page rather than tabulating anything reads as its cells.
-        if table.rows.len() < 2 || columns < 2 || long {
-            for cell in table.rows.into_iter().flatten() {
-                if let Some(block) = markdown::block(None, false, &cell) {
-                    self.out.push(block);
-                }
-            }
-            return;
-        }
-        let row = |cells: &[String]| {
-            let cells: Vec<String> = (0..columns)
-                .map(|i| {
-                    cells
-                        .get(i)
-                        .map_or("", String::as_str)
-                        .replace('|', "\u{2223}")
-                })
-                .collect();
-            format!("| {} |", cells.join(" | "))
-        };
-        let mut lines = vec![row(&table.rows[0])];
-        lines.push(format!("|{}", " --- |".repeat(columns)));
-        lines.extend(table.rows[1..].iter().map(|r| row(r)));
-        self.out.push(lines.join("\n"));
+        self.out.extend(markdown::table(table.rows));
     }
 
     fn flush(&mut self) {

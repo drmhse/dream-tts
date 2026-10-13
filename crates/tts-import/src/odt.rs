@@ -26,6 +26,7 @@ pub fn to_markdown(xml: &str) -> Result<String> {
     let mut heading: Option<usize> = None;
     let mut list_depth = 0usize;
     let mut in_block = false;
+    let mut grid = markdown::Grid::default();
 
     loop {
         match reader.read_event() {
@@ -44,6 +45,9 @@ pub fn to_markdown(xml: &str) -> Result<String> {
                 }
                 "p" => in_block = true,
                 "list" => list_depth += 1,
+                "table" => grid.open(),
+                "table-row" => grid.open_row(),
+                "table-cell" => grid.open_cell(),
                 _ => {}
             },
             Ok(Event::Empty(e)) => match local(e.name().as_ref()).as_str() {
@@ -53,12 +57,17 @@ pub fn to_markdown(xml: &str) -> Result<String> {
             },
             Ok(Event::End(e)) => match local(e.name().as_ref()).as_str() {
                 "h" | "p" => {
-                    push_paragraph(&mut out, &text, heading, list_depth > 0);
+                    if !grid.paragraph(&text) {
+                        push_paragraph(&mut out, &text, heading, list_depth > 0);
+                    }
                     text.clear();
                     heading = None;
                     in_block = false;
                 }
                 "list" => list_depth = list_depth.saturating_sub(1),
+                "table" => out.extend(grid.close()),
+                "table-row" => grid.close_row(),
+                "table-cell" => grid.close_cell(),
                 _ => {}
             },
             Ok(Event::Text(t)) if in_block => {

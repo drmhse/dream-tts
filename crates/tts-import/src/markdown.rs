@@ -27,6 +27,103 @@ pub fn document(blocks: &[String]) -> String {
     format!("{}\n", blocks.join("\n\n").trim())
 }
 
+/// A table as blocks: a pipe table when it tabulates something, its cells as paragraphs when
+/// it only lays out a page.
+pub fn table(rows: Vec<Vec<String>>) -> Vec<String> {
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let long = rows.iter().flatten().any(|c| c.chars().count() > 300);
+    if rows.len() < 2 || columns < 2 || long {
+        return rows
+            .into_iter()
+            .flatten()
+            .filter_map(|cell| block(None, false, &cell))
+            .collect();
+    }
+    let row = |cells: &[String]| {
+        let cells: Vec<String> = (0..columns)
+            .map(|i| {
+                cells
+                    .get(i)
+                    .map_or("", String::as_str)
+                    .replace('|', "\u{2223}")
+            })
+            .collect();
+        format!("| {} |", cells.join(" | "))
+    };
+    let mut lines = vec![row(&rows[0])];
+    lines.push(format!("|{}", " --- |".repeat(columns)));
+    lines.extend(rows[1..].iter().map(|r| row(r)));
+    vec![lines.join("\n")]
+}
+
+/// A table read from XML whose cells hold paragraphs, as DOCX's and ODT's do. A table inside a
+/// cell is read as that cell's text.
+#[derive(Default)]
+pub struct Grid {
+    depth: usize,
+    rows: Vec<Vec<String>>,
+    row: Vec<String>,
+    cell: Option<String>,
+}
+
+impl Grid {
+    pub fn open(&mut self) {
+        self.depth += 1;
+    }
+
+    /// The finished table's blocks, once the outermost one closes.
+    pub fn close(&mut self) -> Vec<String> {
+        self.depth = self.depth.saturating_sub(1);
+        if self.depth > 0 {
+            return Vec::new();
+        }
+        self.row.clear();
+        self.cell = None;
+        table(std::mem::take(&mut self.rows))
+    }
+
+    pub fn open_row(&mut self) {
+        if self.depth == 1 {
+            self.row.clear();
+        }
+    }
+
+    pub fn close_row(&mut self) {
+        if self.depth == 1 && !self.row.is_empty() {
+            self.rows.push(std::mem::take(&mut self.row));
+        }
+    }
+
+    pub fn open_cell(&mut self) {
+        if self.depth == 1 {
+            self.cell = Some(String::new());
+        }
+    }
+
+    pub fn close_cell(&mut self) {
+        if self.depth == 1 {
+            if let Some(cell) = self.cell.take() {
+                self.row.push(cell.trim().to_string());
+            }
+        }
+    }
+
+    /// Takes a paragraph that belongs to a cell; `false` when no table is open.
+    pub fn paragraph(&mut self, text: &str) -> bool {
+        if self.depth == 0 {
+            return false;
+        }
+        let text = text.trim();
+        if let Some(cell) = self.cell.as_mut().filter(|_| !text.is_empty()) {
+            if !cell.is_empty() {
+                cell.push(' ');
+            }
+            cell.push_str(text);
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

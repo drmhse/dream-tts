@@ -31,6 +31,7 @@ pub fn to_markdown(xml: &str) -> Result<String> {
     // Word writes a numbered list as a paragraph carrying `w:numPr`, with no element that
     // says "list"; without this every bullet becomes its own paragraph and loses the marker.
     let mut numbered = false;
+    let mut grid = markdown::Grid::default();
 
     loop {
         match reader.read_event() {
@@ -38,6 +39,9 @@ pub fn to_markdown(xml: &str) -> Result<String> {
             Ok(Event::Start(e)) => match local(e.name().as_ref()).as_str() {
                 "t" => in_text = true,
                 "numpr" => numbered = true,
+                "tbl" => grid.open(),
+                "tr" => grid.open_row(),
+                "tc" => grid.open_cell(),
                 _ => {}
             },
             Ok(Event::Empty(e)) => match local(e.name().as_ref()).as_str() {
@@ -55,8 +59,13 @@ pub fn to_markdown(xml: &str) -> Result<String> {
             },
             Ok(Event::End(e)) => match local(e.name().as_ref()).as_str() {
                 "t" => in_text = false,
+                "tbl" => out.extend(grid.close()),
+                "tr" => grid.close_row(),
+                "tc" => grid.close_cell(),
                 "p" => {
-                    push_paragraph(&mut out, &text, style.as_deref(), numbered);
+                    if !grid.paragraph(&text) {
+                        push_paragraph(&mut out, &text, style.as_deref(), numbered);
+                    }
                     text.clear();
                     style = None;
                     numbered = false;
@@ -133,6 +142,21 @@ mod tests {
         assert_eq!(heading_level("Subtitle"), Some(2));
         assert_eq!(heading_level("BodyText"), None);
         assert_eq!(heading_level("Heading9"), None);
+    }
+
+    #[test]
+    fn a_table_is_a_table() {
+        let cell = |t: &str| format!("<w:tc><w:p><w:r><w:t>{t}</w:t></w:r></w:p></w:tc>");
+        let row = |a: &str, b: &str| format!("<w:tr>{}{}</w:tr>", cell(a), cell(b));
+        let xml = format!(
+            "<w:p><w:r><w:t>Before</w:t></w:r></w:p><w:tbl>{}{}</w:tbl>",
+            row("Env", "Host"),
+            row("Prod", "go.example.com")
+        );
+        assert_eq!(
+            to_markdown(&xml).unwrap(),
+            "Before\n\n| Env | Host |\n| --- | --- |\n| Prod | go.example.com |\n"
+        );
     }
 
     #[test]
