@@ -489,7 +489,9 @@ impl<'a> Converter<'a> {
     }
 
     fn end_capture(&mut self) {
-        let Some((capture, _)) = self.capture.take() else { return };
+        let Some((capture, _)) = self.capture.take() else {
+            return;
+        };
         match capture {
             Capture::NoteRef { target, text } => {
                 let label: String = text.chars().filter(|c| c.is_alphanumeric()).collect();
@@ -523,14 +525,21 @@ impl<'a> Converter<'a> {
     /// icon or a letter drawn as an image would break the line it sits in.
     fn figure(&mut self, src: &str, alt: &str) {
         let Some(base) = self.images else { return };
-        if self.table.is_some() || self.capture.is_some() || !strip(&self.line).trim().is_empty()
-        {
+        if self.table.is_some() || self.capture.is_some() || !strip(&self.line).trim().is_empty() {
             return;
         }
-        let Some(path) = image_path(base, src) else { return };
+        let Some(path) = image_path(base, src) else {
+            return;
+        };
         let alt: String = alt
             .chars()
-            .map(|c| if matches!(c, '[' | ']') || c.is_control() { ' ' } else { c })
+            .map(|c| {
+                if matches!(c, '[' | ']') || c.is_control() {
+                    ' '
+                } else {
+                    c
+                }
+            })
             .collect();
         self.flush();
         self.out.push(format!(
@@ -553,7 +562,12 @@ impl<'a> Converter<'a> {
         }
         let row = |cells: &[String]| {
             let cells: Vec<String> = (0..columns)
-                .map(|i| cells.get(i).map_or("", String::as_str).replace('|', "\u{2223}"))
+                .map(|i| {
+                    cells
+                        .get(i)
+                        .map_or("", String::as_str)
+                        .replace('|', "\u{2223}")
+                })
                 .collect();
             format!("| {} |", cells.join(" | "))
         };
@@ -573,7 +587,11 @@ impl<'a> Converter<'a> {
         } else {
             styled(&self.line)
         };
-        if let Some(note) = self.note.as_mut().filter(|n| !n.written && !text.trim().is_empty()) {
+        if let Some(note) = self
+            .note
+            .as_mut()
+            .filter(|n| !n.written && !text.trim().is_empty())
+        {
             if let Some(label) = &note.label {
                 text = format!("[^{label}]: {}", text.trim());
                 note.written = true;
@@ -632,12 +650,16 @@ fn styled(text: &str) -> String {
             i += 1;
             continue;
         };
-        let inner: String = chars[i + 1..end].iter().filter(|c| !is_marker(**c)).collect();
+        let inner: String = chars[i + 1..end]
+            .iter()
+            .filter(|c| !is_marker(**c))
+            .collect();
         let core = inner.trim();
         let lead = inner.starts_with(char::is_whitespace);
         let trail = inner.ends_with(char::is_whitespace);
         let after = chars[end + 1..].iter().find(|c| !is_marker(**c)).copied();
-        let joins = |c: char| c.is_alphanumeric() || matches!(c, '*' | '`' | '_' | '\'' | '\u{2019}');
+        let joins =
+            |c: char| c.is_alphanumeric() || matches!(c, '*' | '`' | '_' | '\'' | '\u{2019}');
         let forbidden = match mark {
             Mark::Code => core.contains('`'),
             _ => core.contains(['*', '`']) || core.starts_with('_') || core.ends_with('_'),
@@ -673,10 +695,10 @@ fn attr(e: &BytesStart, key: &str) -> Option<String> {
 
 /// EPUB's `epub:type` and ARIA's `role` both say what a part of a book is.
 fn has_type(e: &BytesStart, kind: &str) -> bool {
-    ["type", "role"]
-        .iter()
-        .filter_map(|k| attr(e, k))
-        .any(|v| v.split_whitespace().any(|t| t.trim_start_matches("doc-") == kind))
+    ["type", "role"].iter().filter_map(|k| attr(e, k)).any(|v| {
+        v.split_whitespace()
+            .any(|t| t.trim_start_matches("doc-") == kind)
+    })
 }
 
 fn is_note(e: &BytesStart) -> bool {
@@ -819,7 +841,6 @@ fn push_text(line: &mut String, text: &str) {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -909,8 +930,8 @@ mod tests {
 
     #[test]
     fn one_style_at_a_time_is_kept() {
-        let md = to_markdown("<p><strong>all <em>of</em> it</strong> and <code>x*y</code></p>")
-            .unwrap();
+        let md =
+            to_markdown("<p><strong>all <em>of</em> it</strong> and <code>x*y</code></p>").unwrap();
         assert_eq!(md, "**all of it** and `x*y`\n");
     }
 
@@ -941,29 +962,39 @@ mod tests {
 
     #[test]
     fn a_drop_cap_drawn_as_a_picture_is_its_letter() {
-        let md = to_markdown_with("<p><img src=\"a.png\" alt=\"A\"/>LICE was</p>", Some("")).unwrap();
+        let md =
+            to_markdown_with("<p><img src=\"a.png\" alt=\"A\"/>LICE was</p>", Some("")).unwrap();
         assert_eq!(md, "ALICE was\n");
-        let md = to_markdown("<div><img src=\"a.png\" alt=\"A\"/></div><div>LICE was</div>").unwrap();
+        let md =
+            to_markdown("<div><img src=\"a.png\" alt=\"A\"/></div><div>LICE was</div>").unwrap();
         assert_eq!(md, "ALICE was\n");
     }
 
     #[test]
     fn a_tiny_picture_is_left_out() {
-        let md = to_markdown_with("<p><img src=\"dot.png\" width=\"8\" height=\"8\"/></p>", Some(""))
-            .unwrap();
+        let md = to_markdown_with(
+            "<p><img src=\"dot.png\" width=\"8\" height=\"8\"/></p>",
+            Some(""),
+        )
+        .unwrap();
         assert_eq!(md, "\n");
     }
 
     #[test]
     fn a_cover_wrapped_in_svg_is_its_picture() {
         let html = "<svg xmlns:xlink=\"http://www.w3.org/1999/xlink\"><image xlink:href=\"cover.jpg\"/></svg>";
-        assert_eq!(to_markdown_with(html, Some("OEBPS")).unwrap(), "![](OEBPS/cover.jpg)\n");
+        assert_eq!(
+            to_markdown_with(html, Some("OEBPS")).unwrap(),
+            "![](OEBPS/cover.jpg)\n"
+        );
     }
 
     #[test]
     fn a_quotation_is_quoted_paragraph_by_paragraph() {
-        let md = to_markdown("<p>He said:</p><blockquote><p>One.</p><p>Two.</p></blockquote><p>After.</p>")
-            .unwrap();
+        let md = to_markdown(
+            "<p>He said:</p><blockquote><p>One.</p><p>Two.</p></blockquote><p>After.</p>",
+        )
+        .unwrap();
         assert_eq!(md, "He said:\n\n> One.\n\n> Two.\n\nAfter.\n");
     }
 
@@ -982,8 +1013,10 @@ mod tests {
 
     #[test]
     fn a_layout_table_reads_as_its_cells() {
-        let md = to_markdown("<table><tr><td><p>Only</p><p>column</p></td></tr><tr><td>here</td></tr></table>")
-            .unwrap();
+        let md = to_markdown(
+            "<table><tr><td><p>Only</p><p>column</p></td></tr><tr><td>here</td></tr></table>",
+        )
+        .unwrap();
         assert_eq!(md, "Only column\n\nhere\n");
     }
 
@@ -998,7 +1031,10 @@ mod tests {
         let html = "<p>A claim.<a epub:type=\"noteref\" href=\"notes.xhtml#n1\">[1]</a> More.</p>\
                     <aside epub:type=\"footnote\" id=\"n1\"><p><a href=\"#r1\">1</a> The source.</p><p>Also this.</p></aside>";
         let md = to_markdown(html).unwrap();
-        assert_eq!(md, "A claim.[^1] More.\n\n[^1]: The source.\n\nAlso this.\n");
+        assert_eq!(
+            md,
+            "A claim.[^1] More.\n\n[^1]: The source.\n\nAlso this.\n"
+        );
     }
 
     /// The point of every rule above: the page counts the same words, styled or not.
@@ -1022,7 +1058,10 @@ mod tests {
             words
         };
         let styled = to_markdown(html).unwrap();
-        let plain: String = styled.chars().filter(|c| !matches!(c, '*' | '`' | '>' | '|')).collect();
+        let plain: String = styled
+            .chars()
+            .filter(|c| !matches!(c, '*' | '`' | '>' | '|'))
+            .collect();
         assert_eq!(words(&styled), words(&plain));
         assert!(words(&styled).len() > 25, "{styled}");
     }

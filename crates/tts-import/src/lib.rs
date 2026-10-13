@@ -240,30 +240,57 @@ pub fn document(path: &Path) -> Result<tts_doc::Document> {
 }
 
 /// A picture a document's markdown names, as bytes: an entry in an EPUB, or a file beside
-/// anything else. Only what an image line can name is read, and only pictures.
+/// anything else. Only what an image line can name is read, only pictures, and nothing outside
+/// the document's own folder.
 pub fn resource(document: &Path, name: &str) -> Option<Vec<u8>> {
-    let name = unescape(name);
-    let image = Path::new(&name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| {
-            matches!(
-                e.to_ascii_lowercase().as_str(),
-                "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "svgz"
-            )
-        });
-    if !image || name.contains("://") {
-        return None;
-    }
-    if Format::detect(document) == Some(Format::Epub) {
-        return zipped::Archive::open(document).ok()?.bytes(&name);
-    }
-    let path = document.parent()?.join(&name);
     const LARGEST: u64 = 50 << 20;
-    if std::fs::metadata(&path).ok()?.len() > LARGEST {
-        return None;
+    // Escaped by an importer to sit inside `(…)`, or a file whose name really has a `%` in it.
+    let unescaped = unescape(name);
+    let names = [unescaped.as_str(), name];
+    let names = names.iter().take(if unescaped == name { 1 } else { 2 });
+    let image = |name: &str| {
+        Path::new(name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| {
+                matches!(
+                    e.to_ascii_lowercase().as_str(),
+                    "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "svgz"
+                )
+            })
+            && !name.contains("://")
+    };
+    if Format::detect(document) == Some(Format::Epub) {
+        let mut archive = zipped::Archive::open(document).ok()?;
+        return names
+            .filter(|n| image(n))
+            .find_map(|n| archive.bytes_within(n, LARGEST));
     }
-    std::fs::read(path).ok()
+    let folder = document.parent()?;
+    names.filter(|n| image(n)).find_map(|n| {
+        let path = folder.join(inside(n)?);
+        (std::fs::metadata(&path).ok()?.len() <= LARGEST).then_some(())?;
+        std::fs::read(path).ok()
+    })
+}
+
+/// A relative path that stays inside the folder it is read from, or `None`.
+fn inside(name: &str) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for part in Path::new(name).components() {
+        match part {
+            Component::Normal(p) => out.push(p),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(out)
 }
 
 /// `%XX` escapes back to bytes: what an importer wrote to keep a path inside `(…)`.
@@ -421,6 +448,32 @@ fn heading_level(line: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_picture_is_read_only_from_inside_its_document_folder() {
+        let dir = std::env::temp_dir().join(format!("tts-resource-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("book/img")).unwrap();
+        std::fs::write(dir.join("book/img/a b.png"), b"one").unwrap();
+        std::fs::write(dir.join("book/100%.png"), b"two").unwrap();
+        std::fs::write(dir.join("outside.png"), b"three").unwrap();
+        let doc = dir.join("book/doc.md");
+        assert_eq!(
+            super::resource(&doc, "img/a%20b.png").as_deref(),
+            Some(&b"one"[..])
+        );
+        assert_eq!(
+            super::resource(&doc, "img/../img/a b.png").as_deref(),
+            Some(&b"one"[..])
+        );
+        assert_eq!(
+            super::resource(&doc, "100%.png").as_deref(),
+            Some(&b"two"[..])
+        );
+        assert_eq!(super::resource(&doc, "../outside.png"), None);
+        let absolute = dir.join("outside.png");
+        assert_eq!(super::resource(&doc, absolute.to_str().unwrap()), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     use super::*;
 
     #[test]

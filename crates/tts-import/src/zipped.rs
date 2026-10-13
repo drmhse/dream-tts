@@ -39,6 +39,17 @@ impl Archive {
         Some(buf)
     }
 
+    /// One entry's bytes, if it is no larger than `limit` once inflated.
+    pub fn bytes_within(&mut self, name: &str, limit: u64) -> Option<Vec<u8>> {
+        let entry = self.inner.by_name(name).ok()?;
+        if entry.size() > limit {
+            return None;
+        }
+        let mut buf = Vec::new();
+        entry.take(limit + 1).read_to_end(&mut buf).ok()?;
+        (buf.len() as u64 <= limit).then_some(buf)
+    }
+
     pub fn has(&self, name: &str) -> bool {
         self.inner.index_for_name(name).is_some()
     }
