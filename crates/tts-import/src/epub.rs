@@ -33,7 +33,8 @@ pub fn chapters(path: &Path) -> Result<Vec<Chapter>> {
         let Some(xhtml) = archive.read_opt(&full) else {
             continue;
         };
-        let markdown = html::to_markdown(&xhtml)?;
+        let dir = full.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let markdown = html::to_markdown_with(&xhtml, Some(dir))?;
         if markdown.trim().is_empty() {
             continue;
         }
@@ -155,7 +156,7 @@ fn decode_href(href: &str) -> String {
 }
 
 /// Join a manifest href to the OPF's directory, resolving the `../` that a nested OPF uses.
-fn join(base: &str, href: &str) -> String {
+pub(crate) fn join(base: &str, href: &str) -> String {
     if base.is_empty() {
         return href.to_string();
     }

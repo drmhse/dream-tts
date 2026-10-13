@@ -239,6 +239,55 @@ pub fn document(path: &Path) -> Result<tts_doc::Document> {
     Ok(tts_doc::Document::from_markdown(&markdown))
 }
 
+/// A picture a document's markdown names, as bytes: an entry in an EPUB, or a file beside
+/// anything else. Only what an image line can name is read, and only pictures.
+pub fn resource(document: &Path, name: &str) -> Option<Vec<u8>> {
+    let name = unescape(name);
+    let image = Path::new(&name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "svgz"
+            )
+        });
+    if !image || name.contains("://") {
+        return None;
+    }
+    if Format::detect(document) == Some(Format::Epub) {
+        return zipped::Archive::open(document).ok()?.bytes(&name);
+    }
+    let path = document.parent()?.join(&name);
+    const LARGEST: u64 = 50 << 20;
+    if std::fs::metadata(&path).ok()?.len() > LARGEST {
+        return None;
+    }
+    std::fs::read(path).ok()
+}
+
+/// `%XX` escapes back to bytes: what an importer wrote to keep a path inside `(…)`.
+fn unescape(name: &str) -> String {
+    let bytes = name.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Some(b) = std::str::from_utf8(&bytes[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Read and split a document, choosing the importer by extension.
 pub fn import(path: &Path) -> Result<Document> {
     let format = Format::detect(path).with_context(|| {
@@ -269,7 +318,7 @@ pub fn import_as(path: &Path, format: Format) -> Result<Document> {
             title: None,
             body: read_text(path)?,
         }],
-        Format::Html => html::chapters(&read_text(path)?)?,
+        Format::Html => html::chapters_beside(&read_text(path)?)?,
         Format::Docx => docx::chapters(path)?,
         Format::Odt => odt::chapters(path)?,
         Format::Epub => epub::chapters(path)?,
