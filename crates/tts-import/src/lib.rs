@@ -23,6 +23,7 @@ pub mod convert;
 pub mod docx;
 pub mod epub;
 pub mod fb2;
+pub mod gfm;
 pub mod html;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod ocr;
@@ -227,7 +228,12 @@ pub fn document(path: &Path) -> Result<tts_doc::Document> {
         Some(Format::Markdown | Format::Text) | None
     );
     let markdown = if raw {
-        read_text(path)?
+        let text = read_text(path)?;
+        if Format::detect(path) == Some(Format::Markdown) {
+            gfm::tidy(&text)
+        } else {
+            text
+        }
     } else {
         import(path)?
             .chapters
@@ -236,7 +242,11 @@ pub fn document(path: &Path) -> Result<tts_doc::Document> {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    Ok(tts_doc::Document::from_markdown(&markdown))
+    let mut document = tts_doc::Document::from_markdown(&markdown);
+    if Format::detect(path) == Some(Format::Epub) {
+        document.title = epub::title(path).or(document.title);
+    }
+    Ok(document)
 }
 
 /// A picture a document's markdown names, as bytes: an entry in an EPUB, or a file beside

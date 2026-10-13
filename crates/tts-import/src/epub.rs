@@ -60,6 +60,29 @@ pub fn chapters(path: &Path) -> Result<Vec<Chapter>> {
     Ok(out)
 }
 
+/// The book's own title, from its package metadata: the first heading is often "Cover" or
+/// "Table of Contents".
+pub fn title(path: &Path) -> Option<String> {
+    let mut archive = Archive::open(path).ok()?;
+    let container = archive.read("META-INF/container.xml").ok()?;
+    let opf = archive.read(&rootfile(&container)?).ok()?;
+    let mut reader = reader(&opf);
+    let mut inside = false;
+    let mut text = String::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Eof) | Err(_) => return None,
+            Ok(Event::Start(e)) if local(e.name().as_ref()) == "title" => inside = true,
+            Ok(Event::Text(t)) if inside => text.push_str(&t.unescape().ok()?),
+            Ok(Event::End(e)) if inside && local(e.name().as_ref()) == "title" => {
+                let title = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                return (!title.is_empty()).then_some(title);
+            }
+            Ok(_) => {}
+        }
+    }
+}
+
 fn rootfile(container: &str) -> Option<String> {
     attribute_of(container, "rootfile", "full-path")
 }
