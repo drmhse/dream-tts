@@ -40,7 +40,8 @@ pub fn flowing(narration: &str) -> String {
     while let Some(last) = out
         .split(' ')
         .next_back()
-        .filter(|t| t.chars().all(is_quote))
+        // Not empty: every character of "" is a quote, and an empty narration looped forever.
+        .filter(|t| !t.is_empty() && t.chars().all(is_quote))
     {
         let keep = out.len() - last.len();
         out.truncate(keep);
@@ -145,6 +146,14 @@ pub fn narration(markdown: &str, options: &tts_narrate::Options) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nothing_to_say_is_nothing_rather_than_a_hang() {
+        assert_eq!(flowing(""), "");
+        assert_eq!(flowing("   "), "");
+        assert_eq!(flowing("\u{2022}"), "");
+        assert_eq!(flowing("\""), "");
+    }
 
     #[test]
     fn a_list_read_from_a_pdf_ends_each_item() {
