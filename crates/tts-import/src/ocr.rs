@@ -90,32 +90,48 @@ fn cached(key: &Option<Key>, read: impl FnOnce() -> Result<Vec<Line>>) -> Result
     Ok(lines)
 }
 
+/// How many pages of `path` have been recognised so far in this process.
+pub fn recognised(path: &Path) -> usize {
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return 0;
+    };
+    CACHE
+        .lock()
+        .expect("ocr cache")
+        .as_ref()
+        .map_or(0, |c| c.keys().filter(|k| k.0 == path).count())
+}
+
 /// The lines on one page of a PDF.
 pub fn pdf_page(path: &Path, document: &PDFDocument, index: usize) -> Result<Vec<Line>> {
+    // Drained per page: callers loop over whole books.
     cached(&key(path, index), || {
-        // SAFETY: PDFKit calls on a document the caller owns, on this thread.
-        let page = unsafe { document.pageAtIndex(index) }.context("no such page")?;
-        let bounds = unsafe { page.boundsForBox(PDFDisplayBox::CropBox) };
-        let (width, height) = (bounds.size.width, bounds.size.height);
-        anyhow::ensure!(width > 0.0 && height > 0.0, "the page has no size");
-        let scale = LONG_SIDE / width.max(height);
-        let context = bitmap(
-            (width * scale).round() as usize,
-            (height * scale).round() as usize,
-        )?;
-        CGContext::scale_ctm(Some(&context), scale, scale);
-        unsafe { page.drawWithBox_toContext(PDFDisplayBox::CropBox, &context) };
-        CGContext::flush(Some(&context));
-        let image = CGBitmapContextCreateImage(Some(&context)).context("the page as an image")?;
-        // SAFETY: a CGImage we own and empty options.
-        let handler = unsafe {
-            VNImageRequestHandler::initWithCGImage_options(
-                VNImageRequestHandler::alloc(),
-                &image,
-                &NSDictionary::new(),
-            )
-        };
-        recognise(&handler, width, height)
+        objc2::rc::autoreleasepool(|_| {
+            // SAFETY: PDFKit calls on a document the caller owns, on this thread.
+            let page = unsafe { document.pageAtIndex(index) }.context("no such page")?;
+            let bounds = unsafe { page.boundsForBox(PDFDisplayBox::CropBox) };
+            let (width, height) = (bounds.size.width, bounds.size.height);
+            anyhow::ensure!(width > 0.0 && height > 0.0, "the page has no size");
+            let scale = LONG_SIDE / width.max(height);
+            let context = bitmap(
+                (width * scale).round() as usize,
+                (height * scale).round() as usize,
+            )?;
+            CGContext::scale_ctm(Some(&context), scale, scale);
+            unsafe { page.drawWithBox_toContext(PDFDisplayBox::CropBox, &context) };
+            CGContext::flush(Some(&context));
+            let image =
+                CGBitmapContextCreateImage(Some(&context)).context("the page as an image")?;
+            // SAFETY: a CGImage we own and empty options.
+            let handler = unsafe {
+                VNImageRequestHandler::initWithCGImage_options(
+                    VNImageRequestHandler::alloc(),
+                    &image,
+                    &NSDictionary::new(),
+                )
+            };
+            recognise(&handler, width, height)
+        })
     })
 }
 
@@ -223,6 +239,9 @@ pub fn warm() -> Result<()> {
 }
 
 fn recognise(handler: &VNImageRequestHandler, width: f64, height: f64) -> Result<Vec<Line>> {
+    // One at a time: the warm-up and a first page recognised together could deadlock in Vision.
+    static VISION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = VISION.lock().unwrap_or_else(|e| e.into_inner());
     let request = unsafe { VNRecognizeTextRequest::init(VNRecognizeTextRequest::alloc()) };
     request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
     request.setUsesLanguageCorrection(true);
