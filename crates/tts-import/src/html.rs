@@ -86,7 +86,7 @@ pub fn to_markdown_with(html: &str, images: Option<&str>) -> Result<String> {
 /// starts and ends on word boundaries, which is the only place markdown's `*` can sit
 /// without splitting a word in two.
 #[derive(Clone, Copy, PartialEq)]
-enum Mark {
+pub(crate) enum Mark {
     Emphasis,
     Strong,
     Code,
@@ -102,7 +102,7 @@ impl Mark {
         }
     }
 
-    fn open(self) -> char {
+    pub(crate) fn open(self) -> char {
         match self {
             Self::Emphasis => '\u{E000}',
             Self::Strong => '\u{E002}',
@@ -110,7 +110,7 @@ impl Mark {
         }
     }
 
-    fn close(self) -> char {
+    pub(crate) fn close(self) -> char {
         char::from_u32(self.open() as u32 + 1).expect("private use")
     }
 
@@ -602,14 +602,14 @@ impl<'a> Converter<'a> {
 }
 
 /// The text with every style marker dropped.
-fn strip(text: &str) -> String {
+pub(crate) fn strip(text: &str) -> String {
     text.chars().filter(|c| !is_marker(*c)).collect()
 }
 
 /// Markers to markdown where a run sits on word boundaries, and to plain text where it does
 /// not: `un<em>believ</em>able` written `un*believ*able` would be three words to the
 /// tokeniser, and the word count is what every highlight hangs on.
-fn styled(text: &str) -> String {
+pub(crate) fn styled(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
