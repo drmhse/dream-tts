@@ -59,6 +59,7 @@ pub fn chapters(path: &Path) -> Result<Vec<Chapter>> {
     match outline_marks(&document) {
         marks if marks.len() > 1 => Ok(split_at(&page_text, &marks)),
         _ => Ok(vec![Chapter {
+            level: 1,
             title: None,
             body: paragraphs(&page_text.join("\n\n")),
         }]),
@@ -182,6 +183,7 @@ fn split_at(pages: &[String], marks: &[(usize, String)]) -> Vec<Chapter> {
         let front = &joined[..*first];
         if !front.trim().is_empty() {
             out.push(Chapter {
+                level: 1,
                 title: None,
                 body: paragraphs(front),
             });
@@ -194,6 +196,7 @@ fn split_at(pages: &[String], marks: &[(usize, String)]) -> Vec<Chapter> {
         }
         let body = strip_leading_heading(&joined[*start..end], title);
         out.push(Chapter {
+            level: 1,
             title: Some((*title).to_string()),
             body: paragraphs(&body),
         });

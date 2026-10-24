@@ -61,13 +61,18 @@ pub struct Chapter {
     pub title: Option<String>,
     /// Markdown body, without the title.
     pub body: String,
+    /// The title's heading level, so a chapter that opens a new file in an EPUB stays the rank
+    /// its book gave it. 0 is taken as 1.
+    pub level: u8,
 }
 
 impl Chapter {
     /// The file's contents: the title as an H1, then the body.
     pub fn markdown(&self) -> String {
         match &self.title {
-            Some(t) if !t.trim().is_empty() => format!("# {}\n\n{}\n", t.trim(), self.body.trim()),
+            Some(t) if !t.trim().is_empty() => {
+                format!("{} {}\n\n{}\n", "#".repeat(self.level.clamp(1, 6) as usize), t.trim(), self.body.trim())
+            }
             _ => format!("{}\n", self.body.trim()),
         }
     }
@@ -352,6 +357,7 @@ pub fn import_as(path: &Path, format: Format) -> Result<Document> {
     let chapters = match format {
         Format::Markdown => split_markdown(&read_text(path)?),
         Format::Text => vec![Chapter {
+            level: 1,
             title: None,
             body: read_text(path)?,
         }],
@@ -418,6 +424,7 @@ pub fn split_markdown(text: &str) -> Vec<Chapter> {
         return vec![Chapter {
             title: None,
             body: text.to_string(),
+            level: 1,
         }];
     }
     let mut chapters: Vec<Chapter> = Vec::new();
@@ -429,6 +436,7 @@ pub fn split_markdown(text: &str) -> Vec<Chapter> {
                 chapters.push(Chapter {
                     title: title.take(),
                     body: body.join("\n"),
+                    level: level as u8,
                 });
                 body.clear();
             }
@@ -441,12 +449,13 @@ pub fn split_markdown(text: &str) -> Vec<Chapter> {
         chapters.push(Chapter {
             title,
             body: body.join("\n"),
+            level: level as u8,
         });
     }
     chapters
 }
 
-fn heading_level(line: &str) -> Option<usize> {
+pub(crate) fn heading_level(line: &str) -> Option<usize> {
     let trimmed = line.trim_start();
     if !trimmed.starts_with('#') {
         return None;
@@ -519,11 +528,13 @@ mod tests {
     #[test]
     fn a_chapter_writes_its_title_as_a_heading() {
         let c = Chapter {
+            level: 1,
             title: Some("One".into()),
             body: "alpha".into(),
         };
         assert_eq!(c.markdown(), "# One\n\nalpha\n");
         let untitled = Chapter {
+            level: 1,
             title: None,
             body: "alpha".into(),
         };

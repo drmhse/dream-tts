@@ -25,7 +25,7 @@ pub fn chapters(path: &Path) -> Result<Vec<Chapter>> {
         bail!("the EPUB spine is empty; there is no reading order to follow");
     }
 
-    let mut out: Vec<Chapter> = Vec::new();
+    let mut documents: Vec<String> = Vec::new();
     for href in spine {
         let full = join(base, &href);
         // A spine entry naming a missing file is a broken EPUB, but the rest of the book is
@@ -38,22 +38,31 @@ pub fn chapters(path: &Path) -> Result<Vec<Chapter>> {
         if markdown.trim().is_empty() {
             continue;
         }
+        documents.push(markdown);
+    }
+
+    let mut out: Vec<Chapter> = Vec::new();
+    for markdown in documents {
         // One spine document is one chapter, even when it carries several headings: the book
         // said where its chapters are and that is better evidence than a heading level.
         let split = crate::split_markdown(&markdown);
         match split.as_slice() {
             [only] => out.push(only.clone()),
             _ => {
+                // The file's later chapters keep the rank of its first: they are siblings.
+                let level = split.first().map_or(1, |c| c.level);
                 let title = split.iter().find_map(|c| c.title.clone());
                 let body = split
                     .iter()
                     .map(|c| match &c.title {
-                        Some(t) if Some(t) != title.as_ref() => format!("## {t}\n\n{}", c.body),
+                        Some(t) if Some(t) != title.as_ref() => {
+                            format!("{} {t}\n\n{}", "#".repeat(level.clamp(1, 6) as usize), c.body)
+                        }
                         _ => c.body.clone(),
                     })
                     .collect::<Vec<_>>()
                     .join("\n\n");
-                out.push(Chapter { title, body });
+                out.push(Chapter { title, body, level });
             }
         }
     }
@@ -296,6 +305,26 @@ mod tests {
         }
         zip.finish().unwrap();
         path
+    }
+
+    #[test]
+    fn chapters_keep_their_rank_whichever_file_they_open() {
+        let book = epub(
+            r#"<package><manifest>
+                <item id="a" href="a.xhtml" media-type="application/xhtml+xml"/>
+                <item id="b" href="b.xhtml" media-type="application/xhtml+xml"/>
+            </manifest><spine><itemref idref="a"/><itemref idref="b"/></spine></package>"#,
+            &[
+                ("OEBPS/a.xhtml", b"<html><body><h1>The Book</h1><h2>Chapter I.</h2><p>One.</p></body></html>"),
+                ("OEBPS/b.xhtml", b"<html><body><h2>Chapter II.</h2><p>Two.</p></body></html>"),
+            ],
+        );
+        let doc = crate::import(&book).unwrap();
+        let text: String = doc.chapters.iter().map(|c| c.markdown()).collect();
+        assert!(text.contains("## Chapter I."), "{text}");
+        assert!(text.contains("## Chapter II."), "{text}");
+        assert!(!text.lines().any(|l| l == "# Chapter II."), "{text}");
+        let _ = std::fs::remove_file(book);
     }
 
     #[test]
