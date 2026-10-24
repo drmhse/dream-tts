@@ -83,6 +83,46 @@ pub fn title(path: &Path) -> Option<String> {
     }
 }
 
+/// The book's cover picture, as the package names it: EPUB 3's `cover-image` item, else
+/// EPUB 2's `<meta name="cover">`, else an image item whose id is plainly `cover`.
+pub fn cover(path: &Path) -> Option<Vec<u8>> {
+    let mut archive = Archive::open(path).ok()?;
+    let container = archive.read("META-INF/container.xml").ok()?;
+    let opf_path = rootfile(&container)?;
+    let opf = archive.read(&opf_path).ok()?;
+    let mut reader = reader(&opf);
+    let (mut named, mut items) = (None::<String>, Vec::<(String, String, String, String)>::new());
+    loop {
+        match reader.read_event() {
+            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let attr = |key: &str| {
+                    e.attributes()
+                        .flatten()
+                        .find(|a| local(a.key.as_ref()) == key)
+                        .and_then(|a| String::from_utf8(a.value.to_vec()).ok())
+                        .unwrap_or_default()
+                };
+                match local(e.name().as_ref()).as_str() {
+                    "meta" if attr("name") == "cover" => named = Some(attr("content")),
+                    "item" => items.push((attr("id"), attr("href"), attr("media-type"), attr("properties"))),
+                    _ => {}
+                }
+            }
+            Ok(_) => {}
+        }
+    }
+    let image = |m: &str| m.starts_with("image/");
+    let href = items
+        .iter()
+        .find(|(_, _, m, p)| image(m) && p.split_whitespace().any(|p| p == "cover-image"))
+        .or_else(|| items.iter().find(|(id, _, m, _)| image(m) && Some(id) == named.as_ref()))
+        .or_else(|| items.iter().find(|(id, _, m, _)| image(m) && id.eq_ignore_ascii_case("cover")))
+        .map(|(_, href, _, _)| decode_href(href))?;
+    let base = opf_path.rsplit_once('/').map_or("", |(dir, _)| dir);
+    archive.bytes_within(&join(base, &href), 20 << 20)
+}
+
 fn rootfile(container: &str) -> Option<String> {
     attribute_of(container, "rootfile", "full-path")
 }
@@ -239,6 +279,50 @@ mod tests {
             "OEBPS/text/ch1.xhtml"
         );
         assert_eq!(join("", "ch1.xhtml"), "ch1.xhtml");
+    }
+
+    fn epub(opf: &str, files: &[(&str, &[u8])]) -> std::path::PathBuf {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("cover-{}-{}.epub", std::process::id(), opf.len()));
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("META-INF/container.xml", options).unwrap();
+        zip.write_all(br#"<container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>"#).unwrap();
+        zip.start_file("OEBPS/content.opf", options).unwrap();
+        zip.write_all(opf.as_bytes()).unwrap();
+        for (name, body) in files {
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn the_cover_is_the_picture_the_package_names() {
+        // EPUB 2 names it in a meta; the item called `cover` here is a page, not a picture.
+        let two = epub(
+            r#"<package><metadata><meta name="cover" content="pic"/></metadata><manifest>
+                <item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>
+                <item id="pic" href="images/front%20cover.jpg" media-type="image/jpeg"/>
+            </manifest></package>"#,
+            &[("OEBPS/images/front cover.jpg", b"jpeg"), ("OEBPS/cover.xhtml", b"<html/>")],
+        );
+        assert_eq!(cover(&two).as_deref(), Some(&b"jpeg"[..]));
+        // EPUB 3 marks it with a property.
+        let three = epub(
+            r#"<package><manifest>
+                <item id="a" href="a.png" media-type="image/png"/>
+                <item id="b" href="b.png" media-type="image/png" properties="cover-image"/>
+            </manifest></package>"#,
+            &[("OEBPS/a.png", b"a"), ("OEBPS/b.png", b"b")],
+        );
+        assert_eq!(cover(&three).as_deref(), Some(&b"b"[..]));
+        let none = epub(r#"<package><manifest><item id="a" href="a.png" media-type="image/png"/></manifest></package>"#, &[]);
+        assert_eq!(cover(&none), None);
+        for p in [two, three, none] {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     #[test]
