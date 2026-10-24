@@ -317,6 +317,9 @@ impl<'a> Converter<'a> {
             if !empty {
                 self.quote_depth += 1;
             }
+        } else if name == "br" && self.heading.is_some() {
+            // A heading set on two lines, "I.<br/>A Scandal in Bohemia", is still one heading.
+            push_text(&mut self.line, " ");
         } else if name == "hr" {
             self.flush();
             self.heading = None;
@@ -993,6 +996,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(md, "Only column\n\nhere\n");
+    }
+
+    #[test]
+    fn a_line_break_inside_a_heading_does_not_end_it() {
+        let md = to_markdown("<h2>II.<br/> THE RED-HEADED LEAGUE</h2><p>I had called upon my friend</p>").unwrap();
+        assert_eq!(md, "## II. THE RED-HEADED LEAGUE\n\nI had called upon my friend\n");
+        let md = to_markdown_with("<h2><a id=\"c1\"/><img src=\"head.jpg\"/><br/><br/>Chapter I.</h2><p>It is a truth</p>", Some(""))
+            .unwrap();
+        assert_eq!(md, "![](head.jpg)\n\n## Chapter I.\n\nIt is a truth\n");
     }
 
     #[test]
