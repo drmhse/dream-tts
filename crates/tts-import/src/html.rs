@@ -140,6 +140,9 @@ struct Table {
     cell: Option<String>,
     /// Tables inside this one, read as text in its cells.
     nested: usize,
+    /// Pictures set in its cells: a captioned plate laid out as a table, which a cell of text
+    /// cannot hold. They go before its text, which reads as their caption.
+    figures: Vec<String>,
 }
 
 /// Where a run of text goes while it is not part of the block.
@@ -285,6 +288,7 @@ impl<'a> Converter<'a> {
                 row: Vec::new(),
                 cell: None,
                 nested: 0,
+                figures: Vec::new(),
             });
         } else if name == "a" && !empty && has_type(e, "noteref") {
             let target = attr(e, "href")
@@ -528,7 +532,9 @@ impl<'a> Converter<'a> {
     /// icon or a letter drawn as an image would break the line it sits in.
     fn figure(&mut self, src: &str, alt: &str) {
         let Some(base) = self.images else { return };
-        if self.table.is_some() || self.capture.is_some() || !strip(&self.line).trim().is_empty() {
+        // A cell's words gather in the table, not in the line.
+        let inline = self.table.is_none() && !strip(&self.line).trim().is_empty();
+        if self.capture.is_some() || inline {
             return;
         }
         let Some(path) = image_path(base, src) else {
@@ -544,14 +550,20 @@ impl<'a> Converter<'a> {
                 }
             })
             .collect();
-        self.flush();
-        self.out.push(format!(
+        let figure = format!(
             "![{}]({path})",
             alt.split_whitespace().collect::<Vec<_>>().join(" ")
-        ));
+        );
+        if let Some(table) = self.table.as_mut() {
+            table.figures.push(figure);
+            return;
+        }
+        self.flush();
+        self.out.push(figure);
     }
 
     fn write_table(&mut self, table: Table) {
+        self.out.extend(table.figures);
         self.out.extend(markdown::table(table.rows));
     }
 
@@ -990,6 +1002,24 @@ mod tests {
     }
 
     #[test]
+    fn a_picture_set_in_a_table_is_a_figure_before_its_caption() {
+        // How Project Gutenberg sets Rackham's plates in Alice: caption and picture side by side.
+        let html = "<table><tr><td><i>A Mad Tea Party</i></td>\
+                    <td><img src=\"p84.jpg\" alt=\"A Mad Tea Party\"/></td></tr></table>\
+                    <p>The Hatter was the first</p>";
+        let md = to_markdown_with(html, Some("OEBPS")).unwrap();
+        assert_eq!(
+            md,
+            "![A Mad Tea Party](OEBPS/p84.jpg)\n\n*A Mad Tea Party*\n\nThe Hatter was the first\n"
+        );
+        // With nowhere to put pictures, the caption alone, as before.
+        assert_eq!(
+            to_markdown(html).unwrap(),
+            "*A Mad Tea Party*\n\nThe Hatter was the first\n"
+        );
+    }
+
+    #[test]
     fn a_layout_table_reads_as_its_cells() {
         let md = to_markdown(
             "<table><tr><td><p>Only</p><p>column</p></td></tr><tr><td>here</td></tr></table>",
@@ -1000,8 +1030,14 @@ mod tests {
 
     #[test]
     fn a_line_break_inside_a_heading_does_not_end_it() {
-        let md = to_markdown("<h2>II.<br/> THE RED-HEADED LEAGUE</h2><p>I had called upon my friend</p>").unwrap();
-        assert_eq!(md, "## II. THE RED-HEADED LEAGUE\n\nI had called upon my friend\n");
+        let md = to_markdown(
+            "<h2>II.<br/> THE RED-HEADED LEAGUE</h2><p>I had called upon my friend</p>",
+        )
+        .unwrap();
+        assert_eq!(
+            md,
+            "## II. THE RED-HEADED LEAGUE\n\nI had called upon my friend\n"
+        );
         let md = to_markdown_with("<h2><a id=\"c1\"/><img src=\"head.jpg\"/><br/><br/>Chapter I.</h2><p>It is a truth</p>", Some(""))
             .unwrap();
         assert_eq!(md, "![](head.jpg)\n\n## Chapter I.\n\nIt is a truth\n");

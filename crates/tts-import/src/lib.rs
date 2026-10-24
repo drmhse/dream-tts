@@ -71,7 +71,12 @@ impl Chapter {
     pub fn markdown(&self) -> String {
         match &self.title {
             Some(t) if !t.trim().is_empty() => {
-                format!("{} {}\n\n{}\n", "#".repeat(self.level.clamp(1, 6) as usize), t.trim(), self.body.trim())
+                format!(
+                    "{} {}\n\n{}\n",
+                    "#".repeat(self.level.clamp(1, 6) as usize),
+                    t.trim(),
+                    self.body.trim()
+                )
             }
             _ => format!("{}\n", self.body.trim()),
         }

@@ -56,7 +56,11 @@ pub fn chapters(path: &Path) -> Result<Vec<Chapter>> {
                     .iter()
                     .map(|c| match &c.title {
                         Some(t) if Some(t) != title.as_ref() => {
-                            format!("{} {t}\n\n{}", "#".repeat(level.clamp(1, 6) as usize), c.body)
+                            format!(
+                                "{} {t}\n\n{}",
+                                "#".repeat(level.clamp(1, 6) as usize),
+                                c.body
+                            )
                         }
                         _ => c.body.clone(),
                     })
@@ -100,7 +104,10 @@ pub fn cover(path: &Path) -> Option<Vec<u8>> {
     let opf_path = rootfile(&container)?;
     let opf = archive.read(&opf_path).ok()?;
     let mut reader = reader(&opf);
-    let (mut named, mut items) = (None::<String>, Vec::<(String, String, String, String)>::new());
+    let (mut named, mut items) = (
+        None::<String>,
+        Vec::<(String, String, String, String)>::new(),
+    );
     loop {
         match reader.read_event() {
             Ok(Event::Eof) | Err(_) => break,
@@ -114,7 +121,12 @@ pub fn cover(path: &Path) -> Option<Vec<u8>> {
                 };
                 match local(e.name().as_ref()).as_str() {
                     "meta" if attr("name") == "cover" => named = Some(attr("content")),
-                    "item" => items.push((attr("id"), attr("href"), attr("media-type"), attr("properties"))),
+                    "item" => items.push((
+                        attr("id"),
+                        attr("href"),
+                        attr("media-type"),
+                        attr("properties"),
+                    )),
                     _ => {}
                 }
             }
@@ -125,8 +137,16 @@ pub fn cover(path: &Path) -> Option<Vec<u8>> {
     let href = items
         .iter()
         .find(|(_, _, m, p)| image(m) && p.split_whitespace().any(|p| p == "cover-image"))
-        .or_else(|| items.iter().find(|(id, _, m, _)| image(m) && Some(id) == named.as_ref()))
-        .or_else(|| items.iter().find(|(id, _, m, _)| image(m) && id.eq_ignore_ascii_case("cover")))
+        .or_else(|| {
+            items
+                .iter()
+                .find(|(id, _, m, _)| image(m) && Some(id) == named.as_ref())
+        })
+        .or_else(|| {
+            items
+                .iter()
+                .find(|(id, _, m, _)| image(m) && id.eq_ignore_ascii_case("cover"))
+        })
         .map(|(_, href, _, _)| decode_href(href))?;
     let base = opf_path.rsplit_once('/').map_or("", |(dir, _)| dir);
     archive.bytes_within(&join(base, &href), 20 << 20)
@@ -292,7 +312,8 @@ mod tests {
 
     fn epub(opf: &str, files: &[(&str, &[u8])]) -> std::path::PathBuf {
         use std::io::Write;
-        let path = std::env::temp_dir().join(format!("cover-{}-{}.epub", std::process::id(), opf.len()));
+        let path =
+            std::env::temp_dir().join(format!("cover-{}-{}.epub", std::process::id(), opf.len()));
         let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
         let options = zip::write::SimpleFileOptions::default();
         zip.start_file("META-INF/container.xml", options).unwrap();
@@ -315,8 +336,14 @@ mod tests {
                 <item id="b" href="b.xhtml" media-type="application/xhtml+xml"/>
             </manifest><spine><itemref idref="a"/><itemref idref="b"/></spine></package>"#,
             &[
-                ("OEBPS/a.xhtml", b"<html><body><h1>The Book</h1><h2>Chapter I.</h2><p>One.</p></body></html>"),
-                ("OEBPS/b.xhtml", b"<html><body><h2>Chapter II.</h2><p>Two.</p></body></html>"),
+                (
+                    "OEBPS/a.xhtml",
+                    b"<html><body><h1>The Book</h1><h2>Chapter I.</h2><p>One.</p></body></html>",
+                ),
+                (
+                    "OEBPS/b.xhtml",
+                    b"<html><body><h2>Chapter II.</h2><p>Two.</p></body></html>",
+                ),
             ],
         );
         let doc = crate::import(&book).unwrap();
@@ -335,7 +362,10 @@ mod tests {
                 <item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>
                 <item id="pic" href="images/front%20cover.jpg" media-type="image/jpeg"/>
             </manifest></package>"#,
-            &[("OEBPS/images/front cover.jpg", b"jpeg"), ("OEBPS/cover.xhtml", b"<html/>")],
+            &[
+                ("OEBPS/images/front cover.jpg", b"jpeg"),
+                ("OEBPS/cover.xhtml", b"<html/>"),
+            ],
         );
         assert_eq!(cover(&two).as_deref(), Some(&b"jpeg"[..]));
         // EPUB 3 marks it with a property.
@@ -347,7 +377,10 @@ mod tests {
             &[("OEBPS/a.png", b"a"), ("OEBPS/b.png", b"b")],
         );
         assert_eq!(cover(&three).as_deref(), Some(&b"b"[..]));
-        let none = epub(r#"<package><manifest><item id="a" href="a.png" media-type="image/png"/></manifest></package>"#, &[]);
+        let none = epub(
+            r#"<package><manifest><item id="a" href="a.png" media-type="image/png"/></manifest></package>"#,
+            &[],
+        );
         assert_eq!(cover(&none), None);
         for p in [two, three, none] {
             let _ = std::fs::remove_file(p);
