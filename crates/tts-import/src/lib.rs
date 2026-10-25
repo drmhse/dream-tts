@@ -36,6 +36,7 @@ pub mod text;
 pub mod web;
 
 mod markdown;
+mod title_page;
 mod xml;
 mod zipped;
 
@@ -252,9 +253,16 @@ pub fn document(path: &Path) -> Result<tts_doc::Document> {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let title = (Format::detect(path) == Some(Format::Epub))
+        .then(|| epub::title(path))
+        .flatten();
+    let markdown = match &title {
+        Some(title) => title_page::credits(&markdown, title),
+        None => markdown,
+    };
     let mut document = tts_doc::Document::from_markdown(&markdown);
-    if Format::detect(path) == Some(Format::Epub) {
-        document.title = epub::title(path).or(document.title);
+    if title.is_some() {
+        document.title = title;
     }
     Ok(document)
 }
