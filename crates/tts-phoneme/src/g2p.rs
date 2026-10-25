@@ -167,7 +167,8 @@ pub struct G2P {
     /// Approximate a word misaki would drop; see `Lexicon::approximate`. Off by default, so
     /// the phoneme gate compares against misaki exactly.
     fallback: bool,
-    /// The last resort under `fallback`, for American English, whose phonemes it writes.
+    /// The last resort under `fallback`. It writes American English, which a British voice
+    /// reads with an American vowel or two: better than the silence it replaces.
     guesser: Option<crate::guess::Guesser>,
 }
 
@@ -181,11 +182,7 @@ impl G2P {
                 r"^['\u{2018}\u{2019}]+|\p{Lu}(?=\p{Lu}\p{Ll})|(?:^-)?(?:\d?[,.]?\d)+|[-_]+|['\u{2018}\u{2019}]{2,}|\p{L}*?(?:['\u{2018}\u{2019}]\p{L})*?\p{Ll}(?=\p{Lu})|\p{L}+(?:['\u{2018}\u{2019}]\p{L})*|[^-_\p{L}'\u{2018}\u{2019}\d]|['\u{2018}\u{2019}]+$",
             )?,
             fallback: false,
-            guesser: if british {
-                None
-            } else {
-                crate::guess::Guesser::load(dir)?
-            },
+            guesser: crate::guess::Guesser::load(dir)?,
         })
     }
 
@@ -495,7 +492,7 @@ impl G2P {
                     if tk.phonemes.is_none() {
                         let hit = self
                             .lexicon_lookup(tk, &ctx)
-                            .or_else(|| self.derive(&tk.text, derive_unknown, &mut unknown));
+                            .or_else(|| self.derive(tk, &ctx, derive_unknown, &mut unknown));
                         if let Some((ps, rating)) = hit {
                             tk.phonemes = Some(ps);
                             tk.rating = Some(rating);
@@ -504,6 +501,9 @@ impl G2P {
                     ctx = Self::token_context(ctx, tk.phonemes.as_deref(), tk);
                 }
                 Word::Many(group) => {
+                    if derive_unknown {
+                        self.say_whole(group, &ctx);
+                    }
                     // Longest merge first, backing off from the left, then dropping the
                     // rightmost part — the order misaki uses, and the reason a hyphenated
                     // compound resolves as a word when the lexicon has it and as parts
@@ -540,7 +540,7 @@ impl G2P {
                                     && (tk.text.is_empty()
                                         || !tk.text.chars().all(|c| SUBTOKEN_JUNKS.contains(c)))
                                 {
-                                    self.derive(&tk.text, derive_unknown, &mut unknown)
+                                    self.derive(tk, &ctx, derive_unknown, &mut unknown)
                                 } else {
                                     None
                                 }
@@ -601,7 +601,14 @@ impl G2P {
 
     /// The derivation stage, plus the lint. A word reported here is one the voice cannot
     /// say; naming it beats inventing a pronunciation for it.
-    fn derive(&self, text: &str, derive_unknown: bool, unknown: &mut Vec<String>) -> Option<Hit> {
+    fn derive(
+        &self,
+        tk: &MToken,
+        ctx: &TokenContext,
+        derive_unknown: bool,
+        unknown: &mut Vec<String>,
+    ) -> Option<Hit> {
+        let text = tk.text.as_str();
         if text.is_empty() {
             return None;
         }
@@ -614,13 +621,9 @@ impl G2P {
         if !text.chars().any(char::is_alphabetic) {
             return None;
         }
-        let guessed = || {
-            let guesser = self.guesser.as_ref()?;
-            guesser.phonemes(text).map(|ps| (ps, 1))
-        };
-        match self.lexicon.derive(text).or_else(|| {
+        match self.derived(text).or_else(|| {
             self.fallback
-                .then(|| self.lexicon.approximate(text).or_else(guessed))
+                .then(|| self.last_resort(text).or_else(|| self.respelled(tk, ctx)))
                 .flatten()
         }) {
             Some(hit) => Some(hit),
@@ -632,6 +635,212 @@ impl G2P {
             }
         }
     }
+}
+
+impl G2P {
+    /// The lexicon's rules. Under `fallback`, a name is guessed before it is read as two words
+    /// written as one: `Wickham` is not `wick` + `ham`, nor `Shere` `she` + `re`.
+    fn derived(&self, text: &str) -> Option<Hit> {
+        if self.fallback && is_name(text) {
+            self.lexicon
+                .inflected(text)
+                .or_else(|| self.guessed(text))
+                .or_else(|| self.lexicon.compound(text))
+        } else {
+            self.lexicon.derive(text)
+        }
+    }
+
+    /// What `fallback` adds after the lexicon's rules: an approximation, then the guesser.
+    /// A name goes to the guesser before being cut into words: `Dinah` is not `din` + `ah`,
+    /// nor `Hathi` `hat` + `hi`.
+    fn last_resort(&self, text: &str) -> Option<Hit> {
+        if is_name(text) {
+            self.lexicon
+                .initials(text)
+                .or_else(|| self.guessed(text))
+                .or_else(|| self.lexicon.approximate(text))
+        } else {
+            self.lexicon
+                .approximate(text)
+                .or_else(|| self.guessed(text))
+        }
+    }
+
+    fn guessed(&self, text: &str) -> Option<Hit> {
+        self.guesser.as_ref()?.phonemes(text).map(|ps| (ps, 1))
+    }
+
+    /// A word nothing could say as written, said as English spells it (see `english_letters`):
+    /// through the lexicon, then the same fallbacks. A romanised name goes to the guesser
+    /// first, since the lexicon's entry for its letters is usually another word: `Ch’i` is
+    /// not the Greek letter `chi`.
+    fn respelled(&self, tk: &MToken, ctx: &TokenContext) -> Option<Hit> {
+        // An Irish O’ is a syllable of its own, O + Brien: run together, `obrien` reads as
+        // one word, `boreen`.
+        let irish = tk
+            .text
+            .strip_prefix(['O', 'o'])
+            .and_then(|rest| rest.strip_prefix(APOSTROPHES));
+        if let Some(rest) = irish.filter(|r| r.chars().next().is_some_and(char::is_uppercase)) {
+            let name = MToken {
+                text: rest.to_string(),
+                ..tk.clone()
+            };
+            let (ps, rating) = self.said(&name, ctx)?;
+            return Some((format!("ˌO{ps}"), rating));
+        }
+        let plain = english_letters(&tk.text)?;
+        let looked_up = || {
+            let as_spelt = MToken {
+                text: plain.clone(),
+                alias: None,
+                ..tk.clone()
+            };
+            self.lexicon_lookup(&as_spelt, ctx)
+        };
+        let derived = || {
+            self.lexicon
+                .derive(&plain)
+                .or_else(|| self.last_resort(&plain))
+        };
+        if romanised(&tk.text) {
+            self.guessed(&plain).or_else(looked_up).or_else(derived)
+        } else {
+            looked_up().or_else(derived)
+        }
+    }
+
+    /// A word as the fallback says it: the lexicon, its rules, the last resorts, then as
+    /// English letters.
+    fn said(&self, tk: &MToken, ctx: &TokenContext) -> Option<Hit> {
+        self.lexicon_lookup(tk, ctx)
+            .or_else(|| self.derived(&tk.text))
+            .or_else(|| self.last_resort(&tk.text))
+            .or_else(|| self.respelled(tk, ctx))
+    }
+
+    /// Each run of a written word's parts between hyphens that `whole` can say, said whole
+    /// before the parts are tried one by one: `Yao-ch’en` is `Yao`, then `ch’en` as one.
+    fn say_whole(&self, group: &mut [MToken], ctx: &TokenContext) {
+        let mut start = 0;
+        while start < group.len() {
+            let junk = |tk: &MToken| {
+                !tk.text.is_empty() && tk.text.chars().all(|c| SUBTOKEN_JUNKS.contains(c))
+            };
+            let end = (start..group.len())
+                .find(|&i| junk(&group[i]))
+                .unwrap_or(group.len());
+            if end - start > 1 {
+                if let Some((ps, rating)) = self.whole(&group[start..end], ctx) {
+                    group[start].phonemes = Some(ps);
+                    group[start].rating = Some(rating);
+                    for x in &mut group[start + 1..end] {
+                        x.phonemes = Some(String::new());
+                    }
+                }
+            }
+            start = end + 1;
+        }
+    }
+
+    /// A written word whose parts no lexicon has, said whole, under `fallback`: a romanised
+    /// name the tokenizer cut at its apostrophe (`Ts’ao` into `Ts’a` and `o`), or a name
+    /// before an ending the lexicon knows (`Dinah’ll`, cut into `Dinah’l` and `l`).
+    fn whole(&self, group: &[MToken], ctx: &TokenContext) -> Option<Hit> {
+        if !self.fallback
+            || group
+                .iter()
+                .any(|tk| tk.alias.is_some() || tk.phonemes.is_some())
+        {
+            return None;
+        }
+        let whole = merge_tokens(group, None);
+        if self.lexicon_lookup(&whole, ctx).is_some() {
+            return None;
+        }
+        if romanised(&whole.text) {
+            return self.respelled(&whole, ctx);
+        }
+        let (stem, ending) = whole.text.rsplit_once(APOSTROPHES)?;
+        let letters = |w: &str| {
+            w.chars()
+                .all(|c| c.is_alphabetic() || APOSTROPHES.contains(&c))
+        };
+        if stem.is_empty() || !letters(stem) || ending.is_empty() {
+            return None;
+        }
+        let stem = MToken {
+            text: stem.to_string(),
+            ..whole.clone()
+        };
+        let (ps, rating) = self.said(&stem, ctx)?;
+        // `’s` sounds as the name ends, `O’Brien’s` with a z; any other ending as listed.
+        let said = if ending.eq_ignore_ascii_case("s") {
+            self.lexicon.suffix_s(&ps)?
+        } else {
+            format!(
+                "{ps}{}",
+                self.lexicon
+                    .lookup(&format!("'{ending}"), &whole.tag, None, None)?
+                    .0
+            )
+        };
+        Some((said, rating))
+    }
+}
+
+/// The endings English writes after an apostrophe; a word with anything else there is a
+/// romanisation, `Ts’ao`, `K’ung`, or an elision like `wand’r`.
+const ENDINGS: [&str; 7] = ["s", "t", "d", "m", "ll", "re", "ve"];
+
+/// Capitalised, not all capitals: `Wickham`, not `NASA`.
+fn is_name(word: &str) -> bool {
+    let mut letters = word.chars();
+    letters.next().is_some_and(char::is_uppercase) && letters.any(char::is_lowercase)
+}
+const APOSTROPHES: [char; 3] = ['\'', '\u{2018}', '\u{2019}'];
+
+fn romanised(word: &str) -> bool {
+    let parts: Vec<&str> = word.split(APOSTROPHES).collect();
+    parts.len() > 1
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(char::is_alphabetic))
+        && !parts[1..]
+            .iter()
+            .any(|p| ENDINGS.contains(&p.to_lowercase().as_str()))
+}
+
+/// The word in English letters, for the fallback: accents and marks off (`Tzŭ`, `fiancé`),
+/// ligatures opened (`manœuvre` to `manoeuvre`, `Cæsar` to `Caesar`), apostrophes inside it
+/// dropped (`Ts’ao` to `Tsao`), and a romanisation's `tz` read as the `ts` it stands for, as
+/// in Sun Tzu. `None` when that changes nothing or still leaves something other than letters.
+fn english_letters(word: &str) -> Option<String> {
+    let mut out = String::with_capacity(word.len());
+    for c in word.nfd() {
+        match c {
+            '\'' | '\u{2018}' | '\u{2019}' | '\u{02bc}' => {}
+            'æ' => out.push_str("ae"),
+            'Æ' => out.push_str("Ae"),
+            'œ' => out.push_str("oe"),
+            'Œ' => out.push_str("Oe"),
+            'ß' => out.push_str("ss"),
+            'ø' => out.push('o'),
+            'Ø' => out.push('O'),
+            c if unicode_normalization::char::is_combining_mark(c) => {}
+            c => out.push(c),
+        }
+    }
+    if !word.chars().any(char::is_lowercase) {
+        out = out.to_uppercase();
+    }
+    if let Some(rest) = out.strip_prefix("tz").or_else(|| out.strip_prefix("Tz")) {
+        out = format!("{}s{rest}", &out[..1]);
+    } else if let Some(rest) = out.strip_prefix("TZ") {
+        out = format!("TS{rest}");
+    }
+    (out != word && !out.is_empty() && out.chars().all(|c| c.is_ascii_alphabetic())).then_some(out)
 }
 
 /// Fold a Unicode digit onto its ASCII value; leave anything else alone.

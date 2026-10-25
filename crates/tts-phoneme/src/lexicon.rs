@@ -322,7 +322,7 @@ impl Lexicon {
     }
 
     /// https://en.wiktionary.org/wiki/-s
-    fn suffix_s(&self, stem: &str) -> Option<String> {
+    pub(crate) fn suffix_s(&self, stem: &str) -> Option<String> {
         let last = stem.chars().last()?;
         Some(if "ptkfθ".contains(last) {
             format!("{stem}s")
@@ -969,16 +969,11 @@ impl Lexicon {
         if word.is_empty() || !word.chars().all(|c| c.is_ascii_alphabetic()) {
             return None;
         }
+        if Self::is_initials(word) {
+            return self.spelled(word);
+        }
         let n = word.chars().count();
         let lower = word.to_ascii_lowercase();
-        let vowelless = !lower.contains(['a', 'e', 'i', 'o', 'u', 'y']);
-        if n <= 4 && (vowelless || (n <= 3 && word == word.to_ascii_uppercase())) {
-            let letters: Option<Vec<String>> = word
-                .chars()
-                .map(|c| self.plain(&c.to_ascii_uppercase().to_string()))
-                .collect();
-            return letters.map(|l| (l.join(" "), 2));
-        }
         // Fewest pieces over the lowercase word, each at least two letters and known.
         let chars: Vec<char> = lower.chars().collect();
         let mut best: Vec<Option<Vec<String>>> = vec![None; n + 1];
@@ -1007,6 +1002,31 @@ impl Lexicon {
             .map(|pieces| (pieces.concat(), 2))
     }
 
+    /// The first half of `approximate`: a short word with no vowel, or a short capitalised
+    /// one, spelled as initials.
+    pub fn initials(&self, word: &str) -> Option<Hit> {
+        let ascii = !word.is_empty() && word.chars().all(|c| c.is_ascii_alphabetic());
+        (ascii && Self::is_initials(word))
+            .then(|| self.spelled(word))
+            .flatten()
+    }
+
+    fn is_initials(word: &str) -> bool {
+        let n = word.chars().count();
+        let vowelless = !word
+            .to_ascii_lowercase()
+            .contains(['a', 'e', 'i', 'o', 'u', 'y']);
+        n <= 4 && (vowelless || (n <= 3 && word == word.to_ascii_uppercase()))
+    }
+
+    fn spelled(&self, word: &str) -> Option<Hit> {
+        let letters: Option<Vec<String>> = word
+            .chars()
+            .map(|c| self.plain(&c.to_ascii_uppercase().to_string()))
+            .collect();
+        letters.map(|l| (l.join(" "), 2))
+    }
+
     /// A word's entry as it stands: gold before silver, a homograph's default.
     fn plain(&self, word: &str) -> Option<String> {
         let entry = self.golds.get(word).or_else(|| self.silvers.get(word))?;
@@ -1017,6 +1037,11 @@ impl Lexicon {
     }
 
     pub fn derive(&self, word: &str) -> Option<Hit> {
+        self.inflected(word).or_else(|| self.compound(word))
+    }
+
+    /// Every rule of `derive` but the compound one: particles, inflections, prefixes.
+    pub fn inflected(&self, word: &str) -> Option<Hit> {
         let lower = word.to_lowercase();
         if let Some(ps) = Self::particle(&lower) {
             return Some((ps, 2));
@@ -1096,7 +1121,11 @@ impl Lexicon {
                 }
             }
         }
+        None
+    }
 
+    pub fn compound(&self, word: &str) -> Option<Hit> {
+        let lower = word.to_lowercase();
         // runbook, webhook, lifecycle: two known words written as one. The most balanced
         // split wins, then the shorter head — "namespace" is name+space, not names+pace,
         // and both of those are real words, so neither longest-head nor first-hit works.
