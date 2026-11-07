@@ -59,10 +59,14 @@ pub struct Chunk {
 /// The chunks of a document, in reading order.
 pub fn plan(blocks: &[Block]) -> Vec<Chunk> {
     let mut out = Vec::new();
-    for (i, block) in blocks.iter().enumerate() {
-        if block.words.is_empty() || !block.kind.is_narrated() {
-            continue;
-        }
+    // The start of a word a column or a page broke with a hyphen, owed to the next block.
+    let mut carried = String::new();
+    let mut continues = false;
+    let spoken: Vec<usize> = (0..blocks.len())
+        .filter(|&i| !blocks[i].words.is_empty() && blocks[i].kind.is_narrated())
+        .collect();
+    for (n, &i) in spoken.iter().enumerate() {
+        let block = &blocks[i];
         // The sibling's own markdown-to-speech rules, not a second copy of them: they carry a
         // chapter's worth of failures — a table that became babble, a lower-case opening that
         // came out as a different word.
@@ -70,13 +74,49 @@ pub fn plan(blocks: &[Block]) -> Vec<Chunk> {
             &operators(&forms::spoken(&block.source)),
             &Options::default(),
         );
-        let narration = flowing(&unshouted(narration.trim()));
+        let mut narration = flowing(&unshouted(narration.trim()));
         if narration.is_empty() {
             continue;
+        }
+        // A paragraph a column or a page cut in two is one sentence across the cut: no full
+        // stop where the column ended, no capital where the next began, and a word broken
+        // with a hyphen said whole. Spoken as two, a paper's "they con-" / "Verge to a shared
+        // model" was a sentence that stopped, and another that began on half a word.
+        if continues {
+            let mut chars = narration.chars();
+            if let Some(first) = chars.next() {
+                narration = first.to_lowercase().chain(chars).collect();
+            }
+            narration = std::mem::take(&mut carried) + &narration;
+        }
+        let next = spoken.get(n + 1).map(|&j| &blocks[j]);
+        continues = next.is_some_and(|next| runs_on(block, next));
+        if continues {
+            let source = block.source.trim_end();
+            narration = narration.trim_end_matches('.').to_string();
+            if source.ends_with('-') && !source.ends_with("--") {
+                let cut = narration.rfind(' ').map_or(0, |at| at + 1);
+                carried = narration[cut..].trim_end_matches(['-', '.']).to_string();
+                narration = narration[..cut].trim_end().to_string();
+            }
+            if narration.is_empty() {
+                continue;
+            }
         }
         out.extend(split_block(i, block, &narration));
     }
     out
+}
+
+/// Whether `next` carries on the sentence `block` left open: two paragraphs, the first ending
+/// without a stop, the second starting in lower case.
+fn runs_on(block: &Block, next: &Block) -> bool {
+    use tts_doc::Kind::Paragraph;
+    let (end, start) = (block.source.trim_end(), next.source.trim_start());
+    matches!(block.kind, Paragraph)
+        && matches!(next.kind, Paragraph)
+        && !end.ends_with(['.', '!', '?', ':', ';', '"', '\u{201d}', ')', ']'])
+        && start.chars().next().is_some_and(char::is_lowercase)
 }
 
 /// One block into chunks, each carrying the canonical words it covers.

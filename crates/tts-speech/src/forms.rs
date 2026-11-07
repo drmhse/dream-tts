@@ -44,6 +44,8 @@ fn prose(text: &str) -> String {
         return String::new();
     }
     let text = ordinals(text);
+    let text = ticks(&text);
+    let text = citations(&text);
     let text = footnotes(&text);
     let text = durations(&text);
     let text = times(&text);
@@ -71,6 +73,86 @@ fn sub(re: &Regex, text: &str, f: impl Fn(&Captures<'_, str>) -> String) -> Stri
 
 fn g<'a>(c: &'a Captures<'_, str>, i: usize) -> &'a str {
     c.get(i).map_or("", |m| m.as_str())
+}
+
+// ---------------------------------------------------------------- figures
+
+/// Four or more bare numbers in a row, with nothing but spaces between: a chart's axis or
+/// legend, extracted with the page's text. Prose lists numbers with commas or "and".
+static TICKS: Lazy<Regex> = Lazy::new(|| {
+    let n = r"[-−]?(?:\d+(?:[.,]\d+)*|\.\d+)[%KMBkmb]?";
+    // Not the number of a phrase that follows: "… 50M 940 million web images" keeps its 940.
+    re(&format!(
+        r"(?:(?<=\s)|^){n}(?:\s+{n}){{3,}}(?=\s+(?![a-z])|\s*$|[.,;:)])"
+    ))
+});
+
+fn ticks(text: &str) -> String {
+    let out = sub(&TICKS, text, |_| String::new());
+    if out.len() == text.len() {
+        return out;
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+// ---------------------------------------------------------------- citations
+
+/// A numeric citation: whole numbers in brackets, listed or ranged, not a link's text.
+static CITATION: Lazy<Regex> =
+    Lazy::new(|| re(r"\s?\[(\d{1,3}(?:\s?[,–—-]\s?\d{1,3})*)\](?![(\[:])"));
+/// Words before a bracket that make it an interval, which is said: "x in [0, 1]".
+const INTERVAL: &[&str] = &[
+    "in",
+    "within",
+    "on",
+    "over",
+    "range",
+    "interval",
+    "intervals",
+    "between",
+    "from",
+    "to",
+    "is",
+    "are",
+    "be",
+    "of",
+    "ci",
+    "and",
+    "∈",
+    "=",
+    "domain",
+    "support",
+    "set",
+];
+/// A footnote's symbol after a word, or opening the note itself: "Shazeer∗", "∗Equal".
+static NOTE_SYMBOL: Lazy<Regex> = Lazy::new(|| {
+    re(
+        r"(?:(?<=[A-Za-z0-9.,;:)\]’”])[∗†‡§¶]+(?:,[∗†‡§¶]+)*|(?<![^\s(])[∗†‡§¶]+(?=[A-Za-z])|\s*(?<!\S)[∗†‡§¶]+\.?\s*$)",
+    )
+});
+
+/// Reference numbers in brackets go, and so do footnote symbols: a paper read aloud said
+/// "inference 48 to 63" and "machine translation 35, 2, 5", a bracket of citations read as an
+/// interval or a list. Author–year citations are prose and stay.
+fn citations(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for m in CITATION.find_iter(text).flatten() {
+        let before = text[..m.start()].trim_end();
+        let word = before
+            .rsplit(|c: char| c.is_whitespace() || c == '(')
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+        // At a block's start "[1]" is a list's own number, as in a bibliography: said.
+        if before.is_empty() || INTERVAL.contains(&word.as_str()) {
+            continue;
+        }
+        out.push_str(&text[last..m.start()]);
+        last = m.end();
+    }
+    out.push_str(&text[last..]);
+    sub(&NOTE_SYMBOL, &out, |_| String::new())
 }
 
 // ---------------------------------------------------------------- superscripts
@@ -757,6 +839,59 @@ mod tests {
             ("Take Route 5 W north.", "Take Route 5 W north."),
             ("`a_i` in code and `14:00`", "`a_i` in code and `14:00`"),
             ("max_len and snake_case", "max_len and snake_case"),
+        ]);
+    }
+
+    #[test]
+    fn a_charts_numbers_go() {
+        says(&[
+            (
+                "alignment with DINOv2 (WIT) 0.20 0.18 0.16 0.14 0.12 0.10 .184 Qwen2.5-72B",
+                "alignment with DINOv2 (WIT) Qwen2.5-72B",
+            ),
+            (
+                "Mutual 10-NN 0.12 0.10 0.08 2M 10M 50M 940 million web images",
+                "Mutual 10-NN 940 million web images",
+            ),
+            (
+                "in 1990, 2000, 2010 and 2020 it grew",
+                "in 1990, 2000, 2010 and 2020 it grew",
+            ),
+            ("scores of 3 4 and 5", "scores of 3 4 and 5"),
+        ]);
+    }
+
+    #[test]
+    fn citations_and_note_symbols() {
+        says(&[
+            (
+                "as unconscious inference [48, 63] and redundancy [7].",
+                "as unconscious inference and redundancy.",
+            ),
+            (
+                "machine translation [35, 2, 5]. Numerous",
+                "machine translation. Numerous",
+            ),
+            ("Huh et al. [22] observed", "Huh et al. observed"),
+            ("a linear map[39], even", "a linear map, even"),
+            ("ranges [3–19] here", "ranges here"),
+            (
+                "x in [0, 1] and the interval [2, 5]",
+                "x in [0, 1] and the interval [2, 5]",
+            ),
+            ("[1] A. Vaswani, Attention.", "[1] A. Vaswani, Attention."),
+            (
+                "see [the notes](#a) and (Huh et al., 2024)",
+                "see [the notes](#a) and (Huh et al., 2024)",
+            ),
+            (
+                "Noam Shazeer∗ and Illia†,‡ wrote",
+                "Noam Shazeer and Illia wrote",
+            ),
+            ("∗Equal contribution.", "Equal contribution."),
+            ("limited training data. ∗", "limited training data."),
+            ("a ∗ b is a convolution", "a ∗ b is a convolution"),
+            ("built on .NET [4] and C#", "built on .NET and C#"),
         ]);
     }
 
