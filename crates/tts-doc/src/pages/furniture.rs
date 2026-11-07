@@ -66,7 +66,9 @@ struct Line {
     page: usize,
     top: f64,
     bottom: f64,
-    /// The text with every run of digits one `#`, so "135/675" and "136/675" agree.
+    /// The text with every run of digits one `#`, so "135/675" and "136/675" agree, and no
+    /// spaces: a tightly set line loses some between pages, and "Good Views" on one page and
+    /// "GoodViews" on the next kept a paper's section bar from counting as the same line.
     key: String,
     words: std::ops::Range<usize>,
 }
@@ -83,7 +85,6 @@ fn lines(boxes: &[WordBox]) -> Vec<Line> {
             Some(line) if same => {
                 line.top = line.top.min(b.rect.y);
                 line.bottom = line.bottom.max(b.rect.y + b.rect.h);
-                line.key.push(' ');
                 line.key.push_str(&text);
                 line.words.end = line.words.end.max(b.words.end);
             }
@@ -102,7 +103,7 @@ fn lines(boxes: &[WordBox]) -> Vec<Line> {
 
 fn mask(word: &str) -> String {
     let mut out = String::with_capacity(word.len());
-    for c in word.to_lowercase().chars() {
+    for c in word.to_lowercase().chars().filter(|c| !c.is_whitespace()) {
         if c.is_ascii_digit() {
             if !out.ends_with('#') {
                 out.push('#');
