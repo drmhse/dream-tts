@@ -7,3 +7,5 @@ license.workspace = true
 [dependencies]
 tts-doc = { path = "../tts-doc" }
 tts-narrate = { path = "../tts-narrate" }
+fancy-regex = "0.19"
+once_cell = "1"

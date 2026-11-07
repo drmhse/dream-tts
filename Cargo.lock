@@ -3266,6 +3266,8 @@ dependencies = [
 name = "tts-speech"
 version = "0.3.0"
 dependencies = [
+ "fancy-regex 0.19.0",
+ "once_cell",
  "tts-doc",
  "tts-narrate",
 ]

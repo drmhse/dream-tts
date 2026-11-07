@@ -2,6 +2,7 @@
 //! that keep their prosody, each carrying the canonical words it covers.
 
 pub mod chunk;
+pub mod forms;
 pub mod sentence;
 pub mod text;
 

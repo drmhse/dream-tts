@@ -14,6 +14,7 @@
 //!
 //! A block that owns no words is not a chunk. Code is shown and never spoken.
 
+use crate::forms;
 use crate::sentence;
 use crate::text::{flowing, operators, unshouted};
 use std::ops::Range;
@@ -65,7 +66,10 @@ pub fn plan(blocks: &[Block]) -> Vec<Chunk> {
         // The sibling's own markdown-to-speech rules, not a second copy of them: they carry a
         // chapter's worth of failures — a table that became babble, a lower-case opening that
         // came out as a different word.
-        let narration = blocks::convert(&operators(&block.source), &Options::default());
+        let narration = blocks::convert(
+            &operators(&forms::spoken(&block.source)),
+            &Options::default(),
+        );
         let narration = flowing(&unshouted(narration.trim()));
         if narration.is_empty() {
             continue;

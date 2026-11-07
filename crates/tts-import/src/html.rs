@@ -182,6 +182,8 @@ struct Converter<'a> {
     note: Option<Note>,
     /// A drop cap waiting for the rest of its word, which often sits in the next block.
     initial: Option<char>,
+    /// Superscripts and subscripts open, each with where its text began in the line.
+    scripts: Vec<(bool, usize)>,
 }
 
 impl<'a> Converter<'a> {
@@ -202,6 +204,7 @@ impl<'a> Converter<'a> {
             notes: std::collections::HashMap::new(),
             note: None,
             initial: None,
+            scripts: Vec::new(),
         }
     }
 
@@ -290,7 +293,7 @@ impl<'a> Converter<'a> {
                 nested: 0,
                 figures: Vec::new(),
             });
-        } else if name == "a" && !empty && has_type(e, "noteref") {
+        } else if name == "a" && !empty && (has_type(e, "noteref") || self.note_link(e)) {
             let target = attr(e, "href")
                 .and_then(|h| h.rsplit_once('#').map(|(_, id)| id.to_string()))
                 .unwrap_or_default();
@@ -346,7 +349,35 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// A link to a note on the same page, as the web writes one: in a superscript, or named for
+    /// a footnote or a citation. Spoken, its number ran into the word before it — "here1".
+    fn note_link(&self, e: &BytesStart) -> bool {
+        let Some(href) = attr(e, "href") else {
+            return false;
+        };
+        if !href.starts_with('#') || href.len() < 2 {
+            return false;
+        }
+        let named = |v: &str| {
+            let v = v.to_ascii_lowercase();
+            ["foot", "fn", "note", "cite", "ref", "endnote"]
+                .iter()
+                .any(|k| v.contains(k))
+        };
+        self.scripts.iter().any(|(sup, _)| *sup)
+            || named(&href)
+            || ["class", "id", "role"]
+                .iter()
+                .filter_map(|k| attr(e, k))
+                .any(|v| named(&v))
+    }
+
     fn inline_start(&mut self, name: &str, empty: bool) {
+        if (name == "sup" || name == "sub") && !empty {
+            let at = self.target().len();
+            self.scripts.push((name == "sup", at));
+            return;
+        }
         let Some(mark) = Mark::of(name) else { return };
         if empty {
             return;
@@ -391,6 +422,10 @@ impl<'a> Converter<'a> {
             }
         }
         if self.capture.is_some() {
+            return;
+        }
+        if name == "sup" || name == "sub" {
+            self.end_script();
             return;
         }
         if let Some(table) = self.table.as_mut() {
@@ -493,6 +528,22 @@ impl<'a> Converter<'a> {
             return;
         }
         push_text(&mut self.line, text);
+    }
+
+    /// A superscript or subscript of figures only, written in the characters made for them:
+    /// "10⁹", "H₂O", "word¹". Flattened, `10<sup>9</sup>` was "109" and read "one hundred nine".
+    fn end_script(&mut self) {
+        let Some((sup, at)) = self.scripts.pop() else {
+            return;
+        };
+        let buf = self.target();
+        if at > buf.len() || !buf.is_char_boundary(at) {
+            return;
+        }
+        if let Some(raised) = scripted(&buf[at..], sup) {
+            buf.truncate(at);
+            buf.push_str(&raised);
+        }
     }
 
     fn end_capture(&mut self) {
@@ -691,6 +742,34 @@ fn has_type(e: &BytesStart, kind: &str) -> bool {
     })
 }
 
+/// Figures and signs in their superscript or subscript forms; `None` for anything else, which
+/// stays as written. A citation's brackets go: "[4]" is a marker, not a quantity.
+fn scripted(text: &str, sup: bool) -> Option<String> {
+    let t = text.trim();
+    let t = t
+        .strip_prefix('[')
+        .and_then(|t| t.strip_suffix(']'))
+        .unwrap_or(t);
+    if t.is_empty() || t.chars().count() > 8 {
+        return None;
+    }
+    let (digits, signs) = if sup {
+        ("⁰¹²³⁴⁵⁶⁷⁸⁹", ['⁺', '⁻', '⁻'])
+    } else {
+        ("₀₁₂₃₄₅₆₇₈₉", ['₊', '₋', '₋'])
+    };
+    t.chars()
+        .map(|c| match c {
+            '0'..='9' => digits.chars().nth(c as usize - '0' as usize),
+            '+' => Some(signs[0]),
+            '-' => Some(signs[1]),
+            '\u{2212}' => Some(signs[2]),
+            ',' if sup => Some(','),
+            _ => None,
+        })
+        .collect()
+}
+
 fn is_note(e: &BytesStart) -> bool {
     ["footnote", "endnote", "rearnote"]
         .iter()
@@ -834,6 +913,40 @@ fn push_text(line: &mut String, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_webs_footnote_marks_and_figures_keep_their_place() {
+        let cases = [
+            (
+                r##"<p>Boils here<sup><a href="#fn1" id="fnref1">1</a></sup> at sea level.</p>"##,
+                "Boils here[^1] at sea level.",
+            ),
+            (
+                r##"<p>A note<a class="footnote-anchor" href="#footnote-3">3</a> mid sentence.</p>"##,
+                "A note[^3] mid sentence.",
+            ),
+            (
+                r##"<p>And cite<a href="#cite_note-5"><sup>[5]</sup></a>.</p>"##,
+                "And cite[^5].",
+            ),
+            (
+                "<p>Plain note<sup>2</sup> and marker<sup>[4]</sup>.</p>",
+                "Plain note\u{b2} and marker\u{2074}.",
+            ),
+            (
+                "<p>Area x<sup>2</sup>, 10<sup>-9</sup> m, H<sub>2</sub>O.</p>",
+                "Area x\u{b2}, 10\u{207b}\u{2079} m, H\u{2082}O.",
+            ),
+            // Words stay words, and a link elsewhere is a link.
+            (
+                "<p>The 1<sup>st</sup> of <a href=\"/about\">us</a>.</p>",
+                "The 1st of us.",
+            ),
+        ];
+        for (html, want) in cases {
+            assert_eq!(to_markdown(html).unwrap().trim(), want, "{html}");
+        }
+    }
 
     #[test]
     fn html_entities_and_bare_ampersands_read_as_a_browser_shows_them() {

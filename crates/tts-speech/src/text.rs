@@ -130,7 +130,7 @@ fn close(text: &mut String) {
 /// A whole document's narration, for a pipeline that speaks it paragraph by paragraph: the
 /// arithmetic said, the markdown rules applied, and each paragraph ended as `flowing` ends one.
 pub fn narration(markdown: &str, options: &tts_narrate::Options) -> String {
-    tts_narrate::convert(&operators(markdown), options)
+    tts_narrate::convert(&operators(&crate::forms::spoken(markdown)), options)
         .lines()
         .map(|line| {
             if line.trim().is_empty() {
