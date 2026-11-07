@@ -485,6 +485,9 @@ impl G2P {
     fn run(&self, text: &str, derive_unknown: bool) -> (String, Vec<String>, Vec<WordSpan>) {
         let mut unknown: Vec<String> = Vec::new();
         let mut words = self.retokenize(self.tokenize(text.trim_start()));
+        if derive_unknown {
+            self.rejoin(&mut words);
+        }
         let mut ctx = TokenContext::default();
         for w in words.iter_mut().rev() {
             match w {
@@ -638,6 +641,26 @@ impl G2P {
 }
 
 impl G2P {
+    /// A word broken at a line's end and set down as two, said as the one word: the head
+    /// carries its phonemes, the tail says nothing.
+    fn rejoin(&self, words: &mut [Word]) {
+        for i in 1..words.len() {
+            let (before, after) = words.split_at_mut(i);
+            let (Word::One(head), Word::One(tail)) = (&mut before[i - 1], &mut after[0]) else {
+                continue;
+            };
+            if head.phonemes.is_some() || tail.phonemes.is_some() || head.whitespace.is_empty() {
+                continue;
+            }
+            if let Some(ps) = self.lexicon.joined(&head.text, &tail.text) {
+                head.phonemes = Some(ps);
+                head.rating = Some(3);
+                tail.phonemes = Some(String::new());
+                tail.rating = Some(3);
+            }
+        }
+    }
+
     /// The lexicon's rules. Under `fallback`, a name is guessed before it is read as two words
     /// written as one: `Wickham` is not `wick` + `ham`, nor `Shere` `she` + `re`.
     fn derived(&self, text: &str) -> Option<Hit> {

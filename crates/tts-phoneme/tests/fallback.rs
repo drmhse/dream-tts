@@ -98,3 +98,50 @@ fn a_british_voice_says_what_its_lexicon_lacks() {
         .phonemize_report("Mr. Darcy at Pemberley; Mowgli, Kaa and the slithy toves.");
     assert!(unknown.is_empty(), "{unknown:?}");
 }
+
+#[test]
+fn words_a_pdf_ran_together_or_broke_are_said_as_words() {
+    let Some(g2p) = g2p() else { return };
+    let lexicon = tts_phoneme::lexicon::Lexicon::load(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../references/kokoro/weights/frontend"),
+        false,
+    )
+    .expect("lexicon");
+    // From arXiv 2610.39302, whose page has no spaces in these lines.
+    for (run, words) in [
+        (
+            "thesamepictureofitisaquestionwithrootsdatingback",
+            "the same picture of it is a question with roots dating back",
+        ),
+        (
+            "wordembeddingstrainedseparatelyondifferentlanguages",
+            "word embeddings trained separately on different languages",
+        ),
+        (
+            "andtheirmisalignmentisboundedotherwise",
+            "and their misalignment is bounded otherwise",
+        ),
+        (
+            "samplesthannexttokenpredictiononthesamecorpus",
+            "samples than next token prediction on the same corpus",
+        ),
+    ] {
+        assert_eq!(
+            lexicon.segments(run).map(|p| p.join(" ")).as_deref(),
+            Some(words),
+            "{run}"
+        );
+    }
+    // Short or capitalised, it is a word of its own, not a run.
+    assert_eq!(lexicon.segments("mysite"), None);
+    assert_eq!(lexicon.segments("Thesamepicture"), None);
+
+    // Broken at a line's end: said whole, once.
+    let (whole, _) = g2p.phonemize_report("transduction");
+    let (broken, _) = g2p.phonemize_report("transduc tion");
+    assert_eq!(broken.trim(), whole.trim());
+    // Two words that are words stay two: "a part", not "apart".
+    let (two, _) = g2p.phonemize_report("a part of it");
+    assert!(two.contains("pˈɑɹt"), "{two}");
+    assert!(!two.contains("əpˈɑɹt"), "{two}");
+}

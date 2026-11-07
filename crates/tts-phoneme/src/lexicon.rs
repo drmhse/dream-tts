@@ -77,6 +77,21 @@ pub struct TokenContext {
     pub future_to: bool,
 }
 
+/// The commonest English words, commonest first (after Fry's list): what splits a run of words
+/// set without spaces when two splits have as many pieces.
+const COMMON: &[&str] = &[
+    "the", "of", "and", "a", "to", "in", "is", "you", "that", "it", "he", "was", "for", "on",
+    "are", "as", "with", "his", "they", "at", "be", "this", "have", "from", "or", "one", "had",
+    "by", "words", "but", "not", "what", "all", "were", "we", "when", "your", "can", "said",
+    "there", "use", "an", "each", "which", "she", "do", "how", "their", "if", "will", "up",
+    "other", "about", "out", "many", "then", "them", "these", "so", "some", "her", "would", "make",
+    "like", "him", "into", "time", "has", "look", "two", "more", "write", "go", "see", "number",
+    "no", "way", "could", "people", "my", "than", "first", "water", "been", "call", "who", "its",
+    "now", "find", "long", "down", "day", "did", "get", "come", "made", "may", "part", "over",
+    "new", "only", "same", "also", "such", "both", "between", "where", "most", "after", "any",
+    "through", "well", "much", "before", "should", "very", "just", "those",
+];
+
 pub struct Lexicon {
     british: bool,
     golds: HashMap<String, Entry>,
@@ -1037,7 +1052,123 @@ impl Lexicon {
     }
 
     pub fn derive(&self, word: &str) -> Option<Hit> {
-        self.inflected(word).or_else(|| self.compound(word))
+        self.inflected(word)
+            .or_else(|| self.compound(word))
+            .or_else(|| self.segmented(word))
+    }
+
+    /// A run of words a PDF set without spaces, said as those words: "thesamepictureofit" is
+    /// "the same picture of it". Only a long, lower-case run, cut into the fewest common words
+    /// with nothing left over; one-letter words only "a" and "i". Without this the run went to
+    /// the guesser and came out as one long invented word.
+    pub fn segmented(&self, word: &str) -> Option<Hit> {
+        let pieces = self.segments(word)?;
+        let said: Option<Vec<String>> = pieces.iter().map(|p| self.sayable(p)).collect();
+        Some((said?.join(" "), 2))
+    }
+
+    /// The words `segmented` reads a run as.
+    pub fn segments(&self, word: &str) -> Option<Vec<String>> {
+        const LONGEST: usize = 18;
+        if word.len() < 12 || !word.chars().all(|c| c.is_ascii_lowercase()) {
+            return None;
+        }
+        let n = word.len();
+        // Fewest pieces to each point. Ties go to the commoner words — "learn the", not
+        // "learnt he" — and then to the longer pieces, by the sum of their squared lengths:
+        // "embeddings trained", not "embedding strained".
+        let rarity = |piece: &str| -> usize {
+            COMMON
+                .iter()
+                .position(|w| *w == piece)
+                .map_or(COMMON.len(), |rank| rank / 4)
+        };
+        // Pieces, rarity, squared length, and the pieces themselves.
+        type Split<'w> = (usize, usize, usize, Vec<&'w str>);
+        let mut best: Vec<Option<Split>> = vec![None; n + 1];
+        best[0] = Some((0, 0, 0, Vec::new()));
+        for end in 1..=n {
+            for start in end.saturating_sub(LONGEST)..end {
+                let Some((count, rare, weight, pieces)) = best[start].clone() else {
+                    continue;
+                };
+                let piece = &word[start..end];
+                // In lower-case text the pronoun would be a capital: "i" is never a word here.
+                let known = if piece.len() == 1 {
+                    piece == "a"
+                } else {
+                    self.sayable(piece).is_some()
+                };
+                if !known {
+                    continue;
+                }
+                let candidate = (
+                    count + 1,
+                    rare + rarity(piece),
+                    weight + piece.len() * piece.len(),
+                    {
+                        let mut p = pieces;
+                        p.push(piece);
+                        p
+                    },
+                );
+                let better = best[end].as_ref().is_none_or(|(c, r, w, _)| {
+                    (candidate.0, candidate.1, std::cmp::Reverse(candidate.2))
+                        < (*c, *r, std::cmp::Reverse(*w))
+                });
+                if better {
+                    best[end] = Some(candidate);
+                }
+            }
+        }
+        let (_, _, _, pieces) = best[n].take()?;
+        if pieces.len() < 3 {
+            return None;
+        }
+        Some(pieces.into_iter().map(str::to_string).collect())
+    }
+
+    /// A word the lexicon has, or a plain regular form of one it has: "dating", "embeddings".
+    /// Only an ending on a known stem — the full inflection rules also strip prefixes and
+    /// join compounds, and took "samepictureofitis" for a word.
+    fn sayable(&self, word: &str) -> Option<String> {
+        if self.known_word(word) {
+            return self.known_phonemes(word);
+        }
+        let plural_y = word
+            .strip_suffix("ies")
+            .is_some_and(|stem| stem.len() >= 3 && self.known_word(&format!("{stem}y")));
+        let regular = plural_y
+            || ["s", "es", "ed", "d", "ing", "er", "ers", "ly", "ings"]
+                .iter()
+                .any(|end| {
+                    word.strip_suffix(end).is_some_and(|stem| {
+                        stem.len() >= 3
+                            && (self.known_word(stem)
+                                || self.known_word(&format!("{stem}e"))
+                                || stem
+                                    .strip_suffix(|c: char| stem.ends_with(&format!("{c}{c}")))
+                                    .is_some_and(|s| self.known_word(s)))
+                    })
+                });
+        if !regular {
+            return None;
+        }
+        self.inflected(word).map(|(ps, _)| ps)
+    }
+
+    /// Two tokens that are one word broken at a line's end — "transduc tion", "hav ing" — said
+    /// as that word: only when together they are a word and one of them alone is not.
+    pub fn joined(&self, head: &str, tail: &str) -> Option<String> {
+        let letters = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphabetic());
+        if !letters(head) || !letters(tail) || !tail.chars().all(|c| c.is_ascii_lowercase()) {
+            return None;
+        }
+        let head = head.to_ascii_lowercase();
+        if self.known_word(&head) && self.known_word(tail) {
+            return None;
+        }
+        self.sayable(&format!("{head}{tail}"))
     }
 
     /// Every rule of `derive` but the compound one: particles, inflections, prefixes.
