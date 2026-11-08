@@ -20,7 +20,9 @@ use std::collections::BTreeSet;
 pub fn split(blocks: Vec<Block>, breaks: &BTreeSet<usize>) -> Vec<Block> {
     let mut out = Vec::with_capacity(blocks.len());
     for block in blocks {
-        if !matches!(block.kind, Kind::Paragraph) {
+        // Fewer than two words has no inside to cut, and a wordless one — a scan's signature or
+        // ornament — would make the range below run backwards.
+        if !matches!(block.kind, Kind::Paragraph) || block.words.len() < 2 {
             out.push(block);
             continue;
         }
@@ -118,6 +120,16 @@ mod tests {
             source: text.to_string(),
             words,
         }
+    }
+
+    /// A scanned page's ornament or signature is a paragraph with no words; it passes through.
+    #[test]
+    fn a_wordless_paragraph_is_left_alone() {
+        let blocks = vec![paragraph("~", 7..7), paragraph("One two", 7..9)];
+        let breaks = BTreeSet::from([7, 8]);
+        let out = split(blocks, &breaks);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].words, 7..7);
     }
 
     /// The tokeniser stays the authority. This checks the cut agrees with it rather than
