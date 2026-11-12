@@ -22,6 +22,7 @@ fn main() -> Result<()> {
     let voice = take("--voice", "af_heart");
     let out = take("--out", "kokoro.wav");
     let seed: u64 = take("--seed", "1234").parse()?;
+    let decoder: kokoro::model::DecoderKind = take("--decoder", "kokoro").parse()?;
     let cpu = args.iter().any(|a| a == "--cpu");
     args.retain(|a| a != "--cpu");
     let text = if args.is_empty() {
@@ -35,7 +36,7 @@ fn main() -> Result<()> {
     } else {
         Device::new_metal(0).context("opening the Metal device")?
     };
-    let model = Model::load(&root, &device)?;
+    let model = Model::load_with(&root, &device, decoder)?;
     let voices = Voices::load(&root.join("voices.safetensors"), &device)?;
     let g2p = tts_phoneme::g2p::G2P::load(&frontend, false)?;
 

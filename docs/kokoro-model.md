@@ -141,6 +141,35 @@ Measured, not assumed:
   autoregression — but every custom kernel is single-batch today, so that is a
   project, not a patch.
 
+## The nano decoder
+
+`--set decoder=nano` (`Model::load_with(.., DecoderKind::Nano)`, `src/nano.rs`) replaces the
+53.3M-parameter decoder with the 1.75M-parameter one from
+[nano-edge-tts](https://huggingface.co/drmhse/nano-edge-tts), read from `weights/nano/`. Same inputs and
+output length, so the text side and the word clock are untouched, and Kokoro's decoder is never read from
+the checkpoint. A mapper (80 frames/s) and a renderer (160 frames/s) set per-bin gains on a pulse train's
+25 ms STFT and white noise's 5 ms STFT. Nothing learned runs at audio rate: the pulse trains, framing and
+overlap-add are host loops, and the device only sees frame-rate matmuls.
+
+The gate (`kokoro-validate`, fixtures from `references/kokoro/dump_nano.py` with the draws replayed)
+reads mapper 9e-7 relative, head 3e-3, audio SNR 54.9 dB against the PyTorch reference, on CPU and on
+Metal alike; float16 weights read 54.3 dB. It is not bit-exact for two reasons, both matched as far as
+they go: torch upsamples the F0 track with a fused f32 index when given a scale factor (not the
+size-based double index `source.rs` matches), and the training code's STFT table was built with the
+angle rounded through f32, which at `k * n` near 2e5 is 0.06 rad off; the port reproduces the table,
+because the network learned against it.
+
+13.85 s sentence, M4, `kokoro-render`, 4 passes, last one, interleaved twice:
+
+| | Metal RTF | decoder | CPU RTF | decoder | peak footprint Metal / CPU |
+|---|---:|---:|---:|---:|---:|
+| Kokoro decoder | 0.030 | 0.351 s | 0.318–0.327 | 4.05–4.17 s | 1685 / 1513 MB |
+| nano | 0.008–0.009 | 0.052–0.054 s | 0.039 | 0.18–0.19 s | 507 / 354 MB |
+
+With nano the text side is half the Metal time and two thirds of the CPU time. Metal against CPU on the
+same text reads 33.5 dB for nano and 41.6 dB for Kokoro's decoder: the text side differs slightly
+between the two devices, and nano's pulse phase integrates its F0.
+
 ## What is not done
 
 - The `Engine` trait and the registry: this is a library and two binaries, not yet an

@@ -11,6 +11,7 @@ pub mod decoder;
 pub mod engine;
 pub mod lstm;
 pub mod model;
+pub mod nano;
 pub mod predictor;
 pub mod source;
 pub mod text_encoder;

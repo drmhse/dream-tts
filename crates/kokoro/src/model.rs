@@ -4,6 +4,7 @@ use crate::albert::Albert;
 use crate::blocks::Linear;
 use crate::cfg::Config;
 use crate::decoder::Decoder;
+use crate::nano::Nano;
 use crate::predictor::Predictor;
 use crate::source::Draws;
 use crate::text_encoder::TextEncoder;
@@ -23,8 +24,35 @@ pub struct Model {
     bert_encoder: Linear,
     predictor: Predictor,
     text_encoder: TextEncoder,
-    decoder: Decoder,
+    decoder: Vocoder,
     device: Device,
+}
+
+/// Which network turns the text side's output into audio. Same inputs, same output length, so
+/// everything upstream and the word clock are shared.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DecoderKind {
+    #[default]
+    Kokoro,
+    /// `nano::Nano`, from `nano/` beside the checkpoint. Kokoro's decoder is then never read
+    /// from the file, so its 53M parameters are not resident.
+    Nano,
+}
+
+impl std::str::FromStr for DecoderKind {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "kokoro" => Ok(Self::Kokoro),
+            "nano" => Ok(Self::Nano),
+            other => anyhow::bail!("decoder is kokoro or nano, not {other:?}"),
+        }
+    }
+}
+
+enum Vocoder {
+    Kokoro(Box<Decoder>),
+    Nano(Box<Nano>),
 }
 
 /// The shipped voices, each a `[510, 256]` table indexed by phoneme count.
@@ -72,6 +100,10 @@ impl Voices {
 
 impl Model {
     pub fn load(root: &Path, device: &Device) -> Result<Self> {
+        Self::load_with(root, device, DecoderKind::Kokoro)
+    }
+
+    pub fn load_with(root: &Path, device: &Device, kind: DecoderKind) -> Result<Self> {
         let cfg = Config::load(&root.join("config.json"))?;
         let path = root.join("kokoro.safetensors");
         let w = Weights::load(path.to_str().context("weight path")?, device)?;
@@ -80,7 +112,10 @@ impl Model {
             bert_encoder: Linear::load(&w, "bert_encoder")?,
             predictor: Predictor::load(&w, &cfg)?,
             text_encoder: TextEncoder::load(&w, &cfg)?,
-            decoder: Decoder::load(&w, &cfg)?,
+            decoder: match kind {
+                DecoderKind::Kokoro => Vocoder::Kokoro(Box::new(Decoder::load(&w, &cfg)?)),
+                DecoderKind::Nano => Vocoder::Nano(Box::new(Nano::load(root, device)?)),
+            },
             cfg,
             device: device.clone(),
         })
@@ -88,6 +123,13 @@ impl Model {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    pub fn decoder_kind(&self) -> DecoderKind {
+        match self.decoder {
+            Vocoder::Kokoro(_) => DecoderKind::Kokoro,
+            Vocoder::Nano(_) => DecoderKind::Nano,
+        }
     }
 
     /// `style` is one `[1, 256]` row: the first half conditions the decoder, the second
@@ -156,9 +198,11 @@ impl Model {
         let d = self.predictor.text_encoder.forward(&d_en, &s_pred)?;
         let durations = self.predictor.durations(&d, speed)?;
         // The decoder's last block doubles the frame rate before the generator.
-        self.decoder
-            .generator
-            .prewarm(2 * durations.iter().sum::<usize>(), &self.device);
+        if let Vocoder::Kokoro(decoder) = &self.decoder {
+            decoder
+                .generator
+                .prewarm(2 * durations.iter().sum::<usize>(), &self.device);
+        }
         lap("duration", &mut timings, &mut mark, &self.device)?;
 
         let aln = Predictor::alignment(&durations, &self.device)?;
@@ -169,7 +213,10 @@ impl Model {
         let asr = self.text_encoder.forward(ids, &self.device)?.matmul(&aln)?;
         lap("encoder", &mut timings, &mut mark, &self.device)?;
 
-        let audio = self.decoder.forward(&asr, &f0, &energy, &s_dec, draws)?;
+        let audio = match &self.decoder {
+            Vocoder::Kokoro(d) => d.forward(&asr, &f0, &energy, &s_dec, draws)?,
+            Vocoder::Nano(d) => d.forward(&asr, &f0, &energy, &s_dec, draws)?,
+        };
         lap("decoder", &mut timings, &mut mark, &self.device)?;
         Ok((audio, timings, durations))
     }

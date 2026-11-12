@@ -50,6 +50,9 @@ references/qwen3tts/.venv/bin/python references/qwen3tts/export_voice.py \
 
 `kokoro` cannot clone; it carries 28 voices and takes one by name:
 `--engine kokoro --set voice=am_michael`.
+`--set decoder=nano` swaps Kokoro's 53M-parameter decoder for the 1.75M-parameter
+[nano-edge-tts](https://huggingface.co/drmhse/nano-edge-tts) one: same voices and timing, 3.5x faster on
+Metal, 8x on the CPU, with a slightly purer tone on some vowels ([measurements](docs/kokoro-model.md#the-nano-decoder)).
 
 ## The engines
 

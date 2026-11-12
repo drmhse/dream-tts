@@ -270,6 +270,15 @@ else
     mv "$KOKORO_W/voices.safetensors.part" "$KOKORO_W/voices.safetensors"
     mv "$KOKORO_W/config.json.part" "$KOKORO_W/config.json"
     say "Kokoro converted weights pulled from $ASSETS_REPO — no torch needed"
+    # The nano decoder (`--set decoder=nano`) is 3.5 MB and optional: a failure here costs nothing.
+    if mkdir -p "$KOKORO_W/nano" \
+      && curl -sSfL --retry 3 -o "$KOKORO_W/nano/config.json.part" "$ASSETS_BASE/nano/config.json" \
+      && curl -sSfL --retry 3 -o "$KOKORO_W/nano/nano-edge-tts.safetensors.part" "$ASSETS_BASE/nano/nano-edge-tts.safetensors"; then
+      mv "$KOKORO_W/nano/config.json.part" "$KOKORO_W/nano/config.json"
+      mv "$KOKORO_W/nano/nano-edge-tts.safetensors.part" "$KOKORO_W/nano/nano-edge-tts.safetensors"
+    else
+      rm -f "$KOKORO_W"/nano/*.part
+    fi
   else
     rm -f "$KOKORO_W"/*.part
   # The 26 voicepacks this omits are the Spanish, French, Hindi, Italian, Japanese,

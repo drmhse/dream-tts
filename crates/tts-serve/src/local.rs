@@ -27,12 +27,22 @@ pub struct Said {
 }
 
 impl Local {
-    pub fn load(engine: &str, model_root: &Path, segment_chars: usize, cpu: bool) -> Result<Self> {
+    /// `settings` are the `--set` pairs, as the server takes them.
+    pub fn load(
+        engine: &str,
+        model_root: &Path,
+        segment_chars: usize,
+        cpu: bool,
+        settings: &[(String, String)],
+    ) -> Result<Self> {
         let config = EngineConfig {
             model_root: model_root.to_path_buf(),
             quant: None,
             cpu,
-            overrides: Default::default(),
+            overrides: settings
+                .iter()
+                .map(|(k, v)| (k.clone(), v.into()))
+                .collect(),
         };
         let started = Instant::now();
         let engine = tts_engines::load(engine, &config)

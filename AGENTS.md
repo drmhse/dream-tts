@@ -32,7 +32,8 @@ English frontend is a lexicon with no espeak fallback (GPL): an unknown word tha
 a compound of known words is approximated, and in American English anything else is guessed by
 g2p_en's small Apache-2.0 model (both off with `--set fallback=off`); what is left is named in a
 lint. `docs/kokoro-frontend.md` and `docs/kokoro-model.md` carry its traps and
-its measurements. On Metal its generator runs padded to length buckets (`KOKORO_BUCKETS`, 0 to
+its measurements. `--set decoder=nano` swaps in a 1.75M-parameter decoder (`src/nano.rs`, weights in
+`weights/nano/`), gated by the same `kokoro-validate` against `fixtures/kokoro/nano.safetensors`. On Metal its generator runs padded to length buckets (`KOKORO_BUCKETS`, 0 to
 disable), so an A/B of a generator change has to render several lengths, not one utterance
 repeated: a repeated utterance never pays MPSGraph's per-length compile. Each resblock runs as
 one MPSGraph (`KOKORO_NO_MPSBLOCK` to compose it instead); a graph holds its intermediates until

@@ -23,6 +23,11 @@ impl Linear {
         })
     }
 
+    /// From a weight already `[in, out]`.
+    pub fn from_parts(w: Tensor, b: Option<Tensor>) -> Self {
+        Self { w, b }
+    }
+
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
         let y = x.broadcast_matmul(&self.w)?;
         Ok(match &self.b {

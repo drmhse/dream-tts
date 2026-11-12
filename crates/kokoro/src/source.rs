@@ -22,7 +22,7 @@ const VOICED_THRESHOLD: f32 = 10.0;
 /// and immediately puts them back, which looks like a no-op and is not: it is what keeps
 /// the phase continuous across a frame boundary. The half-pixel convention has to match,
 /// or every harmonic drifts.
-fn interpolate_linear(x: &[f32], channels: usize, out_len: usize) -> Vec<f32> {
+pub(crate) fn interpolate_linear(x: &[f32], channels: usize, out_len: usize) -> Vec<f32> {
     let in_len = x.len() / channels;
     // f64 throughout, and `(1-λ)a + λb` rather than `a + (b-a)λ`. Both match torch on
     // purpose: its CPU kernel accumulates float input in double, and the phase reaching

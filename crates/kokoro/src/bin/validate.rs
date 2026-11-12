@@ -150,6 +150,60 @@ fn shape_audit(w: &Weights, cfg: &Config) -> Result<usize> {
     Ok(problems)
 }
 
+/// The nano decoder against `references/kokoro/dump_nano.py`: its two network outputs, its two
+/// excitations, and the audio with the reference's draws replayed.
+fn nano_rows(root: &std::path::Path, fixtures: &std::path::Path, r: &mut Report) -> Result<()> {
+    let fx = Weights::load(
+        fixtures.join("nano.safetensors").to_str().unwrap(),
+        &Device::Cpu,
+    )?;
+    let nano = kokoro::nano::Nano::load(root, &Device::Cpu)?;
+    let f0 = fx.get("in.f0")?;
+    let curve: Vec<f32> = f0.flatten_all()?.to_vec1()?;
+    let len = curve.len() * 300;
+    let f = kokoro::nano::upsample(&curve, len);
+    let pulse = Tensor::new(kokoro::nano::pulse_train(&f), &Device::Cpu)?;
+    // Not exact: torch's fused f32 upsampling index is matched to 2 ulp, and the phase integrates
+    // the remainder, so the sharpest pulses move by a fraction of a sample.
+    r.check_rel("nano_pulse", &pulse, &fx.get("pulse")?, 5e-3);
+    let jitter: Vec<f32> = fx.get("draw.1")?.flatten_all()?.to_vec1()?;
+    let creak = Tensor::new(
+        kokoro::nano::creak_train(&f, nano.creak_rate(), jitter),
+        &Device::Cpu,
+    )?;
+    r.check_rel("nano_creak", &creak, &fx.get("creak")?, 5e-3);
+    let out = nano.render(
+        &fx.get("in.asr")?,
+        &f0,
+        &fx.get("in.energy")?,
+        &fx.get("in.style")?,
+        &mut ReplayDraws::new(&fx, 2)?,
+    )?;
+    r.check("nano_mapper", &out.mapper, &fx.get("mapper")?, 1e-3);
+    // The head reads the pulse train's log spectrum, so it inherits the pulse row's error.
+    r.check_rel("nano_head", &out.head, &fx.get("head")?, 1e-2);
+    let want: Vec<f32> = fx.get("audio")?.to_vec1()?;
+    r.rows += 1;
+    let signal: f64 = want.iter().map(|v| (*v as f64).powi(2)).sum();
+    let error: f64 = out
+        .audio
+        .iter()
+        .zip(&want)
+        .map(|(a, b)| ((a - b) as f64).powi(2))
+        .sum();
+    let snr = 10.0 * (signal / error.max(1e-30)).log10();
+    // 54.9 dB when written; the Kokoro decoder's own row passes at 24.
+    let ok = out.audio.len() == want.len() && snr >= 40.0;
+    r.failures += usize::from(!ok);
+    println!(
+        "  {:<22} {}  SNR {snr:.1} dB  {} samples",
+        "nano_audio",
+        if ok { "ok  " } else { "FAIL" },
+        out.audio.len()
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let root = PathBuf::from(
         std::env::args()
@@ -337,6 +391,10 @@ fn main() -> Result<()> {
         }
     }
 
+    if fixtures.join("nano.safetensors").exists() && root.join(kokoro::nano::DIR).exists() {
+        println!("\nnano decoder");
+        nano_rows(&root, &fixtures, &mut r)?;
+    }
     println!("\n{} rows, {} failures", r.rows, r.failures);
     if r.failures > 0 || problems > 0 {
         std::process::exit(1);

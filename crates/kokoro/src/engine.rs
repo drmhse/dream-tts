@@ -7,7 +7,7 @@
 
 use crate::cfg::Config;
 use crate::decoder::SeededDraws;
-use crate::model::{Model, Voices};
+use crate::model::{DecoderKind, Model, Voices};
 use anyhow::{Context, Result};
 use candle_core::Device;
 use std::time::Instant;
@@ -102,7 +102,12 @@ impl KokoroEngine {
             Some(other) => anyhow::bail!("--set british= takes true or false, got {other:?}"),
             None => voice.starts_with('b'),
         };
-        let model = Model::load(&config.model_root, &device)?;
+        // `--set decoder=nano` swaps Kokoro's 53M decoder for the 1.75M one in `nano/`.
+        let decoder = match config.overrides.get("decoder").and_then(|p| p.to_str()) {
+            Some(name) => name.parse()?,
+            None => DecoderKind::default(),
+        };
+        let model = Model::load_with(&config.model_root, &device, decoder)?;
         let voices = Voices::load(&config.path("voices", "voices.safetensors"), &device)?;
         anyhow::ensure!(
             voices.names().contains(&voice.as_str()),
