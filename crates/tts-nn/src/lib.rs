@@ -741,6 +741,9 @@ pub fn centered_conv1d_gemm(
     dilation: usize,
     pad_left: usize,
 ) -> Result<Tensor> {
+    if let Some(y) = cpu::conv_tiled(x, w_tap, b, k, dilation, pad_left)? {
+        return Ok(y);
+    }
     let (_, cin, len) = x.dims3()?;
     let cols_per_chunk = chunk_width(centered_col_budget() / (k * cin), len);
     if cols_per_chunk < len {

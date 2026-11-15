@@ -1,7 +1,7 @@
 //! Single-pass CPU kernels for ops candle composes from several allocating passes. Off the CPU
 //! each falls back to the composed form, which the tests check the kernels against.
 
-use candle_core::{CpuStorage, CustomOp1, CustomOp3, Layout, Result, Shape, Tensor};
+use candle_core::{CpuStorage, CustomOp1, CustomOp2, CustomOp3, Layout, Result, Shape, Tensor};
 
 /// erf as Eigen's rational fit, `x P(x^2) / Q(x^2)` on [-4, 4]: within 4.5e-7 of the exact erf,
 /// branch-free, so the loop vectorises. candle's `gelu_erf` calls libm's scalar `erff` per element,
@@ -40,7 +40,7 @@ pub fn exp(x: f32) -> f32 {
     p = p * r + 8.333_452e-3;
     p = p * r + 4.166_579_6e-2;
     p = p * r + 1.666_666_5e-1;
-    p = p * r + 5.000_000_1e-1;
+    p = p * r + 5e-1;
     let y = p * r * r + r + 1.0;
     y * f32::from_bits(((n as i32 + 127) as u32) << 23)
 }
@@ -51,10 +51,10 @@ pub fn exp(x: f32) -> f32 {
 pub fn tanh(x: f32) -> f32 {
     let z = x * x;
     let mut p = -5.704_988_7e-3f32;
-    p = p * z + 2.063_908_9e-2;
+    p = p * z + 2.063_909e-2;
     p = p * z - 5.373_971_6e-2;
     p = p * z + 1.333_144_2e-1;
-    p = p * z - 3.333_328_2e-1;
+    p = p * z - 3.333_328e-1;
     let small = p * z * x + x;
     let big = (1.0 - 2.0 / (exp(2.0 * x.abs()) + 1.0)).copysign(x);
     if x.abs() < 0.625 {
@@ -76,7 +76,7 @@ pub fn sigmoid(x: f32) -> f32 {
 pub fn exp64(x: f64) -> f64 {
     let x = x.clamp(-700.0, 700.0);
     let n = (x * std::f64::consts::LOG2_E).round();
-    let r = x - n * 6.931_471_803_691_238_2e-1 - n * 1.908_214_929_270_587_7e-10;
+    let r = x - n * 6.931_471_803_691_238e-1 - n * 1.908_214_929_270_587_7e-10;
     let mut p = 1.0 / 479_001_600.0;
     for d in [
         39_916_800.0,
@@ -136,6 +136,15 @@ impl CustomOp1 for SoftmaxLast {
         }
         Ok((CpuStorage::F32(dst), l.shape().clone()))
     }
+}
+
+/// Threads for `units` independent pieces of work: candle's count (RAYON_NUM_THREADS, else the
+/// cores), at most four; past that the decoder's ops are too short to split further.
+pub fn threads_for(units: usize) -> usize {
+    candle_core::utils::get_num_threads()
+        .min(4)
+        .min(units)
+        .max(1)
 }
 
 /// Eight partial sums, so the loop vectorises: one accumulator is a serial chain, since the
@@ -412,6 +421,302 @@ pub fn scaled_residual(x: &Tensor, h: &Tensor, scale: &Tensor) -> Result<Tensor>
     x + h.broadcast_mul(&scale.reshape((1, 1, c))?)?
 }
 
+/// Accelerate's vForce and BLAS, declared here rather than through a crate: candle's `accelerate`
+/// feature already links the framework on every Apple target.
+#[cfg(target_vendor = "apple")]
+mod accelerate {
+    extern "C" {
+        pub fn vvsinf(y: *mut f32, x: *const f32, n: *const i32);
+        #[allow(clippy::too_many_arguments)]
+        pub fn cblas_sgemm(
+            order: i32,
+            trans_a: i32,
+            trans_b: i32,
+            m: i32,
+            n: i32,
+            k: i32,
+            alpha: f32,
+            a: *const f32,
+            lda: i32,
+            b: *const f32,
+            ldb: i32,
+            beta: f32,
+            c: *mut f32,
+            ldc: i32,
+        );
+    }
+    pub const ROW_MAJOR: i32 = 101;
+    pub const NO_TRANS: i32 = 111;
+    pub const TRANS: i32 = 112;
+}
+
+/// `sin` over a slice in place: vForce on Apple hardware, libm elsewhere. An inline Cephes `sin^2`
+/// fused into the Snake loop instead was slower (0.96-1.00 s against 0.92 for the Kokoro decoder).
+fn sin_in_place(v: &mut [f32]) {
+    #[cfg(target_vendor = "apple")]
+    {
+        let n = v.len() as i32;
+        let p = v.as_mut_ptr();
+        // vvsinf allows the output to alias the input.
+        unsafe { accelerate::vvsinf(p, p as *const f32, &n) };
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    v.iter_mut().for_each(|x| *x = x.sin());
+}
+
+struct AdainSnakeCpu {
+    c: usize,
+    len: usize,
+    eps: f32,
+}
+
+impl CustomOp2 for AdainSnakeCpu {
+    fn name(&self) -> &'static str {
+        "adain_snake_cpu"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        let (CpuStorage::F32(x), CpuStorage::F32(p)) = (s1, s2) else {
+            candle_core::bail!("adain_snake_cpu: only f32")
+        };
+        let (c, len) = (self.c, self.len);
+        let x = &x[l1.start_offset()..l1.start_offset() + c * len];
+        // Packed rows: mean, var, gamma, beta, alpha, beta_recip.
+        let p = &p[l2.start_offset()..l2.start_offset() + 6 * c];
+        let col = |r: usize, j: usize| p[r * c + j];
+        let mut dst = vec![0f32; c * len];
+        // Channel rows `j0..`, one per `len`-chunk of `out`.
+        let rows = |j0: usize, out: &mut [f32]| {
+            const CHUNK: usize = 2048;
+            let mut u = vec![0f32; CHUNK];
+            for (i, os) in out.chunks_exact_mut(len).enumerate() {
+                let (j, row) = (j0 + i, &x[(j0 + i) * len..(j0 + i + 1) * len]);
+                let scale = (1.0 + col(2, j)) / (col(1, j) + self.eps).sqrt();
+                let shift = col(3, j) - col(0, j) * scale;
+                let (alpha, br) = (col(4, j), col(5, j));
+                for (xs, os) in row.chunks(CHUNK).zip(os.chunks_mut(CHUNK)) {
+                    let u = &mut u[..xs.len()];
+                    for ((o, uu), &v) in os.iter_mut().zip(u.iter_mut()).zip(xs) {
+                        *o = v * scale + shift;
+                        *uu = *o * alpha;
+                    }
+                    sin_in_place(u);
+                    for (o, &sv) in os.iter_mut().zip(u.iter()) {
+                        *o += br * sv * sv;
+                    }
+                }
+            }
+        };
+        let threads = threads_for(c);
+        if threads <= 1 {
+            rows(0, &mut dst);
+        } else {
+            let per = c.div_ceil(threads);
+            let rows = &rows;
+            std::thread::scope(|sc| {
+                for (i, part) in dst.chunks_mut(per * len).enumerate() {
+                    sc.spawn(move || rows(i * per, part));
+                }
+            });
+        }
+        Ok((CpuStorage::F32(dst), l1.shape().clone()))
+    }
+}
+
+/// AdaIN then SnakeBeta on `[1, C, L]`, one pass per channel row. `packed` is `[6, C]`: mean, var,
+/// gamma, beta, alpha, 1/beta. Composed on the CPU it was six full passes and the generator's
+/// largest cost.
+pub fn adain_snake(x: &Tensor, packed: &Tensor, eps: f64) -> Result<Tensor> {
+    let (_, c, len) = x.dims3()?;
+    x.contiguous()?.apply_op2_no_bwd(
+        &packed.contiguous()?,
+        &AdainSnakeCpu {
+            c,
+            len,
+            eps: eps as f32,
+        },
+    )
+}
+
+#[cfg(target_vendor = "apple")]
+struct ConvTiled {
+    cin: usize,
+    len: usize,
+    out: usize,
+    k: usize,
+    dilation: usize,
+    pad_left: usize,
+    tile: usize,
+    /// The weight arrives as `[k * cin, out]` (row-major) to be read transposed.
+    trans: bool,
+}
+
+#[cfg(target_vendor = "apple")]
+impl CustomOp3 for ConvTiled {
+    fn name(&self) -> &'static str {
+        "conv_tiled_cpu"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+        s3: &CpuStorage,
+        l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        let (CpuStorage::F32(x), CpuStorage::F32(w), CpuStorage::F32(b)) = (s1, s2, s3) else {
+            candle_core::bail!("conv_tiled_cpu: only f32")
+        };
+        let (cin, len, out, k, d) = (self.cin, self.len, self.out, self.k, self.dilation);
+        let x = &x[l1.start_offset()..l1.start_offset() + cin * len];
+        let w = &w[l2.start_offset()..l2.start_offset() + out * k * cin];
+        let b = &b[l3.start_offset()..l3.start_offset() + out];
+        let mut y = Vec::with_capacity(out * len);
+        for &bias in b {
+            y.extend(std::iter::repeat_n(bias, len));
+        }
+        let tile = self.tile.min(len);
+        let (ta, lda) = if self.trans {
+            (accelerate::TRANS, out)
+        } else {
+            (accelerate::NO_TRANS, k * cin)
+        };
+        let gemm = |a: *const f32, kk: usize, bm: *const f32, ldb: usize, n: usize, c: *mut f32| unsafe {
+            accelerate::cblas_sgemm(
+                accelerate::ROW_MAJOR,
+                ta,
+                accelerate::NO_TRANS,
+                out as i32,
+                n as i32,
+                kk as i32,
+                1.0,
+                a,
+                lda as i32,
+                bm,
+                ldb as i32,
+                1.0,
+                c,
+                len as i32,
+            )
+        };
+        // Columns [lo, hi) of every output row, tile by tile. Threads take disjoint, tile-aligned
+        // column ranges, so the tiles and the result are the same however many there are.
+        let y_addr = y.as_mut_ptr() as usize;
+        let run = |lo: usize, hi: usize| {
+            let mut cols = vec![0f32; k * cin * tile];
+            let mut c0 = lo;
+            while c0 < hi {
+                let n = tile.min(hi - c0);
+                // cols[(t, ci), j] = x[ci, c0 + j + t*d - pad_left], zero outside.
+                for t in 0..k {
+                    let shift = (t * d) as isize - self.pad_left as isize;
+                    for ci in 0..cin {
+                        let dst = &mut cols[(t * cin + ci) * n..(t * cin + ci + 1) * n];
+                        let src = &x[ci * len..(ci + 1) * len];
+                        let start = c0 as isize + shift;
+                        let lo = (-start).clamp(0, n as isize) as usize;
+                        let hi = (len as isize - start).clamp(0, n as isize) as usize;
+                        dst[..lo].fill(0.0);
+                        if hi > lo {
+                            let s = (start + lo as isize) as usize;
+                            dst[lo..hi].copy_from_slice(&src[s..s + hi - lo]);
+                        }
+                        dst[hi.max(lo)..].fill(0.0);
+                    }
+                }
+                gemm(
+                    w.as_ptr(),
+                    k * cin,
+                    cols.as_ptr(),
+                    n,
+                    n,
+                    (y_addr as *mut f32).wrapping_add(c0),
+                );
+                c0 += n;
+            }
+        };
+        let threads = threads_for(len.div_ceil(tile));
+        if threads <= 1 {
+            run(0, len);
+        } else {
+            let per = len.div_ceil(threads).div_ceil(tile) * tile;
+            let run = &run;
+            std::thread::scope(|sc| {
+                for i in 0..threads {
+                    let (lo, hi) = (i * per, ((i + 1) * per).min(len));
+                    if lo < hi {
+                        sc.spawn(move || run(lo, hi));
+                    }
+                }
+            });
+        }
+        Ok((CpuStorage::F32(y), (1, out, len).into()))
+    }
+}
+
+/// A 1-D conv on `[1, cin, len]` with `w_tap` `[out, k * cin]` (tap-major): im2col one tile of
+/// columns at a time, sized to stay in cache, each multiplied by Accelerate straight into its slice
+/// of the output. The whole-sequence im2col is hundreds of MB at Kokoro's widest layers, and the
+/// GEMM streamed it from memory. Apple CPU only; `None` elsewhere.
+pub fn conv_tiled(
+    x: &Tensor,
+    w_tap: &Tensor,
+    b: Option<&Tensor>,
+    k: usize,
+    dilation: usize,
+    pad_left: usize,
+) -> Result<Option<Tensor>> {
+    #[cfg(target_vendor = "apple")]
+    {
+        let (batch, cin, len) = x.dims3()?;
+        let out = w_tap.dim(0)?;
+        if batch != 1 || !x.device().is_cpu() || x.dtype() != candle_core::DType::F32 {
+            return Ok(None);
+        }
+        // 512 columns: the tile, its GEMM operand and the output slice stay in L2. Measured on a
+        // quiet M4, Kokoro decoder, one thread: whole-sequence im2col 1.09 s, 256 0.93, 512 0.91,
+        // 1024 0.97, 4096 1.29. One GEMM per tap from a single padded copy instead: 0.95.
+        let tile = 512;
+        let bias = match b {
+            Some(b) => b.flatten_all()?.contiguous()?,
+            None => Tensor::zeros(out, candle_core::DType::F32, x.device())?,
+        };
+        // A transposed view of a contiguous `[k * cin, out]` weight (how Kokoro's decoder keeps
+        // them) is read in place with a transposed GEMM; copying it was a seventh of the decoder.
+        let (w, trans) = if w_tap.is_contiguous() {
+            (w_tap.clone(), false)
+        } else if w_tap.t()?.is_contiguous() {
+            (w_tap.t()?, true)
+        } else {
+            (w_tap.contiguous()?, false)
+        };
+        let op = ConvTiled {
+            cin,
+            len,
+            out,
+            k,
+            dilation,
+            pad_left,
+            tile,
+            trans,
+        };
+        Ok(Some(x.contiguous()?.apply_op3_no_bwd(&w, &bias, &op)?))
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = (x, w_tap, b, k, dilation, pad_left);
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,6 +801,70 @@ mod tests {
             let want = (&x + h.broadcast_mul(&s.reshape((1, 1, c)).unwrap()).unwrap()).unwrap();
             assert!(max_diff(&scaled_residual(&x, &h, &s).unwrap(), &want) < 1e-6);
         }
+    }
+
+    #[test]
+    fn conv_tiled_matches_im2col() {
+        let dev = Device::Cpu;
+        for (cin, out, len, k, d) in [
+            (8, 6, 50, 3, 1),
+            (16, 16, 3000, 7, 3),
+            (32, 24, 2500, 11, 5),
+            (5, 3, 9, 1, 1),
+        ] {
+            let x = Tensor::randn(0f32, 1.0, (1, cin, len), &dev).unwrap();
+            let w = Tensor::randn(0f32, 0.2, (out, cin, k), &dev).unwrap();
+            let b = Tensor::randn(0f32, 0.5, out, &dev).unwrap();
+            let wt = crate::tap_major_weight(&w).unwrap();
+            for pad_left in [(k - 1) * d / 2, 0, (k - 1) * d] {
+                let Some(got) = conv_tiled(&x, &wt, Some(&b), k, d, pad_left).unwrap() else {
+                    return;
+                };
+                let wtt = wt.t().unwrap().contiguous().unwrap().t().unwrap();
+                let got_t = conv_tiled(&x, &wtt, Some(&b), k, d, pad_left)
+                    .unwrap()
+                    .unwrap();
+                assert!(max_diff(&got, &got_t) < 1e-4);
+                let want =
+                    crate::conv1d_gemm_whole(&x, &wt, Some(&b), k, d, Some(pad_left)).unwrap();
+                let diff = max_diff(&got, &want);
+                assert!(
+                    diff < 1e-4,
+                    "{cin}->{out} @{len} k{k} d{d} pad {pad_left}: {diff}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn adain_snake_matches_composed() {
+        let dev = Device::Cpu;
+        let (c, len) = (12, 5000);
+        let x = Tensor::randn(0.2f32, 1.5, (1, c, len), &dev).unwrap();
+        let r = |m: f32, s: f32| Tensor::randn(m, s, c, &dev).unwrap();
+        let (mean, var, gamma, beta) = (
+            r(0.2, 0.1),
+            r(2.0, 0.3).abs().unwrap(),
+            r(0.0, 0.3),
+            r(0.0, 0.3),
+        );
+        let (alpha, br) = (r(1.0, 0.3), r(1.0, 0.3));
+        let packed = Tensor::stack(&[&mean, &var, &gamma, &beta, &alpha, &br], 0).unwrap();
+        let got = adain_snake(&x, &packed, 1e-5).unwrap();
+        let y = crate::fused::adain_apply(&x, &mean, &var, &gamma, &beta, 1e-5).unwrap();
+        let u = y.broadcast_mul(&alpha.reshape((1, c, 1)).unwrap()).unwrap();
+        let want = y
+            .broadcast_add(
+                &u.sin()
+                    .unwrap()
+                    .sqr()
+                    .unwrap()
+                    .broadcast_mul(&br.reshape((1, c, 1)).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        let diff = max_diff(&got, &want);
+        assert!(diff < 2e-5, "{diff}");
     }
 
     #[test]

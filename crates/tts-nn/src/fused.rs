@@ -1118,17 +1118,58 @@ impl CustomOp1 for Moments {
             candle_core::bail!("channel_moments: input must be contiguous");
         }
         let o = l.start_offset();
-        let mut dst = vec![0f32; 2 * self.channels];
-        for c in 0..self.channels {
+        // Per channel; channels split across threads, each one's sums unchanged by the split.
+        let stats = |c: usize| -> (f32, f32) {
             let row = &x[o + c * self.len..o + c * self.len + self.valid];
-            let (mut sum, mut sq) = (0f32, 0f32);
-            for v in row {
-                sum += v;
-                sq += v * v;
+            // f64, eight lanes: a single f32 accumulator over tens of thousands of samples drifted
+            // enough to move Kokoro's audio (34 dB from exact statistics against 42 dB for eight f32
+            // lanes); the lanes keep it vectorised.
+            let (mut s8, mut q8) = ([0f64; 8], [0f64; 8]);
+            let chunks = row.chunks_exact(8);
+            let tail = chunks.remainder();
+            for ch in chunks {
+                for i in 0..8 {
+                    let v = ch[i] as f64;
+                    s8[i] += v;
+                    q8[i] += v * v;
+                }
             }
-            let mean = sum / self.valid as f32;
-            dst[c] = mean;
-            dst[self.channels + c] = (sq / self.valid as f32 - mean * mean).max(0.0);
+            let (mut sum, mut sq) = (s8.iter().sum::<f64>(), q8.iter().sum::<f64>());
+            for &v in tail {
+                sum += v as f64;
+                sq += v as f64 * v as f64;
+            }
+            let mean = sum / self.valid as f64;
+            (
+                mean as f32,
+                (sq / self.valid as f64 - mean * mean).max(0.0) as f32,
+            )
+        };
+        let n = self.channels;
+        let mut pairs = vec![(0f32, 0f32); n];
+        let threads = crate::cpu::threads_for(n);
+        if threads <= 1 {
+            pairs
+                .iter_mut()
+                .enumerate()
+                .for_each(|(c, p)| *p = stats(c));
+        } else {
+            let per = n.div_ceil(threads);
+            let stats = &stats;
+            std::thread::scope(|sc| {
+                for (i, part) in pairs.chunks_mut(per).enumerate() {
+                    sc.spawn(move || {
+                        part.iter_mut()
+                            .enumerate()
+                            .for_each(|(k, p)| *p = stats(i * per + k))
+                    });
+                }
+            });
+        }
+        let mut dst = vec![0f32; 2 * n];
+        for (c, (m, v)) in pairs.into_iter().enumerate() {
+            dst[c] = m;
+            dst[n + c] = v;
         }
         Ok((CpuStorage::F32(dst), (2, self.channels).into()))
     }
@@ -1601,6 +1642,17 @@ pub fn adain_snake(
             eps: eps as f32,
         };
         return x.contiguous()?.apply_op2_no_bwd(&packed, &op);
+    }
+    if b == 1
+        && x.device().is_cpu()
+        && x.dtype() == candle_core::DType::F32
+        && parts.iter().all(|t| t.elem_count() == c)
+    {
+        let packed = Tensor::stack(
+            &parts.iter().map(|t| flat(t)).collect::<Result<Vec<_>>>()?,
+            0,
+        )?;
+        return crate::cpu::adain_snake(x, &packed, eps);
     }
     let y = adain_apply(x, mean, var, gamma, beta, eps)?;
     snake_beta(

@@ -197,7 +197,25 @@ on the same texts, measured between two Rust runs that agree:
 | after | **0.0115-0.0121** | **0.0105** | 338 MB |
 | PyTorch | 0.0135 | 0.0128 | 1,267 MB |
 
-Kokoro's own decoder on the same build, one thread: 0.735 -> 0.136 (PyTorch 0.144).
+Kokoro's own decoder, the same 12.2 s sentence (`kokoro-render --cpu --decoder kokoro`, builds alternated):
+
+| | 1 thread RTF | all cores RTF |
+|---|---:|---:|
+| before Accelerate | 0.717 | |
+| Accelerate | 0.128-0.141 | 0.123-0.131 |
+| now | **0.084-0.088** | **0.064-0.072** |
+
+Its convolutions are cache-sized im2col tiles (512 columns), each multiplied by Accelerate straight into
+its slice of the output, read with the weight in place (a transposed GEMM, where `contiguous()` had been
+copying every weight on every call); AdaIN + SnakeBeta is one pass with vForce's `vvsinf`. With threads
+to spare, tiles, channel rows and statistics split across up to four, and the audio is bit-identical to
+one thread. The GEMMs now run near Accelerate's one-thread ceiling on these shapes (1.75 TFLOP/s when the
+operands fit in cache, 0.88 at 4096 columns).
+
+The channel statistics AdaIN normalises with were one f32 accumulator over tens of thousands of samples.
+Against statistics in double precision that build's audio read 34 dB; eight f32 lanes 42 dB; f64 lanes,
+now, exact, at no measurable cost. F0_proj fell from 1.85e-3 to 3.3e-4 against its 2e-3 tolerance: most
+of that row's error was the statistics, not the arithmetic around them.
 
 What did not help:
 
@@ -207,6 +225,11 @@ What did not help:
   to 2.01e-3, both over the 2e-3 tolerance. candle's Accelerate build already runs that GELU on vForce.
 - Slicing the LSTM gate rows up front to drop bounds checks: no faster, and summing the two gate inputs
   in f64 instead of f32 moved F0_proj to 2.08e-3.
+- A conv as `k` GEMMs, one per tap, from a single padded copy over the whole sequence: 1.47 s against
+  1.09 for whole-sequence im2col. Each tap re-reads and re-writes the whole output. Within a 512-column
+  tile, where the output slice stays in cache: 0.95 against 0.91.
+- An inline Cephes `sin^2` fused into the Snake loop instead of `vvsinf`: 0.96-1.00 s against 0.92, and
+  less accurate.
 
 ## What is not done
 
