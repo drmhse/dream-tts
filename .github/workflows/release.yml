@@ -29,7 +29,7 @@ jobs:
     name: aarch64-apple-darwin
     # Pinned, not `macos-latest`: a runner bump to a newer SDK is a silent way to raise the
     # minimum OS of everything shipped here.
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
