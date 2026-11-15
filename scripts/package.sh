@@ -112,7 +112,8 @@ env $BARE ./dream-tts config >/dev/null   || die "dream-tts config failed"
 printf '# Title\n\nProse with a 3.2 GB/s rate and `PaymentCaptured(id)`.\n' >"$work/one.md"
 narrated="$(env $BARE ./dream-tts narrate "$work/one.md")" || die "dream-tts narrate failed"
 case "$narrated" in
-  *"3.2 gigabytes per second"*) ;;
+  # Before its noun a quantity is said in the singular: "a 3.2 gigabyte per second rate".
+  *"3.2 gigabyte per second rate"*) ;;
   *) die "narrate did not verbalise the rate: $narrated" ;;
 esac
 env $BARE ./dream-tts import "$work/one.md" --dry-run >/dev/null \
