@@ -1639,13 +1639,16 @@ impl candle_core::CustomOp3 for LstmGates {
             l3.start_offset(),
             self.hidden,
         );
-        let sig = |v: f32| 1.0 / (1.0 + (-v).exp());
+        // Double precision through vectorisable exp and tanh, rounded once: with libm's scalar f32
+        // ones this op was a quarter of a one-thread Kokoro render. The f32 Cephes forms (1.1 ulp)
+        // were as fast but moved kokoro-validate's F0_proj to 2.01e-3, over its 2e-3 tolerance.
+        use crate::cpu::{sigmoid64 as sig, tanh64 as tanh};
         let mut dst = vec![0f32; 2 * h];
         for j in 0..h {
-            let gate = |n: usize| g[o1 + n * h + j] + p[o2 + n * h + j];
-            let ct = sig(gate(1)) * c[o3 + j] + sig(gate(0)) * gate(2).tanh();
+            let gate = |n: usize| (g[o1 + n * h + j] + p[o2 + n * h + j]) as f64;
+            let ct = (sig(gate(1)) * c[o3 + j] as f64 + sig(gate(0)) * tanh(gate(2))) as f32;
             dst[h + j] = ct;
-            dst[j] = sig(gate(3)) * ct.tanh();
+            dst[j] = (sig(gate(3)) * tanh(ct as f64)) as f32;
         }
         Ok((CpuStorage::F32(dst), (2, h).into()))
     }

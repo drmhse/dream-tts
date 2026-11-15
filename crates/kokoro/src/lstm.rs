@@ -98,8 +98,22 @@ impl BiLstm {
             )?;
             return Ok(out.unsqueeze(0)?);
         }
-        let f = self.forward.run(&x, false, self.hidden, &device)?;
-        let b = self.backward.run(&x, true, self.hidden, &device)?;
+        // The directions are independent: with CPU threads to spare, one each.
+        let (f, b) = if device.is_cpu() && candle_core::utils::get_num_threads() > 1 {
+            std::thread::scope(|sc| -> Result<_> {
+                let back = sc.spawn(|| self.backward.run(&x, true, self.hidden, &device));
+                let f = self.forward.run(&x, false, self.hidden, &device)?;
+                let b = back
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("LSTM thread panicked"))??;
+                Ok((f, b))
+            })?
+        } else {
+            (
+                self.forward.run(&x, false, self.hidden, &device)?,
+                self.backward.run(&x, true, self.hidden, &device)?,
+            )
+        };
         Ok(Tensor::cat(&[f, b], 1)?.unsqueeze(0)?)
     }
 }

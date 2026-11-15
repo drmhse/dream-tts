@@ -96,17 +96,10 @@ impl Block {
 
     fn apply(&self, x: &Tensor, s: &Tensor) -> Result<Tensor> {
         let h = tts_nn::cpu::depthwise_tc(x, &self.taps, &self.dw_bias)?;
-        let h = if self.instance {
-            let mean = h.mean_keepdim(1)?;
-            let c = h.broadcast_sub(&mean)?;
-            c.broadcast_div(&(c.sqr()?.mean_keepdim(1)? + EPS)?.sqrt()?)?
-        } else {
-            tts_nn::layer_norm_plain(&h, EPS)?
-        };
         let (g, b) = film(&self.fc, s, self.dim)?;
-        let h = h.broadcast_mul(&g)?.broadcast_add(&b)?;
+        let h = tts_nn::cpu::norm_film(&h, &g, &b, self.instance, EPS)?;
         let h = self.down.apply(&tts_nn::gelu_exact(&self.up.apply(&h)?)?)?;
-        Ok((x + h.broadcast_mul(&self.scale.reshape((1, 1, self.dim))?)?)?)
+        Ok(tts_nn::cpu::scaled_residual(x, &h, &self.scale)?)
     }
 }
 
@@ -138,10 +131,8 @@ impl Trunk {
             x = b.apply(&x, s)?;
         }
         let (g, b) = film(&self.fc, s, self.dim)?;
-        let x = tts_nn::layer_norm_plain(&x, EPS)?
-            .broadcast_mul(&g)?
-            .broadcast_add(&b)?;
-        self.head.apply(&x)
+        self.head
+            .apply(&tts_nn::cpu::norm_film(&x, &g, &b, false, EPS)?)
     }
 }
 
@@ -221,11 +212,13 @@ impl Stft {
 
     /// (re, im) `[frames, bins]` -> `length` samples, normalised by the summed squared window.
     fn inverse(&self, re: &Tensor, im: &Tensor, length: usize) -> Result<Vec<f32>> {
-        let frames = re.dim(0)?;
-        let rows: Vec<f32> = Tensor::cat(&[re, im], 1)?
-            .matmul(&self.inv)?
-            .flatten_all()?
-            .to_vec1()?;
+        self.inverse_rows(&Tensor::cat(&[re, im], 1)?, length)
+    }
+
+    /// The same from `[frames, 2 * bins]` rows already laid out as re | im.
+    fn inverse_rows(&self, spec: &Tensor, length: usize) -> Result<Vec<f32>> {
+        let frames = spec.dim(0)?;
+        let rows: Vec<f32> = spec.matmul(&self.inv)?.flatten_all()?.to_vec1()?;
         let total = (frames - 1) * self.hop + self.n_fft;
         let (mut y, mut env) = (vec![0f32; total], vec![0f32; total]);
         for (t, row) in rows.chunks(self.n_fft).enumerate() {
@@ -321,12 +314,33 @@ pub fn pulse_train(f: &[f32]) -> Vec<f32> {
 /// Slow irregular pulses where the pitch track is unvoiced: creaky voice. The irregularity is white
 /// noise brick-walled at 25 Hz and scaled to 300 cents rms.
 pub fn creak_train(f: &[f32], rate: f32, noise: Vec<f32>) -> Vec<f32> {
-    use rustfft::{num_complex::Complex, FftPlanner};
     let len = f.len();
+    let keep = (25.0 * len as f64 / SR as f64) as usize + 1;
+    let x = if len % 2 == 0 {
+        brickwall_real(&noise, keep)
+    } else {
+        brickwall_complex(noise, keep)
+    };
+    let rms = (x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / len as f64).sqrt() as f32;
+    let fc: Vec<f32> = x
+        .iter()
+        .map(|v| rate * (v * 300.0 / (rms + 1e-9) / 1200.0).exp2())
+        .collect();
+    pulses(&fc, |i| f[i] <= VOICED_HZ)
+}
+
+/// `exp(min(z, 8) - 3) / scale`, the renderer's gain.
+fn gain(z: f32, scale: f32) -> f32 {
+    tts_nn::cpu::exp(z.min(8.0) - 3.0) / scale
+}
+
+/// Real noise brick-walled to its first `keep` bins: the full complex FFT and back.
+fn brickwall_complex(noise: Vec<f32>, keep: usize) -> Vec<f32> {
+    use rustfft::{num_complex::Complex, FftPlanner};
+    let len = noise.len();
     let mut buf: Vec<Complex<f32>> = noise.into_iter().map(|v| Complex::new(v, 0.0)).collect();
     let mut planner = FftPlanner::<f32>::new();
     planner.plan_fft_forward(len).process(&mut buf);
-    let keep = (25.0 * len as f64 / SR as f64) as usize + 1;
     // One-sided cut, mirrored, so the inverse stays real as irfft's does.
     for (k, v) in buf.iter_mut().enumerate() {
         if k != 0 && k.min(len - k) >= keep {
@@ -334,13 +348,45 @@ pub fn creak_train(f: &[f32], rate: f32, noise: Vec<f32>) -> Vec<f32> {
         }
     }
     planner.plan_fft_inverse(len).process(&mut buf);
-    let x: Vec<f32> = buf.iter().map(|c| c.re / len as f32).collect();
-    let rms = (x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / len as f64).sqrt() as f32;
-    let fc: Vec<f32> = x
-        .iter()
-        .map(|v| rate * (v * 300.0 / (rms + 1e-9) / 1200.0).exp2())
+    buf.iter().map(|c| c.re / len as f32).collect()
+}
+
+/// The same for even lengths through a half-length complex FFT each way (even samples real, odd
+/// imaginary): half the work of [`brickwall_complex`], which was a fifth of the decoder's CPU time.
+fn brickwall_real(noise: &[f32], keep: usize) -> Vec<f32> {
+    use rustfft::{num_complex::Complex, FftPlanner};
+    let len = noise.len();
+    let n = len / 2;
+    let mut planner = FftPlanner::<f32>::new();
+    let mut z: Vec<Complex<f32>> = noise
+        .chunks_exact(2)
+        .map(|p| Complex::new(p[0], p[1]))
         .collect();
-    pulses(&fc, |i| f[i] <= VOICED_HZ)
+    planner.plan_fft_forward(n).process(&mut z);
+    let tw = |k: usize, sign: f64| {
+        let a = sign * 2.0 * std::f64::consts::PI * k as f64 / len as f64;
+        Complex::new(a.cos() as f32, a.sin() as f32)
+    };
+    // X[k] = E + W^k O for k < keep, zero above (X[n] at Nyquist is never kept).
+    let kept = keep.min(n);
+    let mut spec = vec![Complex::new(0.0f32, 0.0); n + 1];
+    for k in 0..kept {
+        let (zk, zc) = (z[k % n], z[(n - k) % n].conj());
+        let e = (zk + zc) * 0.5;
+        let o = (zk - zc) * Complex::new(0.0, -0.5);
+        spec[k] = e + tw(k, -1.0) * o;
+    }
+    // Back: Z[k] = (X[k] + X*[n-k]) + i (X[k] - X*[n-k]) W^-k, and z's real and imaginary parts are the
+    // even and odd samples.
+    for (k, out) in z.iter_mut().enumerate() {
+        let (xk, xc) = (spec[k], spec[n - k].conj());
+        *out = (xk + xc) + Complex::new(0.0, 1.0) * (xk - xc) * tw(k, 1.0);
+    }
+    planner.plan_fft_inverse(n).process(&mut z);
+    let scale = 1.0 / len as f32;
+    z.iter()
+        .flat_map(|c| [c.re * scale, c.im * scale])
+        .collect()
 }
 
 /// The audio and the two network outputs the gate compares: the mapper's features `[1, 2T, 512]` and
@@ -412,6 +458,56 @@ impl Nano {
         self.creak
     }
 
+    /// The head applied on the host: gains and rotations straight into the `[re | im]` rows the inverse
+    /// STFTs multiply, where the tensor form is a dozen whole-spectrum passes and a concatenation.
+    fn tail_host(&self, h: &Tensor, spec: [&Tensor; 4], len: usize) -> Result<Vec<f32>> {
+        let host = |t: &Tensor| -> Result<Vec<f32>> { Ok(t.flatten_all()?.to_vec1()?) };
+        let (hv, hr, hi, nr, ni) = (
+            host(h)?,
+            host(spec[0])?,
+            host(spec[1])?,
+            host(spec[2])?,
+            host(spec[3])?,
+        );
+        let (b, nb, sub) = (self.stft.bins, self.nstft.bins, self.sub);
+        let (t, width) = (h.dim(0)?, h.dim(1)?);
+        let dev = h.device();
+
+        let mut rows = vec![0f32; t * 2 * b];
+        for i in 0..t {
+            let hrow = &hv[i * width..];
+            let out = &mut rows[i * 2 * b..(i + 1) * 2 * b];
+            for k in 0..b {
+                let g = gain(hrow[k], self.h_scale);
+                let (sn, c) = hrow[b + k].sin_cos();
+                let (r, m) = (hr[i * b + k], hi[i * b + k]);
+                out[k] = (r * c - m * sn) * g;
+                out[b + k] = (r * sn + m * c) * g;
+            }
+        }
+        let harmonic = self
+            .stft
+            .inverse_rows(&Tensor::from_vec(rows, (t, 2 * b), dev)?, len)?;
+
+        // Noise gains are `sub` frames per network frame, sub-frame major; frame f reads sub-frame f + sub / 2.
+        let frames = nr.len() / nb;
+        let mut rows = vec![0f32; frames * 2 * nb];
+        for f in 0..frames {
+            let r = f + sub / 2;
+            let hrow = &hv[(r / sub) * width + 2 * b + (r % sub) * nb..];
+            let out = &mut rows[f * 2 * nb..(f + 1) * 2 * nb];
+            for j in 0..nb {
+                let g = gain(hrow[j], self.n_scale);
+                out[j] = nr[f * nb + j] * g;
+                out[nb + j] = ni[f * nb + j] * g;
+            }
+        }
+        let noise = self
+            .nstft
+            .inverse_rows(&Tensor::from_vec(rows, (frames, 2 * nb), dev)?, len)?;
+        Ok(harmonic.iter().zip(&noise).map(|(a, b)| a + b).collect())
+    }
+
     pub fn render(
         &self,
         asr: &Tensor,
@@ -440,30 +536,49 @@ impl Nano {
         let a = asr.transpose(1, 2)?.contiguous()?;
         let idx = Tensor::from_vec(nearest(a.dim(1)?, m), m, dev)?;
         let x = Tensor::cat(&[&a.index_select(&idx, 1)?, &pros], 2)?;
-        let mapped = self
-            .mapper
-            .apply(&x, s)?
-            .broadcast_mul(&self.std)?
-            .broadcast_add(&self.mean)?;
-
-        // Metal runs ahead asynchronously, so the signals below overlap the mapper.
-        let f = upsample(&f0, len);
-        let pulse = pulse_train(&f);
-        let noise: Vec<f32> = draws.randn(len).into_iter().map(|v| v * 0.1).collect();
-        let creak = (self.creak > 0.0).then(|| creak_train(&f, self.creak, draws.randn(len)));
-
-        let (hr, hi) = self.stft.forward(&pulse, dev)?;
-        let (nr, ni) = self.nstft.forward(&noise, dev)?;
-        let t = hr.dim(0)?;
-        let logmag =
-            ((((hr.sqr()? + hi.sqr()?)? + 1e-4)?.log()? * 0.5)? - (self.h_scale as f64).ln())?;
-        let (hr, hi) = match &creak {
-            Some(c) => {
-                let (cr, ci) = self.stft.forward(c, dev)?;
-                ((hr + cr)?, (hi + ci)?)
-            }
-            None => (hr, hi),
+        let mapper = || -> Result<Tensor> {
+            Ok(self
+                .mapper
+                .apply(&x, s)?
+                .broadcast_mul(&self.std)?
+                .broadcast_add(&self.mean)?)
         };
+        // Everything else the renderer reads, none of it from the mapper.
+        let signals = |draws: &mut (dyn Draws + Send)| -> Result<[Tensor; 5]> {
+            let f = upsample(&f0, len);
+            let pulse = pulse_train(&f);
+            let noise: Vec<f32> = draws.randn(len).into_iter().map(|v| v * 0.1).collect();
+            let creak = (self.creak > 0.0).then(|| creak_train(&f, self.creak, draws.randn(len)));
+            let (hr, hi) = self.stft.forward(&pulse, dev)?;
+            let (nr, ni) = self.nstft.forward(&noise, dev)?;
+            let logmag =
+                ((((hr.sqr()? + hi.sqr()?)? + 1e-4)?.log()? * 0.5)? - (self.h_scale as f64).ln())?;
+            let (hr, hi) = match &creak {
+                Some(c) => {
+                    let (cr, ci) = self.stft.forward(c, dev)?;
+                    ((hr + cr)?, (hi + ci)?)
+                }
+                None => (hr, hi),
+            };
+            Ok([hr, hi, nr, ni, logmag])
+        };
+        // With CPU threads to spare the two run side by side. Metal runs ahead asynchronously, so there the
+        // signals already overlap the mapper; one thread keeps them in order.
+        let (mapped, [hr, hi, nr, ni, logmag]) =
+            if dev.is_cpu() && candle_core::utils::get_num_threads() > 1 {
+                std::thread::scope(|sc| -> Result<_> {
+                    let side = sc.spawn(|| signals(draws));
+                    let mapped = mapper()?;
+                    let sig = side
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("nano signal thread panicked"))??;
+                    Ok((mapped, sig))
+                })?
+            } else {
+                let mapped = mapper()?;
+                (mapped, signals(draws)?)
+            };
+        let t = hr.dim(0)?;
 
         // Renderer at 160 frames/s: features nearest, prosody linear (torch's index conventions).
         let feat = mapped.index_select(&Tensor::from_vec(nearest(m, t), t, dev)?, 1)?;
@@ -478,6 +593,14 @@ impl Nano {
         let x = Tensor::cat(&[&feat, &lin, &(logmag.unsqueeze(0)? / 4.0)?], 2)?;
         let head = self.renderer.apply(&x, s)?;
         let h = head.squeeze(0)?; // [t, 2 * bins + sub * nbins]
+        if dev.is_cpu() {
+            let audio = self.tail_host(&h, [&hr, &hi, &nr, &ni], len)?;
+            return Ok(Rendered {
+                audio,
+                mapper: mapped,
+                head,
+            });
+        }
 
         let b = self.stft.bins;
         let gain = |z: Tensor, scale: f32| -> Result<Tensor> {
@@ -525,6 +648,31 @@ mod tests {
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
             assert!(err < 1e-4, "{n}/{h}: {err}");
+        }
+    }
+
+    #[test]
+    fn real_brickwall_matches_complex() {
+        let mut state = 9u64;
+        for len in [300 * 37, 300 * 401, 600] {
+            let noise: Vec<f32> = (0..len)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+                })
+                .collect();
+            let keep = (25.0 * len as f64 / SR as f64) as usize + 1;
+            let a = brickwall_real(&noise, keep);
+            let b = brickwall_complex(noise, keep);
+            let peak = b.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let err = a
+                .iter()
+                .zip(&b)
+                .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+            assert!(
+                err < 1e-5 * peak.max(1e-3),
+                "{len}: {err} against peak {peak}"
+            );
         }
     }
 

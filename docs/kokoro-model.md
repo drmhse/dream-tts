@@ -172,30 +172,41 @@ between the two devices, and nano's pulse phase integrates its F0.
 
 ### The CPU path (Mac, iPhone, iPad)
 
-On the CPU, candle's own `gemm` crate was 70% of a one-thread render. `tts-nn` now turns on candle's
-`accelerate` feature for every Apple target, so CPU matmuls go to Accelerate's sgemm; the iOS app already
-links the framework. With that, the nano decoder's time was scalar libm `erff` in its GELU (54% of the
-trunk) and the depthwise conv composed as 14 broadcast ops (29%), and ALBERT's softmax was a scalar `expf`
-per score (8% of the render). `tts_nn::cpu` has one-pass kernels for those three; `kokoro-validate` passes
-(F0_proj 1.85e-3 against its 2e-3 tolerance, nano audio 54.9 dB).
+On the CPU, candle's own `gemm` crate was 70% of a one-thread render. `tts-nn` turns on candle's
+`accelerate` feature for every Apple target, so CPU matmuls go to Accelerate's sgemm (the iOS app already
+links the framework). What was left was scalar libm calls and allocating broadcasts, now one-pass kernels
+in `tts_nn::cpu` and `fused`:
 
-`dream-tts speak --engine kokoro --set decoder=nano`, CPU-only build, five texts (55.4 s of audio), three
-rounds, old and new binaries alternated under the same heavy background load (load average 33-80):
+- nano: GELU (libm `erff`, half the trunk), the depthwise conv (14 broadcast ops), norm + voice gain and
+  bias (8 ops), the scaled residual, and the renderer's head applied on the host straight into the
+  inverse STFTs' rows. The creak's brick-wall uses a half-length complex FFT each way (real input).
+- Text side: ALBERT's softmax (a scalar `expf` per score), and the LSTM gate op, which was a quarter of
+  the render on libm's scalar `exp`/`tanh` and now evaluates them in double precision through a
+  vectorisable `exp64`, rounded once (within 0.5 ulp).
+- With more than one CPU thread, the nano mapper runs beside its signal preparation and each BiLSTM's
+  two directions run side by side. `RAYON_NUM_THREADS=1` keeps everything serial; the gate reads the
+  same either way.
 
-| | 1 thread RTF | all cores RTF |
-|---|---:|---:|
-| before | 0.294 | 0.301 |
-| after | 0.066 | 0.062 |
+`dream-tts speak --engine kokoro --set decoder=nano`, CPU-only build, five texts (55.4 s of audio), text
+in and audio out, quiet M4, three rounds; PyTorch is the released `nano_edge_tts.py` through `KPipeline`
+on the same texts, measured between two Rust runs that agree:
 
-4.5x on one thread (`RAYON_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1`). The absolute numbers are the load's;
-the same baseline read 0.067 on a quiet machine.
+| | 1 thread RTF | all cores RTF | peak memory |
+|---|---:|---:|---:|
+| before | 0.0664 | 0.0404 | 359 MB |
+| after | **0.0115-0.0121** | **0.0105** | 338 MB |
+| PyTorch | 0.0135 | 0.0128 | 1,267 MB |
+
+Kokoro's own decoder on the same build, one thread: 0.735 -> 0.136 (PyTorch 0.144).
 
 What did not help:
 
-- A whole-sequence CPU `lstm_seq` (hand-vectorised recurrent dot products): no faster in cycles than
-  Accelerate's per-step sgemv, 30% more instructions. Removed.
-- A Cephes `tanh` (1.1 ulp) for ALBERT's tanh-GELU: F0_proj went to 2.14e-3, over tolerance, and candle's
-  Accelerate build already runs that GELU on vForce. The fast `exp` stays only in the softmax.
+- A whole-sequence CPU `lstm_seq` with hand-vectorised recurrent dot products: no faster in cycles than
+  Accelerate's per-step sgemv. Removed.
+- Cephes `tanh` in f32 (1.1 ulp): in ALBERT's tanh-GELU it moved F0_proj to 2.14e-3, in the LSTM gates
+  to 2.01e-3, both over the 2e-3 tolerance. candle's Accelerate build already runs that GELU on vForce.
+- Slicing the LSTM gate rows up front to drop bounds checks: no faster, and summing the two gate inputs
+  in f64 instead of f32 moved F0_proj to 2.08e-3.
 
 ## What is not done
 
