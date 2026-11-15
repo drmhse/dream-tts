@@ -768,15 +768,36 @@ mod tests {
         assert!(s <= 0.5001, "sigmoid64: {s:.4} ulp");
     }
 
+    /// Against double precision, on fixed scores: candle's own f32 softmax rounds differently
+    /// (its sums run in another order), and an unseeded comparison with it failed one draw in a few.
     #[test]
-    fn softmax_matches_candle() {
-        let dev = Device::Cpu;
-        let x = Tensor::randn(0f32, 4.0, (3, 37, 151), &dev).unwrap();
-        let d = max_diff(
-            &softmax_last_dim(&x).unwrap(),
-            &candle_nn::ops::softmax_last_dim(&x).unwrap(),
-        );
-        assert!(d < 1e-6, "softmax {d}");
+    fn softmax_is_accurate() {
+        let (rows, n) = (111, 151);
+        let mut state = 3u64;
+        let x: Vec<f32> = (0..rows * n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * 12.0
+            })
+            .collect();
+        let got = softmax_last_dim(&Tensor::from_slice(&x, (rows, n), &Device::Cpu).unwrap())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let mut worst = 0f64;
+        for (row, out) in x.chunks(n).zip(got.chunks(n)) {
+            let m = row.iter().fold(f64::MIN, |a, &v| a.max(v as f64));
+            let e: Vec<f64> = row.iter().map(|&v| (v as f64 - m).exp()).collect();
+            let s: f64 = e.iter().sum();
+            for (&o, &ev) in out.iter().zip(&e) {
+                worst = worst.max((o as f64 - ev / s).abs());
+            }
+        }
+        assert!(worst < 5e-7, "softmax {worst:.3e}");
     }
 
     #[test]
