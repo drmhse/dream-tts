@@ -30,6 +30,7 @@
 #![cfg_attr(not(feature = "metal"), allow(dead_code, unused_imports))]
 
 pub mod attn;
+pub mod cpu;
 pub mod fused;
 pub mod im2col;
 #[cfg(feature = "metal")]
@@ -1123,7 +1124,7 @@ pub fn gelu_tanh(x: &Tensor) -> Result<Tensor> {
 
 /// Exact GELU (erf) — torch's default `nn.GELU()`.
 pub fn gelu_exact(x: &Tensor) -> Result<Tensor> {
-    Ok(x.gelu_erf()?)
+    Ok(cpu::gelu_erf(x)?)
 }
 
 /// SwiGLU feed-forward: `w2(silu(w1 x) * w3 x)`. Weights are `[out, in]`.

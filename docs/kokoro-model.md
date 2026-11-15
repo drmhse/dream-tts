@@ -170,6 +170,33 @@ With nano the text side is half the Metal time and two thirds of the CPU time. M
 same text reads 33.5 dB for nano and 41.6 dB for Kokoro's decoder: the text side differs slightly
 between the two devices, and nano's pulse phase integrates its F0.
 
+### The CPU path (Mac, iPhone, iPad)
+
+On the CPU, candle's own `gemm` crate was 70% of a one-thread render. `tts-nn` now turns on candle's
+`accelerate` feature for every Apple target, so CPU matmuls go to Accelerate's sgemm; the iOS app already
+links the framework. With that, the nano decoder's time was scalar libm `erff` in its GELU (54% of the
+trunk) and the depthwise conv composed as 14 broadcast ops (29%), and ALBERT's softmax was a scalar `expf`
+per score (8% of the render). `tts_nn::cpu` has one-pass kernels for those three; `kokoro-validate` passes
+(F0_proj 1.85e-3 against its 2e-3 tolerance, nano audio 54.9 dB).
+
+`dream-tts speak --engine kokoro --set decoder=nano`, CPU-only build, five texts (55.4 s of audio), three
+rounds, old and new binaries alternated under the same heavy background load (load average 33-80):
+
+| | 1 thread RTF | all cores RTF |
+|---|---:|---:|
+| before | 0.294 | 0.301 |
+| after | 0.066 | 0.062 |
+
+4.5x on one thread (`RAYON_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1`). The absolute numbers are the load's;
+the same baseline read 0.067 on a quiet machine.
+
+What did not help:
+
+- A whole-sequence CPU `lstm_seq` (hand-vectorised recurrent dot products): no faster in cycles than
+  Accelerate's per-step sgemv, 30% more instructions. Removed.
+- A Cephes `tanh` (1.1 ulp) for ALBERT's tanh-GELU: F0_proj went to 2.14e-3, over tolerance, and candle's
+  Accelerate build already runs that GELU on vForce. The fast `exp` stays only in the softmax.
+
 ## What is not done
 
 - The `Engine` trait and the registry: this is a library and two binaries, not yet an

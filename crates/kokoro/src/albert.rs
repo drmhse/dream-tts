@@ -163,7 +163,7 @@ impl Albert {
                 .contiguous()?;
             let (q, k, v) = (qkv.get(0)?, qkv.get(1)?, qkv.get(2)?);
             let scores = q.matmul(&k.t()?)?;
-            let ctx = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?;
+            let ctx = tts_nn::cpu::softmax_last_dim(&scores)?.matmul(&v)?;
             let ctx = ctx
                 .transpose(0, 1)?
                 .reshape((1, t, self.heads * self.head_dim))?

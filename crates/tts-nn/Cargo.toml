@@ -21,6 +21,12 @@ objc2-metal = "0.3.2"
 objc2-metal-performance-shaders = { version = "0.3.2", features = ["MPSCore", "MPSCoreTypes"] }
 objc2-metal-performance-shaders-graph = { version = "0.3.2", features = ["MPSGraph", "MPSGraphCore", "MPSGraphTensor", "MPSGraphTensorData", "MPSGraphOperation", "MPSGraphConvolutionOps", "MPSGraphArithmeticOps", "MPSGraphReductionOps", "MPSGraphTensorShapeOps", "MPSGraphMemoryOps", "MPSGraphDevice", "MPSGraphExecutable", "objc2-metal-performance-shaders"] }
 
+# Accelerate's sgemm for every CPU matmul on Apple hardware (Mac, iPhone, iPad): candle's own
+# `gemm` crate was 70% of a one-thread Kokoro render and 4x slower end to end.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+candle-core = { workspace = true, features = ["accelerate"] }
+candle-nn = { workspace = true, features = ["accelerate"] }
+
 [features]
 default = ["metal"]
 metal = ["candle-core/metal", "candle-nn/metal"]

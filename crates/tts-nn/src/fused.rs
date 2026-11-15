@@ -2106,11 +2106,17 @@ mod tests {
     /// still passed, because the fixtures are 52 timesteps and saturate the gates.
     #[test]
     fn lstm_gates_is_accurate_to_double_precision() -> anyhow::Result<()> {
+        lstm_gates_against_f64(&candle_core::Device::Cpu)?;
         #[cfg(feature = "metal")]
         let _gpu = crate::gpu_guard();
-        let Some(d) = crate::usable_metal() else {
-            return Ok(());
-        };
+        match crate::usable_metal() {
+            Some(d) => lstm_gates_against_f64(&d),
+            None => Ok(()),
+        }
+    }
+
+    fn lstm_gates_against_f64(d: &candle_core::Device) -> anyhow::Result<()> {
+        let d = d.clone();
         // A sweep, not noise: the gates have to be checked where they are neither
         // saturated nor centred, which is where a fast transcendental costs the most.
         let h = 256usize;

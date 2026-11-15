@@ -62,8 +62,8 @@ fn film(fc: &Linear, s: &Tensor, dim: usize) -> Result<(Tensor, Tensor)> {
     Ok(((gb.narrow(2, 0, dim)? + 1.0)?, gb.narrow(2, dim, dim)?))
 }
 
-/// ConvNeXt block. The depthwise conv is k shifted multiply-adds: candle runs a grouped conv as one
-/// conv per group, 128 dispatches where this is 14.
+/// ConvNeXt block. The depthwise conv is k shifted multiply-adds (candle runs a grouped conv as one
+/// conv per group): one pass on the CPU, 14 dispatches on Metal.
 struct Block {
     taps: Tensor,
     dw_bias: Tensor,
@@ -95,18 +95,7 @@ impl Block {
     }
 
     fn apply(&self, x: &Tensor, s: &Tensor) -> Result<Tensor> {
-        let t = x.dim(1)?;
-        let p = self.k / 2;
-        let padded = x.pad_with_zeros(1, p, p)?;
-        let mut h = self
-            .dw_bias
-            .reshape((1, 1, self.dim))?
-            .broadcast_as(x.shape())?
-            .contiguous()?;
-        for j in 0..self.k {
-            let tap = self.taps.narrow(0, j, 1)?.unsqueeze(0)?;
-            h = (h + padded.narrow(1, j, t)?.broadcast_mul(&tap)?)?;
-        }
+        let h = tts_nn::cpu::depthwise_tc(x, &self.taps, &self.dw_bias)?;
         let h = if self.instance {
             let mean = h.mean_keepdim(1)?;
             let c = h.broadcast_sub(&mean)?;
@@ -116,7 +105,7 @@ impl Block {
         };
         let (g, b) = film(&self.fc, s, self.dim)?;
         let h = h.broadcast_mul(&g)?.broadcast_add(&b)?;
-        let h = self.down.apply(&self.up.apply(&h)?.gelu_erf()?)?;
+        let h = self.down.apply(&tts_nn::gelu_exact(&self.up.apply(&h)?)?)?;
         Ok((x + h.broadcast_mul(&self.scale.reshape((1, 1, self.dim))?)?)?)
     }
 }
@@ -492,7 +481,7 @@ impl Nano {
 
         let b = self.stft.bins;
         let gain = |z: Tensor, scale: f32| -> Result<Tensor> {
-            Ok(((z.clamp(f32::MIN, 8f32)? - 3.0)?.exp()? / scale as f64)?)
+            Ok(((z.minimum(8f32)? - 3.0)?.exp()? / scale as f64)?)
         };
         let gh = gain(h.narrow(1, 0, b)?, self.h_scale)?;
         let rot = h.narrow(1, b, b)?;
