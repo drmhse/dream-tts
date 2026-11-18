@@ -90,6 +90,8 @@ fn download(url: &str, to: &Path) -> Result<()> {
             "--silent",
             "--show-error",
             "--location",
+            // Some servers gzip whether asked or not; this asks, and unpacks either way.
+            "--compressed",
             "--max-time",
             "60",
         ])
@@ -895,6 +897,46 @@ fn unsuffixed(title: &str, site: Option<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn a_page_gzipped_unasked_is_unpacked() {
+        use std::io::{Read, Write};
+        let html = b"<html><body><p>Plain words.</p></body></html>";
+        let mut gzip = Command::new("gzip")
+            .arg("-c")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        gzip.stdin.take().unwrap().write_all(html).unwrap();
+        let packed = gzip.wait_with_output().unwrap().stdout;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/",
+            listener.local_addr().unwrap().port()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                head.push(byte[0]);
+            }
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Encoding: gzip\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                packed.len()
+            );
+            stream.write_all(reply.as_bytes()).unwrap();
+            stream.write_all(&packed).unwrap();
+        });
+        let to = std::env::temp_dir().join(format!("web-gzip-{}.html", std::process::id()));
+        download(&url, &to).unwrap();
+        server.join().unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), html);
+        std::fs::remove_file(&to).ok();
+    }
 
     #[test]
     fn the_article_is_kept_and_the_furniture_goes() {
