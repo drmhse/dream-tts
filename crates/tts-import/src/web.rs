@@ -18,22 +18,211 @@ pub fn is_url(text: &str) -> bool {
     (t.starts_with("https://") || t.starts_with("http://")) && !t.contains(char::is_whitespace)
 }
 
-/// The page saved as a file the importers read, and its title.
-pub fn fetch(url: &str) -> Result<(PathBuf, String)> {
+/// What a link gave.
+pub enum Fetched {
+    /// A web page as its article: the saved page, its title, and the picture it previews with.
+    Page {
+        path: PathBuf,
+        title: String,
+        picture: Option<Vec<u8>>,
+    },
+    /// A document the link downloads, and the name to shelve it by.
+    File { path: PathBuf, name: String },
+}
+
+/// The link's page saved as a file the importers read, or the document it downloads.
+pub fn fetch(url: &str) -> Result<Fetched> {
     anyhow::ensure!(is_url(url), "{url} is not a web address");
     use std::hash::{Hash, Hasher};
+    let url = url.trim();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    url.trim().hash(&mut hasher);
+    url.hash(&mut hasher);
+    let key = format!("{:016x}", hasher.finish());
     let dir = crate::convert::cache_root().join("web");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let raw = dir.join(format!("{:016x}.raw.html", hasher.finish()));
-    let out = dir.join(format!("{:016x}.html", hasher.finish()));
+    let raw = dir.join(format!("{key}.raw"));
 
-    download(url.trim(), &raw)?;
-    let (page, title) = page(url.trim(), &std::fs::read(&raw)?)?;
-    std::fs::write(&out, page).with_context(|| format!("writing {}", out.display()))?;
+    download(url, &raw)?;
+    if let Some(name) = document(url, &raw)? {
+        let path = dir.join(format!("{key}-{name}"));
+        std::fs::rename(&raw, &path).with_context(|| format!("keeping {}", path.display()))?;
+        return Ok(Fetched::File { path, name });
+    }
+    let bytes = std::fs::read(&raw)?;
     let _ = std::fs::remove_file(&raw);
-    Ok((out, title))
+    let (page, title) = page(url, &bytes)?;
+    let out = dir.join(format!("{key}.html"));
+    std::fs::write(&out, page).with_context(|| format!("writing {}", out.display()))?;
+    let picture = picture(url, &crate::text::decode(&bytes))
+        .and_then(|address| image(&address, &dir.join(format!("{key}.picture"))));
+    Ok(Fetched::Page {
+        path: out,
+        title,
+        picture,
+    })
+}
+
+/// The name to shelve a download by, when the link gave a document rather than a page.
+fn document(url: &str, raw: &Path) -> Result<Option<String>> {
+    use crate::Format;
+    let name = file_name(url);
+    let named = Format::of(Path::new(&name));
+    let stem = || {
+        Path::new(&name)
+            .file_stem()
+            .map_or_else(|| name.clone(), |s| s.to_string_lossy().into_owned())
+    };
+    Ok(match crate::sniff::format(raw) {
+        Some(Format::Html) => None,
+        Some(format) if named == Some(format) => Some(name),
+        Some(format) => Some(format!("{}.{}", stem(), extension(format, raw))),
+        // Plain text has no signature; its address says what it is.
+        None if matches!(
+            named,
+            Some(Format::Text | Format::Markdown | Format::Pandoc)
+        ) =>
+        {
+            Some(name)
+        }
+        None if binary(raw) => anyhow::bail!("{url} downloads a file the reader does not open"),
+        None => None,
+    })
+}
+
+/// The last part of the link's path, as a file name; `download` when the path names none.
+fn file_name(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let path = rest.split(['?', '#']).next().unwrap_or_default();
+    let last = path
+        .split_once('/')
+        .map_or("", |(_, p)| p.rsplit('/').next().unwrap_or_default());
+    let name = unescape(last).replace(['/', '\\', ':'], "-");
+    let name = name.trim().trim_start_matches('.');
+    if name.is_empty() {
+        "download".into()
+    } else {
+        name.into()
+    }
+}
+
+/// `%20` and the like, as the characters they stand for.
+fn unescape(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(b)) => {
+                out.push(b);
+                i += 3;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn extension(format: crate::Format, path: &Path) -> &'static str {
+    use crate::Format::*;
+    match format {
+        Markdown => "md",
+        Text | Pandoc => "txt",
+        Html => "html",
+        Docx => "docx",
+        Odt => "odt",
+        Epub => "epub",
+        Pdf => "pdf",
+        Rtf => "rtf",
+        Doc => "doc",
+        Rtfd => "rtfd",
+        WebArchive => "webarchive",
+        Fb2 => "fb2",
+        Ebook => "mobi",
+        Presentation => "pptx",
+        IWork => "pages",
+        Image => {
+            let head = std::fs::read(path).unwrap_or_default();
+            picture_type(&head).map_or("jpg", |(ext, _)| ext)
+        }
+    }
+}
+
+/// A NUL near the start: bytes, not text.
+fn binary(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 1024];
+    let n = std::fs::File::open(path)
+        .and_then(|mut f| f.read(&mut head))
+        .unwrap_or(0);
+    head[..n].contains(&0)
+}
+
+/// The picture a page names for its previews, as an address.
+fn picture(url: &str, html: &str) -> Option<String> {
+    let doc = Document::from(html);
+    let named = ["og:image", "og:image:url", "twitter:image"]
+        .iter()
+        .find_map(|name| {
+            doc.select(&format!("meta[property=\"{name}\"], meta[name=\"{name}\"]"))
+                .attr("content")
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+        })?;
+    resolve(url, &named)
+}
+
+/// An address on a page, made whole against the page's own.
+fn resolve(page: &str, href: &str) -> Option<String> {
+    if is_url(href) {
+        return Some(href.to_string());
+    }
+    let (scheme, rest) = page.split_once("://")?;
+    let origin_end = rest.find('/').unwrap_or(rest.len());
+    let origin = format!("{scheme}://{}", &rest[..origin_end]);
+    if let Some(other) = href.strip_prefix("//") {
+        return Some(format!("{scheme}://{other}"));
+    }
+    if href.starts_with('/') {
+        return Some(format!("{origin}{href}"));
+    }
+    if href.contains(':') || href.contains(char::is_whitespace) {
+        return None;
+    }
+    let path = rest[origin_end..].split(['?', '#']).next().unwrap_or("/");
+    let folder = path.rsplit_once('/').map_or("", |(f, _)| f);
+    Some(format!("{origin}{folder}/{href}"))
+}
+
+/// A picture's kind, by its signature: its extension and media type.
+pub fn picture_type(head: &[u8]) -> Option<(&'static str, &'static str)> {
+    if head.starts_with(b"\x89PNG") {
+        Some(("png", "image/png"))
+    } else if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some(("jpg", "image/jpeg"))
+    } else if head.starts_with(b"GIF8") {
+        Some(("gif", "image/gif"))
+    } else if head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WEBP") {
+        Some(("webp", "image/webp"))
+    } else {
+        None
+    }
+}
+
+/// The picture at an address, when it is one a shelf can show and not outsized.
+fn image(address: &str, to: &Path) -> Option<Vec<u8>> {
+    const LARGEST: usize = 8 << 20;
+    let fetched = download(address, to)
+        .ok()
+        .and_then(|_| std::fs::read(to).ok());
+    let _ = std::fs::remove_file(to);
+    fetched.filter(|b| b.len() <= LARGEST && picture_type(b).is_some())
 }
 
 /// A fetched page's bytes as a document of just its article, and its title.
@@ -1066,5 +1255,118 @@ mod tests {
         let html = "<html><body><header>Site</header><p>Only prose.</p></body></html>";
         assert_eq!(article(html).trim(), "<p>Only prose.</p>");
         assert!(is_url("https://example.com/a") && !is_url("book.pdf"));
+    }
+
+    /// A server answering each path it is asked for, `count` times, with that path's bytes.
+    #[cfg(not(target_os = "ios"))]
+    fn serve(routes: Vec<(&'static str, &'static str, Vec<u8>)>, count: usize) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                    head.push(byte[0]);
+                }
+                let line = String::from_utf8_lossy(&head);
+                let asked = line.split(' ').nth(1).unwrap_or("/");
+                let (status, kind, body) = routes
+                    .iter()
+                    .find(|(path, _, _)| *path == asked)
+                    .map_or(("404 Not Found", "text/plain", &b"no"[..]), |(_, k, b)| {
+                        ("200 OK", *k, &b[..])
+                    });
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(reply.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+        base
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn a_link_to_a_document_is_kept_as_that_document() {
+        let pdf = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n1 0 obj\n<<>>\nendobj\n".to_vec();
+        let base = serve(
+            vec![
+                ("/papers/A%20Remark.pdf", "application/pdf", pdf.clone()),
+                ("/get?id=7", "application/octet-stream", pdf.clone()),
+                (
+                    "/notes/read.md",
+                    "text/plain",
+                    b"# Notes\n\nWords.".to_vec(),
+                ),
+                ("/blob", "application/octet-stream", vec![0, 1, 2, 3, 0, 9]),
+            ],
+            4,
+        );
+        let kept = |path: &str| match fetch(&format!("{base}{path}")) {
+            Ok(Fetched::File { path, name }) => Ok((name, std::fs::read(&path).unwrap())),
+            Ok(Fetched::Page { .. }) => Err("read as a web page".to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        assert_eq!(
+            kept("/papers/A%20Remark.pdf"),
+            Ok(("A Remark.pdf".into(), pdf.clone()))
+        );
+        assert_eq!(kept("/get?id=7"), Ok(("get.pdf".into(), pdf)));
+        assert_eq!(kept("/notes/read.md").map(|k| k.0), Ok("read.md".into()));
+        assert!(kept("/blob").unwrap_err().contains("does not open"));
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn a_page_brings_the_picture_it_previews_with() {
+        let png = b"\x89PNG\r\n\x1a\n0000IHDR".to_vec();
+        let html = br#"<!doctype html><html><head><title>Story</title>
+<meta property="og:image" content="/media/lead.png"></head>
+<body><article><p>Words worth reading.</p></article></body></html>"#;
+        let base = serve(
+            vec![
+                ("/posts/story", "text/html", html.to_vec()),
+                ("/media/lead.png", "image/png", png.clone()),
+            ],
+            2,
+        );
+        match fetch(&format!("{base}/posts/story")).unwrap() {
+            Fetched::Page {
+                title,
+                picture,
+                path,
+            } => {
+                assert_eq!(title, "Story");
+                assert_eq!(picture, Some(png));
+                assert!(std::fs::read_to_string(path)
+                    .unwrap()
+                    .contains("Words worth reading."));
+            }
+            Fetched::File { name, .. } => panic!("kept as a file: {name}"),
+        }
+    }
+
+    #[test]
+    fn a_picture_address_is_made_whole() {
+        let page = "https://example.com/blog/post?id=1";
+        assert_eq!(
+            resolve(page, "/a.png").as_deref(),
+            Some("https://example.com/a.png")
+        );
+        assert_eq!(
+            resolve(page, "//cdn.example.com/a.png").as_deref(),
+            Some("https://cdn.example.com/a.png")
+        );
+        assert_eq!(
+            resolve(page, "a.png").as_deref(),
+            Some("https://example.com/blog/a.png")
+        );
+        assert_eq!(resolve(page, "data:image/png;base64,AA"), None);
     }
 }
