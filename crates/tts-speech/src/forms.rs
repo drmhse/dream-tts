@@ -325,7 +325,7 @@ fn subscripts(text: &str) -> String {
                     format!("{} {digits} ", g(c, 1))
                 }
             });
-            out.push_str(spelled.trim_end());
+            out.push_str(spelled.trim_end_matches(' '));
             continue;
         }
         out.push_str(
@@ -344,7 +344,8 @@ fn subscripts(text: &str) -> String {
                     format!("{} sub {digits} ", g(c, 1))
                 }
             })
-            .trim_end()
+            // Only the space added above: a word can end in the newlines that end a paragraph.
+            .trim_end_matches(' ')
             .replace("  ", " "),
         );
     }

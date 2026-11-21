@@ -216,4 +216,13 @@ mod tests {
         assert_eq!(operators("QPS = ~3500"), "QPS equals ~3500");
         assert_eq!(operators("read/write *emphasis*"), "read/write *emphasis*");
     }
+
+    #[test]
+    fn a_code_block_after_prose_is_not_spoken() {
+        let said = narration(
+            "Intro.\n\n```python\nx = 1\n```\n\nAfter `y`.\n",
+            &tts_narrate::Options::default(),
+        );
+        assert_eq!(said, "Intro.\n\nAfter y.");
+    }
 }
