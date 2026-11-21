@@ -1,6 +1,5 @@
-//! nano-edge-tts: a 1.75M-parameter stand-in for Kokoro's 53M decoder (huggingface.co/drmhse/nano-edge-tts).
-//!
-//! Same inputs, same output length. A mapper (80 frames/s) and a renderer (160 frames/s) set a gain and
+//! The decoder half of nano-edge-tts-standalone (huggingface.co/drmhse/nano-edge-tts-standalone): the
+//! text side's features, F0 and energy in, audio out. A mapper (80 frames/s) and a renderer (160 frames/s) set a gain and
 //! rotation per bin of a pulse train's 25 ms STFT and a gain per bin of white noise's 5 ms STFT; two
 //! inverse STFTs make the audio. Nothing learned runs at audio rate, so the signal work stays on the host
 //! and the device only sees frame-rate matmuls. Everything is time-major `[1, T, C]`, the layout the
@@ -8,10 +7,9 @@
 
 use crate::blocks::Linear;
 use crate::source::{interpolate_linear, Draws};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use candle_core::{Device, Tensor};
 use serde::Deserialize;
-use std::path::Path;
 use tts_nn::Weights;
 
 const SR: f32 = 24_000.0;
@@ -19,29 +17,28 @@ const SR: f32 = 24_000.0;
 const UP: usize = 300;
 const VOICED_HZ: f32 = 10.0;
 const EPS: f64 = 1e-5;
-pub const DIR: &str = "nano";
-const WEIGHTS: &str = "nano-edge-tts.safetensors";
 
 #[derive(Deserialize)]
-struct MapperCfg {
+pub struct MapperCfg {
     dim: usize,
     depth: usize,
     kernel: usize,
 }
 
 #[derive(Deserialize)]
-struct RendererCfg {
+pub struct RendererCfg {
     n_fft: usize,
     hop: usize,
     depth: usize,
     noise_nfft: usize,
     creak: f32,
-}
-
-#[derive(Deserialize)]
-struct Cfg {
-    mapper: MapperCfg,
-    renderer: RendererCfg,
+    /// The creak's harmonics stop here (Hz).
+    creak_hi: f32,
+    /// The harmonic log gain above 2 kHz is averaged over this many bins.
+    harm_fsmooth: usize,
+    /// The post-filter: (alpha, from Hz, bins, frames). Above `from` the noise's log gain is pushed
+    /// away from its mean over `bins` bins by alpha, the push averaged over `frames` noise frames.
+    noise_sharpen: Option<[f32; 4]>,
 }
 
 /// A 1x1 conv as the linear it is, on time-major input.
@@ -211,6 +208,7 @@ impl Stft {
     }
 
     /// (re, im) `[frames, bins]` -> `length` samples, normalised by the summed squared window.
+    #[cfg(test)]
     fn inverse(&self, re: &Tensor, im: &Tensor, length: usize) -> Result<Vec<f32>> {
         self.inverse_rows(&Tensor::cat(&[re, im], 1)?, length)
     }
@@ -270,7 +268,7 @@ fn nearest(from: usize, to: usize) -> Vec<u32> {
 
 /// One pulse per cycle of `f` (Hz per sample) where `on`, zero elsewhere. The phase accumulates in f64
 /// and is stored as f32 per sample, as torch's CPU cumsum does.
-fn pulses(f: &[f32], on: impl Fn(usize) -> bool) -> Vec<f32> {
+fn pulses(f: &[f32], hi: f32, on: impl Fn(usize) -> bool) -> Vec<f32> {
     let mut acc = 0f64;
     f.iter()
         .enumerate()
@@ -280,10 +278,25 @@ fn pulses(f: &[f32], on: impl Fn(usize) -> bool) -> Vec<f32> {
             let phase = acc as f32;
             let theta = 2.0 * std::f32::consts::PI * (phase - phase.floor());
             if on(i) {
-                dirichlet(theta, (SR / 2.0 / fi).floor().clamp(1.0, 240.0)) * 0.1
+                dirichlet(theta, (hi / fi).floor().clamp(1.0, 240.0)) * 0.1
             } else {
                 0.0
             }
+        })
+        .collect()
+}
+
+/// Moving average over `k` neighbours (edges average what exists): `avg_pool1d(count_include_pad=False)`.
+fn pool(x: &[f32], k: usize) -> Vec<f32> {
+    let (n, r) = (x.len(), k / 2);
+    let mut acc = vec![0f64; n + 1];
+    for (i, v) in x.iter().enumerate() {
+        acc[i + 1] = acc[i] + *v as f64;
+    }
+    (0..n)
+        .map(|i| {
+            let (lo, hi) = (i.saturating_sub(r), (i + r + 1).min(n));
+            ((acc[hi] - acc[lo]) / (hi - lo) as f64) as f32
         })
         .collect()
 }
@@ -311,9 +324,10 @@ pub fn pulse_train(f: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// Slow irregular pulses where the pitch track is unvoiced: creaky voice. The irregularity is white
-/// noise brick-walled at 25 Hz and scaled to 300 cents rms.
-pub fn creak_train(f: &[f32], rate: f32, noise: Vec<f32>) -> Vec<f32> {
+/// Slow irregular pulses where the pitch track is unvoiced, harmonics up to `hi` Hz: creaky voice. The
+/// irregularity is white noise brick-walled at 25 Hz and scaled to 300 cents rms. The reference draws
+/// that noise from a fixed torch seed; torch's generator is not reproduced, so a render draws its own.
+pub fn creak_train(f: &[f32], rate: f32, hi: f32, noise: Vec<f32>) -> Vec<f32> {
     let len = f.len();
     let keep = (25.0 * len as f64 / SR as f64) as usize + 1;
     let x = if len % 2 == 0 {
@@ -326,7 +340,7 @@ pub fn creak_train(f: &[f32], rate: f32, noise: Vec<f32>) -> Vec<f32> {
         .iter()
         .map(|v| rate * (v * 300.0 / (rms + 1e-9) / 1200.0).exp2())
         .collect();
-    pulses(&fc, |i| f[i] <= VOICED_HZ)
+    pulses(&fc, hi, |i| f[i] <= VOICED_HZ)
 }
 
 /// `exp(min(z, 8) - 3) / scale`, the renderer's gain.
@@ -407,22 +421,19 @@ pub struct Nano {
     /// Noise gains per network frame.
     sub: usize,
     creak: f32,
+    creak_hi: f32,
+    harm_fsmooth: usize,
+    sharpen: Option<[f32; 4]>,
     h_scale: f32,
     n_scale: f32,
 }
 
 impl Nano {
-    /// From `root/nano/`: `config.json` and the weights, f16 or f32.
-    pub fn load(root: &Path, device: &Device) -> Result<Self> {
-        let dir = root.join(DIR);
-        let cfg: Cfg = serde_json::from_slice(
-            &std::fs::read(dir.join("config.json")).context("nano config")?,
-        )?;
-        let w = Weights::load(dir.join(WEIGHTS).to_str().context("nano path")?, device)?;
-        let r = &cfg.renderer;
-        let mapper = Trunk::load(&w, "mapper", cfg.mapper.depth, true)?;
+    /// The `mapper.*` and `renderer.*` tensors of `w`, f16 or f32.
+    pub fn load(w: &Weights, m: &MapperCfg, r: &RendererCfg, device: &Device) -> Result<Self> {
+        let mapper = Trunk::load(w, "mapper", m.depth, true)?;
         anyhow::ensure!(
-            mapper.dim == cfg.mapper.dim && mapper.blocks[0].k == cfg.mapper.kernel,
+            mapper.dim == m.dim && mapper.blocks[0].k == m.kernel,
             "nano mapper shape"
         );
         let stft = Stft::new(r.n_fft, r.hop, device)?;
@@ -432,30 +443,34 @@ impl Nano {
             mapper,
             mean: w.get("mapper.mean")?,
             std: w.get("mapper.std")?,
-            renderer: Trunk::load(&w, "renderer", r.depth, false)?,
+            renderer: Trunk::load(w, "renderer", r.depth, false)?,
             nstft: Stft::new(r.noise_nfft, r.noise_nfft / 4, device)?,
             sub: r.hop / (r.noise_nfft / 4),
             creak: r.creak,
+            creak_hi: r.creak_hi,
+            harm_fsmooth: r.harm_fsmooth,
+            sharpen: r.noise_sharpen,
             h_scale: 0.05 * wsum,
             n_scale: 0.1 * wsq.sqrt(),
             stft,
         })
     }
 
-    /// Kokoro's decoder call: `asr` `[1, 512, T]`, `f0_curve` and `energy` `[1, 2T]`, `s` `[1, 128]`.
+    /// `feat` `[1, T, 512]` (time-major, 40 frames/s), `f0_curve` and `energy` `[1, 2T]`, `s` `[1, 128]`.
     pub fn forward(
         &self,
-        asr: &Tensor,
+        feat: &Tensor,
         f0_curve: &Tensor,
         energy: &Tensor,
         s: &Tensor,
         draws: &mut (dyn Draws + Send),
     ) -> Result<Vec<f32>> {
-        Ok(self.render(asr, f0_curve, energy, s, draws)?.audio)
+        Ok(self.render(feat, f0_curve, energy, s, draws)?.audio)
     }
 
-    pub fn creak_rate(&self) -> f32 {
-        self.creak
+    /// The creak's rate and its harmonics' ceiling, in Hz.
+    pub fn creak(&self) -> (f32, f32) {
+        (self.creak, self.creak_hi)
     }
 
     /// The head applied on the host: gains and rotations straight into the `[re | im]` rows the inverse
@@ -473,12 +488,19 @@ impl Nano {
         let (t, width) = (h.dim(0)?, h.dim(1)?);
         let dev = h.device();
 
+        // The bin 2 kHz falls in, as the reference's `int(2000 * n_fft / SR)`.
+        let i0 = (2000 * self.stft.n_fft) / SR as usize;
         let mut rows = vec![0f32; t * 2 * b];
         for i in 0..t {
             let hrow = &hv[i * width..];
+            let smooth = (self.harm_fsmooth > 1).then(|| pool(&hrow[i0..b], self.harm_fsmooth));
             let out = &mut rows[i * 2 * b..(i + 1) * 2 * b];
             for k in 0..b {
-                let g = gain(hrow[k], self.h_scale);
+                let z = match &smooth {
+                    Some(s) if k >= i0 => s[k - i0],
+                    _ => hrow[k],
+                };
+                let g = gain(z, self.h_scale);
                 let (sn, c) = hrow[b + k].sin_cos();
                 let (r, m) = (hr[i * b + k], hi[i * b + k]);
                 out[k] = (r * c - m * sn) * g;
@@ -491,15 +513,23 @@ impl Nano {
 
         // Noise gains are `sub` frames per network frame, sub-frame major; frame f reads sub-frame f + sub / 2.
         let frames = nr.len() / nb;
-        let mut rows = vec![0f32; frames * 2 * nb];
+        let mut g = vec![0f32; frames * nb];
         for f in 0..frames {
             let r = f + sub / 2;
             let hrow = &hv[(r / sub) * width + 2 * b + (r % sub) * nb..];
+            for j in 0..nb {
+                g[f * nb + j] = gain(hrow[j], self.n_scale);
+            }
+        }
+        if let Some(sharpen) = self.sharpen {
+            self.sharpen_noise(&mut g, frames, sharpen);
+        }
+        let mut rows = vec![0f32; frames * 2 * nb];
+        for f in 0..frames {
             let out = &mut rows[f * 2 * nb..(f + 1) * 2 * nb];
             for j in 0..nb {
-                let g = gain(hrow[j], self.n_scale);
-                out[j] = nr[f * nb + j] * g;
-                out[nb + j] = ni[f * nb + j] * g;
+                out[j] = nr[f * nb + j] * g[f * nb + j];
+                out[nb + j] = ni[f * nb + j] * g[f * nb + j];
             }
         }
         let noise = self
@@ -508,15 +538,52 @@ impl Nano {
         Ok(harmonic.iter().zip(&noise).map(|(a, b)| a + b).collect())
     }
 
+    /// The post-filter on the noise gains `[frames, nb]`: deeper high-band formants.
+    fn sharpen_noise(&self, g: &mut [f32], frames: usize, [alpha, from, bins, span]: [f32; 4]) {
+        let nb = self.nstft.bins;
+        let lg: Vec<f32> = g.iter().map(|v| (v + 1e-12).ln()).collect();
+        let mut d = vec![0f32; frames * nb];
+        for f in 0..frames {
+            let row = &lg[f * nb..(f + 1) * nb];
+            for (j, m) in pool(row, bins as usize).into_iter().enumerate() {
+                d[f * nb + j] = row[j] - m;
+            }
+        }
+        let first = (0..nb)
+            .find(|&j| j as f32 * SR / self.nstft.n_fft as f32 >= from)
+            .unwrap_or(nb);
+        let mut col = vec![0f32; frames];
+        for j in 0..nb {
+            if j >= first && span as usize > 1 {
+                for f in 0..frames {
+                    col[f] = d[f * nb + j];
+                }
+                col = pool(&col, span as usize);
+            } else if j >= first {
+                for f in 0..frames {
+                    col[f] = d[f * nb + j];
+                }
+            }
+            for f in 0..frames {
+                let push = if j >= first {
+                    (alpha - 1.0) * col[f]
+                } else {
+                    0.0
+                };
+                g[f * nb + j] = (lg[f * nb + j] + push).exp();
+            }
+        }
+    }
+
     pub fn render(
         &self,
-        asr: &Tensor,
+        feat: &Tensor,
         f0_curve: &Tensor,
         energy: &Tensor,
         s: &Tensor,
         draws: &mut (dyn Draws + Send),
     ) -> Result<Rendered> {
-        let dev = asr.device();
+        let dev = feat.device();
         let f0: Vec<f32> = f0_curve.flatten_all()?.to_vec1()?;
         let en: Vec<f32> = energy.flatten_all()?.to_vec1()?;
         let m = f0.len();
@@ -532,8 +599,8 @@ impl Nano {
             .collect();
         let pros = Tensor::from_vec(pros, (1, m, 3), dev)?;
 
-        // Mapper at 80 frames/s: asr repeated to the F0 rate (nearest), then prosody.
-        let a = asr.transpose(1, 2)?.contiguous()?;
+        // Mapper at 80 frames/s: the features repeated to the F0 rate (nearest), then prosody.
+        let a = feat.contiguous()?;
         let idx = Tensor::from_vec(nearest(a.dim(1)?, m), m, dev)?;
         let x = Tensor::cat(&[&a.index_select(&idx, 1)?, &pros], 2)?;
         let mapper = || -> Result<Tensor> {
@@ -548,7 +615,8 @@ impl Nano {
             let f = upsample(&f0, len);
             let pulse = pulse_train(&f);
             let noise: Vec<f32> = draws.randn(len).into_iter().map(|v| v * 0.1).collect();
-            let creak = (self.creak > 0.0).then(|| creak_train(&f, self.creak, draws.randn(len)));
+            let creak = (self.creak > 0.0)
+                .then(|| creak_train(&f, self.creak, self.creak_hi, draws.randn(len)));
             let (hr, hi) = self.stft.forward(&pulse, dev)?;
             let (nr, ni) = self.nstft.forward(&noise, dev)?;
             let logmag =
@@ -593,35 +661,11 @@ impl Nano {
         let x = Tensor::cat(&[&feat, &lin, &(logmag.unsqueeze(0)? / 4.0)?], 2)?;
         let head = self.renderer.apply(&x, s)?;
         let h = head.squeeze(0)?; // [t, 2 * bins + sub * nbins]
-        if dev.is_cpu() {
-            let audio = self.tail_host(&h, [&hr, &hi, &nr, &ni], len)?;
-            return Ok(Rendered {
-                audio,
-                mapper: mapped,
-                head,
-            });
-        }
-
-        let b = self.stft.bins;
-        let gain = |z: Tensor, scale: f32| -> Result<Tensor> {
-            Ok(((z.minimum(8f32)? - 3.0)?.exp()? / scale as f64)?)
-        };
-        let gh = gain(h.narrow(1, 0, b)?, self.h_scale)?;
-        let rot = h.narrow(1, b, b)?;
-        let (c, sn) = (rot.cos()?, rot.sin()?);
-        let re = ((&hr * &c)? - (&hi * &sn)?)?.mul(&gh)?;
-        let im = ((&hr * &sn)? + (&hi * &c)?)?.mul(&gh)?;
-        let harmonic = self.stft.inverse(&re, &im, len)?;
-
-        // Noise gains are `sub` frames per network frame, sub-frame major: row t, column s * nb + j.
-        let nb = self.nstft.bins;
-        let frames = nr.dim(0)?;
-        let g = gain(h.narrow(1, 2 * b, self.sub * nb)?, self.n_scale)?
-            .reshape((t * self.sub, nb))?
-            .narrow(0, self.sub / 2, frames)?;
-        let noise = self.nstft.inverse(&nr.mul(&g)?, &ni.mul(&g)?, len)?;
+                                  // The smoothing and the post-filter want whole rows and columns of the head, so the tail runs
+                                  // on the host on every device.
+        let audio = self.tail_host(&h, [&hr, &hi, &nr, &ni], len)?;
         Ok(Rendered {
-            audio: harmonic.iter().zip(&noise).map(|(a, b)| a + b).collect(),
+            audio,
             mapper: mapped,
             head,
         })

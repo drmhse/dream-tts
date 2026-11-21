@@ -28,13 +28,14 @@ if command -v cargo >/dev/null && [ -f Cargo.toml ]; then HAVE_CARGO=1; else HAV
 
 # Whether an engine's converted weights are present. The gates and the renders both need
 # this, and with the default bootstrap installing one engine it is the common case that
-# three of the four are legitimately absent.
+# four of the five are legitimately absent.
 engine_ready() {
   case "$1" in
     qwen3tts)  [ -f references/qwen3tts/weights/model.safetensors ] ;;
     audio8)    [ -f references/audio8/weights/codec.safetensors ] ;;
     cosyvoice) [ -f references/cosyvoice/weights/llm.safetensors ] ;;
     kokoro)    [ -f references/kokoro/weights/kokoro.safetensors ] ;;
+    nano)      [ -f references/nano/weights/nano-tts.safetensors ] ;;
     *) return 1 ;;
   esac
 }
@@ -131,11 +132,20 @@ else
   skip "fixtures/kokoro/forward.safetensors or references/kokoro/weights missing"
 fi
 
+say "nano gate"
+# The front end's ids and tags, the text side, the decoder and the whole path against
+# fixtures/nano, with the reference's random draws replayed.
+if [ -f fixtures/nano/standalone.safetensors ] && engine_ready nano; then
+  run nano-validate || fail=1
+else
+  skip "fixtures/nano/standalone.safetensors or references/nano/weights missing"
+fi
+
 say "End-to-end renders"
 mkdir -p target/gate
 # The second field is the whole voice argument, not a path: kokoro cannot clone, and picks
 # one of its built-in style tables instead of loading an asset.
-for spec in "qwen3tts:--voice voices/cosy-default-qwen3tts" "kokoro:--set voice=af_heart" \
+for spec in "nano:--set voice=af_heart" "qwen3tts:--voice voices/cosy-default-qwen3tts" "kokoro:--set voice=af_heart" \
            "audio8:--voice voices/cosy-default" "cosyvoice:--voice voices/cosy-default-cosyvoice"; do
   id="${spec%%:*}"; voice="${spec##*:}"
   asset="${voice#--voice }"
@@ -154,7 +164,7 @@ say "HTTP service smoke test"
 # Whichever engine is installed, in catalogue order. Pinning this to cosyvoice made the
 # tier skip on every checkout that took the default bootstrap.
 smoke_engine=""
-for id in qwen3tts kokoro audio8 cosyvoice; do
+for id in nano qwen3tts kokoro audio8 cosyvoice; do
   if engine_ready "$id"; then smoke_engine="$id"; break; fi
 done
 smoke_bin=""

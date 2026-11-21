@@ -52,20 +52,20 @@ use tts_core::{Capabilities, Engine, EngineConfig};
 /// Order is preference, and [`default_id`] takes the first *available* entry — so an
 /// unfinished engine may sit anywhere without becoming the default.
 ///
-/// `qwen3tts` leads because it is the fastest by 2x on book-length text and the only
-/// engine whose setup needs nothing but `curl`. It also speaks ten languages and the
-/// list is closed, which used to be handled by keeping it *last* — a guard made of list
-/// position, invisible to any caller. That fact now lives in
-/// [`Capabilities::languages`] and is reported by [`default_caveat`], so a caller that
-/// did not choose an engine is told what it got instead of being quietly given a
-/// different one.
+/// `nano` leads: a 13 MB model, about 50 MB set up with its front end and voices, and the
+/// fastest engine here by a wide margin. It speaks English only and cannot clone; both are
+/// facts in its [`Capabilities`], and [`default_caveat`] tells a caller that did not choose
+/// an engine what it got, and a request for a cloned voice is refused by name rather than
+/// answered with a stranger's.
 ///
-/// `kokoro` follows it rather than leads despite being the fastest here: it cannot clone,
-/// so defaulting to it would answer a request for a cloned voice with a stranger's.
+/// `qwen3tts` follows as the cloning engine with the best quality here, then `kokoro`, the
+/// 82M model `nano` was distilled from.
 #[allow(clippy::vec_init_then_push)]
 pub fn catalogue() -> Vec<Capabilities> {
     #[allow(unused_mut)]
     let mut out = Vec::new();
+    #[cfg(feature = "nano")]
+    out.push(kokoro::nano_engine::capabilities());
     #[cfg(feature = "qwen3tts")]
     out.push(qwen3tts::capabilities());
     #[cfg(feature = "kokoro")]
@@ -104,6 +104,8 @@ pub fn load(id: &str, config: &EngineConfig) -> Result<Box<dyn Engine>> {
         qwen3tts::ID => Ok(Box::new(qwen3tts::Qwen3TtsEngine::load(config)?)),
         #[cfg(feature = "kokoro")]
         kokoro::engine::ID => Ok(Box::new(kokoro::engine::KokoroEngine::load(config)?)),
+        #[cfg(feature = "nano")]
+        kokoro::nano_engine::ID => Ok(Box::new(kokoro::nano_engine::NanoEngine::load(config)?)),
         other => anyhow::bail!(
             "engine `{other}` is not in this build; it carries: {}",
             ids().join(", ")
@@ -135,8 +137,8 @@ pub fn default_voice(id: &str) -> &'static str {
         "audio8" => "voices/cosy-default",
         "cosyvoice" => "voices/cosy-default-cosyvoice",
         "qwen3tts" => "voices/cosy-default-qwen3tts",
-        // kokoro is Cloning::None: its voices are inside the checkpoint, so there is no
-        // asset to name. `every_id_has_conventions` skips it for that reason.
+        // kokoro and nano are Cloning::None: their voices are style tables, so there is no
+        // asset to name. `every_id_has_conventions` skips them for that reason.
         _ => "",
     }
 }
@@ -148,8 +150,8 @@ pub fn default_voice(id: &str) -> &'static str {
 /// that are actually there. `Ok(vec![])` when the engine has none or the asset is absent.
 pub fn builtin_voices(id: &str, root: &std::path::Path) -> Result<Vec<String>> {
     match id {
-        #[cfg(feature = "kokoro")]
-        kokoro::engine::ID => {
+        #[cfg(any(feature = "kokoro", feature = "nano"))]
+        "kokoro" | "nano" => {
             let path = root.join("voices.safetensors");
             if !path.exists() {
                 return Ok(Vec::new());
@@ -171,6 +173,7 @@ pub fn default_root(id: &str) -> &'static str {
         "cosyvoice" => "references/cosyvoice/weights",
         "qwen3tts" => "references/qwen3tts/weights",
         "kokoro" => "references/kokoro/weights",
+        "nano" => "references/nano/weights",
         _ => ".",
     }
 }
@@ -186,15 +189,16 @@ mod tests {
                 audio8::engine::ID,
                 cosyvoice::ID,
                 qwen3tts::ID,
-                kokoro::engine::ID
+                kokoro::engine::ID,
+                kokoro::nano_engine::ID
             ],
-            ["audio8", "cosyvoice", "qwen3tts", "kokoro"]
+            ["audio8", "cosyvoice", "qwen3tts", "kokoro", "nano"]
         );
     }
 
     #[test]
-    fn default_is_qwen3tts() {
-        assert_eq!(default_id(), qwen3tts::ID);
+    fn default_is_nano() {
+        assert_eq!(default_id(), kokoro::nano_engine::ID);
     }
 
     /// Every id must resolve to a model root, and to a shipped voice exactly when it
@@ -227,7 +231,7 @@ mod tests {
         let caps = catalogue();
         let default = caps.iter().find(|c| c.id == default_id()).unwrap();
         assert_eq!(default.languages.is_some(), default_caveat().is_some());
-        let caveat = default_caveat().expect("qwen3tts speaks a closed list");
+        let caveat = default_caveat().expect("nano speaks a closed list");
         assert!(caveat.contains("english") && caveat.contains(default_id()));
     }
 }

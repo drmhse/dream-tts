@@ -29,6 +29,7 @@ all-engines = ["tts-engines/all"]
 audio8 = ["tts-engines/audio8"]
 cosyvoice = ["tts-engines/cosyvoice"]
 kokoro = ["tts-engines/kokoro"]
+nano = ["tts-engines/nano"]
 qwen3tts = ["tts-engines/qwen3tts"]
 metal = ["tts-engines/metal", "tts-core/metal", "candle-core/metal"]
 

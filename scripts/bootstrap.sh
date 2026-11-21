@@ -2,20 +2,20 @@
 #
 # From a fresh clone to working speech. Nothing here is manual.
 #
-#   ./scripts/bootstrap.sh                              qwen3tts, the default, ~4.3 GB
-#   ./scripts/bootstrap.sh --all                        all four engines, ~14 GB
+#   ./scripts/bootstrap.sh                              nano, the default, ~50 MB
+#   ./scripts/bootstrap.sh --all                        all five engines, ~14 GB
 #   ./scripts/bootstrap.sh audio8 cosyvoice             two of them
 #   ./scripts/bootstrap.sh --list                       what the ids are, and what each costs
 #   ./scripts/bootstrap.sh --force audio8               redo a conversion that already ran
 #   ./scripts/bootstrap.sh --prebuilt                   download the binaries, do not build
 #
 # Whichever engines you name, it checks the toolchain, downloads and converts their
-# checkpoints, fetches the fixtures for every gate (~130 MB, cheap, so always), and builds.
+# checkpoints, fetches their gates' fixtures, and builds.
 #
-# The default is qwen3tts alone, and that is the whole reason the default path needs
-# nothing but curl: its checkpoint is a plain download and it has no conversion step.
-# audio8, cosyvoice and kokoro all want python and a torch venv, so asking for one of them
-# is what buys you that cost — it is never paid by someone who did not ask.
+# The default is nano alone, and its whole setup is curl: a 13 MB model, Kokoro's voice
+# tables and its front end. qwen3tts is curl too. audio8, cosyvoice and a from-scratch
+# kokoro want python and a torch venv, so asking for one of them is what buys you that
+# cost — it is never paid by someone who did not ask.
 #
 # No engine needs its upstream *repository*. CosyVoice's two un-derivable artifacts are
 # fetched as assets, so converting its checkpoint is a plain `torch.load`.
@@ -27,7 +27,7 @@ cd "$(dirname "$0")/.."
 ROOT="$PWD"
 
 # Catalogue order, matching `tts_engines::catalogue()`: the default leads.
-ALL_ENGINES="qwen3tts kokoro audio8 cosyvoice"
+ALL_ENGINES="nano qwen3tts kokoro audio8 cosyvoice"
 FORCE=""
 ENGINES=""
 BUILD_MODE=auto
@@ -36,7 +36,7 @@ usage() {
   cat <<'USAGE'
 usage: scripts/bootstrap.sh [--force] [--list] [engine ...]
 
-  engine    audio8 | cosyvoice | kokoro | qwen3tts   (default: qwen3tts alone)
+  engine    audio8 | cosyvoice | kokoro | nano | qwen3tts   (default: nano alone)
   --all     every engine, ~14 GB, and a torch venv
   --prebuilt  download this version's release binaries instead of building
   --build     build from source even on a machine that could download
@@ -53,22 +53,22 @@ while [ $# -gt 0 ]; do
     --build) BUILD_MODE=build; shift ;;
     --list)
       printf '%-11s %-34s %8s %-8s %s\n' engine model disk needs notes
-      printf '%-11s %-34s %8s %-8s %s\n' qwen3tts  Qwen3-TTS-12Hz-1.7B-Base  "~4.3 GB" curl  "the default. Batches; best for long documents"
-      printf '%-11s %-34s %8s %-8s %s\n' kokoro    Kokoro-82M                "~0.7 GB" python "fastest here. 28 built-in voices, no cloning"
+      printf '%-11s %-34s %8s %-8s %s\n' nano      nano-edge-tts-standalone  "~50 MB"  curl  "the default. 3.27M params, fastest here; Kokoro's 28 voices, no cloning"
+      printf '%-11s %-34s %8s %-8s %s\n' qwen3tts  Qwen3-TTS-12Hz-1.7B-Base  "~4.3 GB" curl  "best quality and cloning. Batches; best for long documents"
+      printf '%-11s %-34s %8s %-8s %s\n' kokoro    Kokoro-82M                "~0.7 GB" curl   "the model nano was distilled from. 28 built-in voices, no cloning"
       printf '%-11s %-34s %8s %-8s %s\n' audio8    Audio8-TTS-Preview-0.6b   "~4 GB"   python "44.1 kHz, highest fidelity"
       printf '%-11s %-34s %8s %-8s %s\n' cosyvoice Fun-CosyVoice3-0.5B       "~4 GB"   python "widest language coverage"
       printf '\n%s\n' "python means a torch venv (~2.5 GB) for the conversion step, and python >= 3.10."
       exit 0 ;;
     -h|--help) usage; exit 0 ;;
-    audio8|cosyvoice|kokoro|qwen3tts) ENGINES="$ENGINES $1"; shift ;;
+    audio8|cosyvoice|kokoro|nano|qwen3tts) ENGINES="$ENGINES $1"; shift ;;
     --audio8-only) ENGINES="$ENGINES audio8"; shift ;;   # the old spelling
     *) usage >&2; printf '\nunknown argument: %s\n' "$1" >&2; exit 2 ;;
   esac
 done
 
-# qwen3tts alone, because it is the fastest, the best quality here, and the only engine
-# whose setup is curl and nothing else. `--all` is one flag away.
-[ -n "$ENGINES" ] || ENGINES="qwen3tts"
+# nano alone: the smallest download and the fastest engine. `--all` is one flag away.
+[ -n "$ENGINES" ] || ENGINES="nano"
 # Normalise: the loop above leaves a leading space, which would make `${ENGINES%% *}` empty,
 # and `--all qwen3tts` would name one engine twice. Rebuild from ALL_ENGINES so the result
 # is deduplicated and in catalogue order whatever the arguments looked like.
@@ -173,7 +173,7 @@ fi
 # no python at all — its setup is downloads — so building a torch venv for it would be waste.
 
 if ! wants audio8 && ! wants cosyvoice && ! wants kokoro; then
-  say "Skipping the python env (only qwen3tts selected, which needs none)"
+  say "Skipping the python env (none of the selected engines needs one)"
 elif [ -x "$VENV/bin/python" ]; then
   say "references/audio8/.venv already exists — skipping (delete it to rebuild)"
 else
@@ -270,15 +270,6 @@ else
     mv "$KOKORO_W/voices.safetensors.part" "$KOKORO_W/voices.safetensors"
     mv "$KOKORO_W/config.json.part" "$KOKORO_W/config.json"
     say "Kokoro converted weights pulled from $ASSETS_REPO — no torch needed"
-    # The nano decoder (`--set decoder=nano`) is 3.5 MB and optional: a failure here costs nothing.
-    if mkdir -p "$KOKORO_W/nano" \
-      && curl -sSfL --retry 3 -o "$KOKORO_W/nano/config.json.part" "$ASSETS_BASE/nano/config.json" \
-      && curl -sSfL --retry 3 -o "$KOKORO_W/nano/nano-edge-tts.safetensors.part" "$ASSETS_BASE/nano/nano-edge-tts.safetensors"; then
-      mv "$KOKORO_W/nano/config.json.part" "$KOKORO_W/nano/config.json"
-      mv "$KOKORO_W/nano/nano-edge-tts.safetensors.part" "$KOKORO_W/nano/nano-edge-tts.safetensors"
-    else
-      rm -f "$KOKORO_W"/nano/*.part
-    fi
   else
     rm -f "$KOKORO_W"/*.part
   # The 26 voicepacks this omits are the Spanish, French, Hindi, Italian, Japanese,
@@ -304,13 +295,35 @@ else
   fi
 fi
 
+# ------------------------------------------------------------------ 4d. nano
+#
+# The model from its own repository, pinned to a commit so a re-run fetches the same bytes;
+# the voice tables and front end are Kokoro's, from the assets dataset.
+
+NANO_W="$ROOT/references/nano/weights"
+NANO_COMMIT=35186b7d0106a2aaf419da1c60be190537292f62
+if ! wants nano; then
+  say "Skipping nano (not selected)"
+else
+  say "Fetching nano-edge-tts-standalone (13 MB) and Kokoro's voices and front end (~36 MB)"
+  "$ROOT/scripts/fetch-weights.sh" "$NANO_W" \
+    "https://huggingface.co/drmhse/nano-edge-tts-standalone/resolve/$NANO_COMMIT" \
+    config.json nano-tts.safetensors \
+    || die "nano download failed. Re-run to resume where it stopped."
+  "$ROOT/scripts/fetch-weights.sh" "$NANO_W" \
+    "https://huggingface.co/datasets/${DREAM_TTS_ASSETS_REPO:-drmhse/tts-rs-assets}/resolve/main/kokoro" \
+    voices.safetensors frontend/lexicon-us.json frontend/lexicon-gb.json frontend/tokenizer.json \
+    frontend/tagger.json frontend/tagger.safetensors frontend/g2p.safetensors frontend/g2p.LICENSE \
+    || die "nano's voices or front end did not download. Re-run to resume where it stopped."
+fi
+
 # ------------------------------------------------------------------ 5. derived assets
 
-# The fixture oracles and the two CosyVoice artifacts that need the upstream python package.
-# Cheap (~130 MB) and it is what lets ./scripts/gates.sh run without any PyTorch, so do it
-# unconditionally rather than making the gates the user's problem later.
+# The fixture oracles of the selected engines and, for cosyvoice, the two artifacts that need
+# its upstream python package. They are what let ./scripts/gates.sh run without any PyTorch.
 say "Fetching the derived assets"
-"$ROOT/scripts/fetch-assets.sh" || warn "asset fetch failed — the gates will report themselves
+# shellcheck disable=SC2086
+"$ROOT/scripts/fetch-assets.sh" $ENGINES || warn "asset fetch failed — the gates will report themselves
    skipped, and CosyVoice will not start. Rerun ./scripts/fetch-assets.sh, or regenerate
    from source: docs/reference.md#setup."
 
@@ -339,6 +352,7 @@ fi
 # keep working when a later bootstrap adds a second engine.
 first="${ENGINES%% *}"
 case "$first" in
+  nano)      voice="--set voice=af_heart" ;;
   audio8)    voice="--voice voices/cosy-default" ;;
   cosyvoice) voice="--voice voices/cosy-default-cosyvoice" ;;
   qwen3tts)  voice="--voice voices/cosy-default-qwen3tts" ;;
@@ -373,15 +387,17 @@ wants qwen3tts && [ ! -f "$QWEN_W/model.safetensors" ] && {
   printf '\n  * Qwen3-TTS has no checkpoint — see docs/reference.md#setup.\n'; missing=1; }
 wants kokoro && [ ! -f "$KOKORO_W/kokoro.safetensors" ] && {
   printf '\n  * Kokoro has no checkpoint — see docs/reference.md#setup.\n'; missing=1; }
-# kokoro's oracle is `forward`, not `oracle`: its gate compares stage activations rather
-# than one dumped tensor set.
-for e in audio8 cosyvoice kokoro qwen3tts; do
-  oracle=oracle; [ "$e" = kokoro ] && oracle=forward
+wants nano && [ ! -f "$NANO_W/nano-tts.safetensors" ] && {
+  printf '\n  * nano has no weights — rerun this script.\n'; missing=1; }
+# kokoro's oracle is `forward` and nano's `standalone`: those gates compare stage
+# activations rather than one dumped tensor set.
+for e in $ENGINES; do
+  case "$e" in kokoro) oracle=forward ;; nano) oracle=standalone ;; *) oracle=oracle ;; esac
   if [ ! -f "$ROOT/fixtures/$e/$oracle.safetensors" ]; then
-    printf '  * The %s fixture gate has no fixtures — rerun ./scripts/fetch-assets.sh\n' "$e"
+    printf '  * The %s fixture gate has no fixtures — rerun ./scripts/fetch-assets.sh %s\n' "$e" "$e"
     missing=1
   fi
 done
-[ "$missing" -eq 0 ] && printf '\nEverything selected is present, and all four fixture gates.\n'
+[ "$missing" -eq 0 ] && printf '\nEverything selected is present, with its fixture gates.\n'
 
 printf '\nVerify with:  ./scripts/gates.sh\n'

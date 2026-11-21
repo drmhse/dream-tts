@@ -16,5 +16,9 @@ qwen3tts = { path = "../qwen3tts", default-features = false, optional = true }
 
 [features]
 default = ["metal", "all"]
-all = ["audio8", "cosyvoice", "kokoro", "qwen3tts"]
+all = ["audio8", "cosyvoice", "kokoro", "nano", "qwen3tts"]
+kokoro = ["dep:kokoro"]
+# `nano` lives in the kokoro crate (it shares the voices and front end), so each is its own feature: a
+# build can carry one engine without the other.
+nano = ["dep:kokoro"]
 metal = ["audio8?/metal", "cosyvoice?/metal", "kokoro?/metal", "qwen3tts?/metal", "tts-core/metal"]

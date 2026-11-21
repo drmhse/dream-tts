@@ -1,7 +1,7 @@
 # dream-tts Repository Guide
 
-Offline text-to-speech in Rust with Metal kernels: four engines behind one CLI, no Python at
-runtime. `qwen3tts` is the default and carries the project.
+Offline text-to-speech in Rust with Metal kernels: five engines behind one CLI, no Python at
+runtime. `nano` is the default; `qwen3tts` is the best quality and the cloning engine.
 
 Start with the **`dream-tts` skill** in `.agents/skills/dream-tts/` — it covers setup, narrating
 a page or a book, and how the engine works. This file is only the rules that hold regardless of
@@ -24,6 +24,7 @@ cargo build --release           # NOT `-p qwen3tts`: `dream-tts` lives in tts-cl
 cargo test --release -p tts-nn  # the kernels
 ./scripts/check-phonemes.sh     # Kokoro's English frontend, against spaCy and misaki
 cargo run -p kokoro --release --bin kokoro-validate
+cargo run -p kokoro --release --bin nano-validate
 ```
 
 `kokoro` is the fourth engine and the only non-autoregressive one. It cannot clone — its
@@ -32,8 +33,10 @@ English frontend is a lexicon with no espeak fallback (GPL): an unknown word tha
 a compound of known words is approximated, and in American English anything else is guessed by
 g2p_en's small Apache-2.0 model (both off with `--set fallback=off`); what is left is named in a
 lint. `docs/kokoro-frontend.md` and `docs/kokoro-model.md` carry its traps and
-its measurements. `--set decoder=nano` swaps in a 1.75M-parameter decoder (`src/nano.rs`, weights in
-`weights/nano/`), gated by the same `kokoro-validate` against `fixtures/kokoro/nano.safetensors`. On Metal its generator runs padded to length buckets (`KOKORO_BUCKETS`, 0 to
+its measurements. `nano` lives in the same crate (`src/standalone.rs`, `src/nano.rs`,
+`src/nano_engine.rs`, weights in `references/nano/weights/`): 3.27M parameters distilled from Kokoro,
+sharing its frontend and voice tables, run on the CPU, gated by `nano-validate` against
+`fixtures/nano/standalone.safetensors`. On Metal Kokoro's generator runs padded to length buckets (`KOKORO_BUCKETS`, 0 to
 disable), so an A/B of a generator change has to render several lengths, not one utterance
 repeated: a repeated utterance never pays MPSGraph's per-length compile. Each resblock runs as
 one MPSGraph (`KOKORO_NO_MPSBLOCK` to compose it instead); a graph holds its intermediates until

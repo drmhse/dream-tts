@@ -20,7 +20,9 @@
 # checked against the published SHA256SUMS and a mismatch is deleted rather than kept.
 #
 # Re-running is safe: a file that is already present and hashes correctly is skipped.
-# Pass --force to refetch everything.
+# Pass --force to refetch everything, and engine names to fetch only theirs:
+#
+#   scripts/fetch-assets.sh [--force] [audio8|cosyvoice|kokoro|nano|qwen3tts ...]
 #
 # Regenerating from source instead is documented in docs/reference.md#3-regenerating-the-fixtures, and is the stronger
 # move if you are auditing the ports rather than using them — a gate that verifies against
@@ -35,7 +37,14 @@ cd "$(dirname "$0")/.."
 # `DREAM_TTS_ASSETS_REPO` overrides it in the meantime.
 REPO="${DREAM_TTS_ASSETS_REPO:-drmhse/tts-rs-assets}"
 BASE="https://huggingface.co/datasets/$REPO/resolve/main"
-FORCE="${1:-}"
+FORCE=""
+ONLY=""
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=--force ;;
+    *) ONLY="$ONLY $arg" ;;
+  esac
+done
 
 say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -55,6 +64,11 @@ if [ -t 2 ]; then PROGRESS=(-#); else PROGRESS=(-sS); fi
 # things this script has no business installing — the rendered samples, for one — and a repo
 # that grows a directory must not break every existing clone's bootstrap.
 dest_for() {
+  if [ -n "$ONLY" ]; then
+    local engine="${1%%/*}"
+    [ "$engine" = fixtures ] && { engine="${1#fixtures/}"; engine="${engine%%/*}"; }
+    case " $ONLY " in *" $engine "*) ;; *) printf ''; return ;; esac
+  fi
   case "$1" in
     cosyvoice/*) printf 'references/cosyvoice/weights/%s' "${1#cosyvoice/}" ;;
     kokoro/*)    printf 'references/kokoro/weights/%s' "${1#kokoro/}" ;;
@@ -106,7 +120,7 @@ while read -r want path; do
 done < "$SUMS"
 
 say "Done: $fetched fetched, $skipped already present and verified."
-[ "$ignored" -gt 0 ] && printf '  (%d dataset file(s) this script does not install, e.g. the rendered samples)\n' "$ignored"
+[ "$ignored" -gt 0 ] && [ -z "$ONLY" ] && printf '  (%d dataset file(s) this script does not install, e.g. the rendered samples)\n' "$ignored"
 
 # CosyVoice still needs its checkpoint converted; say so rather than implying it can run.
 if [ ! -f references/cosyvoice/weights/llm.safetensors ]; then

@@ -27,3 +27,7 @@ path = "src/bin/validate.rs"
 [[bin]]
 name = "kokoro-render"
 path = "src/bin/render.rs"
+
+[[bin]]
+name = "nano-validate"
+path = "src/bin/nano_validate.rs"

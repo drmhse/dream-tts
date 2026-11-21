@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! dream-tts engines                             # what exists, and what works
-//! dream-tts speak --text "hello" --out out.wav  # the default engine, qwen3tts
+//! dream-tts speak --text "hello" --out out.wav  # the default engine, nano
+//! dream-tts speak --text-file book.epub --out book.wav  # a whole document, written as it is spoken
 //! dream-tts speak --engine audio8 --text-file book.txt --voice voices/cosy-default --out out.wav
 //! dream-tts import book.epub --out prep/        # any document into chapter-NNN.md
 //! dream-tts narrate prep/chapter-001.md         # markdown into speakable text
@@ -32,7 +33,8 @@ use tts_core::{Cloning, Config, EngineConfig, Gaps, GpuLock, Sampling, Synthesis
     after_help = "\
 Examples:
   dream-tts speak --text \"Hello.\" --out hello.wav        the default engine and voice
-  dream-tts speak --text-file book.md --quant f16 --out book.wav
+  dream-tts speak --text-file book.epub --out book.wav    any document, written as it is spoken
+  dream-tts speak --voice voices/my-voice --text-file book.md --out book.wav   a cloned voice
   dream-tts speak --engine audio8 --out x.wav --text \"…\"  44.1 kHz
   dream-tts voice voices/my-voice                         what an asset holds
 
@@ -522,9 +524,19 @@ fn cmd_speak(args: &Speak, cfg: &Config) -> Result<()> {
     // Precedence, once: flag, then config, then the registry. `chose` is what tells the
     // caveat below apart from a deliberate choice — a config file naming an engine is a
     // choice, so it must not warn either.
+    // A voice asset belongs to one engine, so naming one without an engine chooses its engine.
+    let named_voice = args
+        .voice
+        .clone()
+        .or_else(|| cfg.settings.voice.clone())
+        .map(|p| cfg.locate_or_err(&p, "voice asset"))
+        .transpose()?;
     let (id, chose) = match args.engine.clone().or_else(|| cfg.settings.engine.clone()) {
         Some(id) => (id, true),
-        None => (tts_engines::default_id().to_string(), false),
+        None => match &named_voice {
+            Some(p) => (Voice::load(p)?.engine, true),
+            None => (tts_engines::default_id().to_string(), false),
+        },
     };
     if !chose {
         // Only on the defaulted path: a caller that named the engine accepted its limits,
@@ -565,12 +577,6 @@ fn cmd_speak(args: &Speak, cfg: &Config) -> Result<()> {
     // engine's own shipped voice is used rather than failing — every engine here clones
     // from an asset, so `speak --text …` with no `--voice` would otherwise be an error, and
     // "it needs a voice" is not a decision the caller has any information to make.
-    let named_voice = args
-        .voice
-        .clone()
-        .or_else(|| cfg.settings.voice.clone())
-        .map(|p| cfg.locate_or_err(&p, "voice asset"))
-        .transpose()?;
     let clones = tts_engines::catalogue()
         .into_iter()
         .find(|c| c.id == id)
@@ -631,8 +637,18 @@ fn cmd_speak(args: &Speak, cfg: &Config) -> Result<()> {
     // The built-in defaults live in one place, `SynthesisRequest::new`, rather than being
     // restated as clap `default_value_t` where a config file could never reach them.
     let defaults = SynthesisRequest::new("");
-    let request = SynthesisRequest {
-        text,
+    let gaps = Gaps {
+        segment_ms: args
+            .gap_ms
+            .or(cfg.settings.gaps.and_then(|g| g.segment_ms))
+            .unwrap_or(defaults.gaps.segment_ms),
+        paragraph_ms: args
+            .para_gap_ms
+            .or(cfg.settings.gaps.and_then(|g| g.paragraph_ms))
+            .unwrap_or(defaults.gaps.paragraph_ms),
+    };
+    let mut request = SynthesisRequest {
+        text: String::new(),
         voice,
         speaker: None,
         sampling: Sampling {
@@ -647,16 +663,7 @@ fn cmd_speak(args: &Speak, cfg: &Config) -> Result<()> {
             .or(cfg.settings.max_chars)
             .unwrap_or(defaults.max_chars),
         max_new_tokens: args.max_new_tokens,
-        gaps: Gaps {
-            segment_ms: args
-                .gap_ms
-                .or(cfg.settings.gaps.and_then(|g| g.segment_ms))
-                .unwrap_or(defaults.gaps.segment_ms),
-            paragraph_ms: args
-                .para_gap_ms
-                .or(cfg.settings.gaps.and_then(|g| g.paragraph_ms))
-                .unwrap_or(defaults.gaps.paragraph_ms),
-        },
+        gaps,
         progress: None,
         interrupt: None,
     };
@@ -669,42 +676,88 @@ fn cmd_speak(args: &Speak, cfg: &Config) -> Result<()> {
                 .unwrap_or_else(|| "no duration recorded".into()),
         );
     }
+    let parts = parts_of(&text, PART_CHARS);
     ui::field(
         "text",
-        format!("{} characters", request.text.chars().count()),
+        format!(
+            "{} characters{}",
+            text.chars().count(),
+            if parts.len() > 1 {
+                format!(", {} parts", parts.len())
+            } else {
+                String::new()
+            }
+        ),
     );
 
     // The bar lives behind a mutex because the callback is `Fn` and shared: an engine is
     // free to report from whichever thread does the work, and one of them batches.
     let bar = std::sync::Arc::new(std::sync::Mutex::new(ui::Bar::new()));
-    let request = {
-        let bar = bar.clone();
-        request.with_progress(std::sync::Arc::new(move |event| {
+    let part = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let (bar, part, count) = (bar.clone(), part.clone(), parts.len());
+        request.progress = Some(std::sync::Arc::new(move |event| {
             if let Ok(mut b) = bar.lock() {
                 match event {
                     tts_core::ProgressEvent::Planned { segments } => b.planned(segments),
+                    tts_core::ProgressEvent::Advanced { stage, done, total } if count > 1 => {
+                        let k = part.load(std::sync::atomic::Ordering::Relaxed) + 1;
+                        b.advance(&format!("{stage} {k}/{count}"), done, total)
+                    }
                     tts_core::ProgressEvent::Advanced { stage, done, total } => {
                         b.advance(stage, done, total)
                     }
                 }
             }
-        }))
-    };
+        }));
+    }
 
-    let out = engine.synthesize(&request);
+    // A document is spoken a part at a time, each appended to `--out` as it lands: the file
+    // plays while it grows, and memory holds one part's audio rather than a book's.
+    anyhow::ensure!(!parts.is_empty(), "no text to speak");
+    let mut wav: Option<tts_core::wav::Appender> = None;
+    let mut stats = tts_core::Stats::default();
+    for (k, text) in parts.into_iter().enumerate() {
+        part.store(k, std::sync::atomic::Ordering::Relaxed);
+        request.text = text;
+        let out = engine.synthesize(&request);
+        let out = match out {
+            Ok(out) => out,
+            Err(e) => {
+                if let Ok(mut b) = bar.lock() {
+                    b.finish();
+                }
+                return Err(e);
+            }
+        };
+        let rate = out.audio.sample_rate;
+        let w = match &mut wav {
+            Some(w) => {
+                w.append(&tts_core::wav::silence(rate as usize, gaps.paragraph_ms))?;
+                w
+            }
+            None => wav.insert(tts_core::wav::Appender::create(&args.out, rate)?),
+        };
+        w.append(&out.audio.samples)?;
+        stats.segments += out.stats.segments;
+        stats.frames += out.stats.frames;
+        stats.total_s += out.stats.total_s;
+        for (stage, secs) in out.stats.stages {
+            stats.add(stage, secs);
+        }
+    }
     if let Ok(mut b) = bar.lock() {
         b.finish();
     }
-    let out = out?;
-    let seconds = out.audio.seconds();
-    tts_core::wav::write_mono(&args.out, &out.audio.samples, out.audio.sample_rate)?;
+    let sample_rate = caps.sample_rate;
+    let seconds = wav.as_ref().map_or(0.0, |w| w.seconds());
 
-    let s = &out.stats;
+    let s = &stats;
     ui::heading("done");
     println!(
         "{} of audio at {} Hz in {}  ·  {} {}",
         ui::bold(&ui::duration(seconds)),
-        out.audio.sample_rate,
+        sample_rate,
         ui::bold(&ui::duration(s.total_s)),
         ui::dim("RTF"),
         ui::green(&format!("{:.3}", s.rtf(seconds)))
@@ -748,6 +801,43 @@ fn cmd_speak(args: &Speak, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Characters per part of a long `speak`. `qwen3tts` batches up to 48 segments of about 220
+/// characters across a request, so a part this size keeps its batches full.
+const PART_CHARS: usize = 12_000;
+
+/// `text` in parts of at least `size` bytes, split between lines (the paragraphs every engine
+/// segments by), or at a sentence's end inside a line longer than `size`: narration joins a PDF's
+/// paragraphs across page breaks, so one line can be a whole document.
+fn parts_of(text: &str, size: usize) -> Vec<String> {
+    let mut parts = vec![String::new()];
+    for line in text.lines() {
+        let mut rest = line;
+        while !rest.is_empty() {
+            let last = parts.last_mut().unwrap();
+            if last.len() >= size {
+                parts.push(String::new());
+                continue;
+            }
+            let room = size - last.len();
+            let cut = if rest.len() <= room {
+                rest.len()
+            } else {
+                rest.char_indices()
+                    .skip_while(|(i, _)| *i < room)
+                    .find(|(i, c)| matches!(c, '.' | '!' | '?') && rest[i + 1..].starts_with(' '))
+                    .map_or(rest.len(), |(i, _)| i + 1)
+            };
+            if !last.is_empty() {
+                last.push('\n');
+            }
+            last.push_str(&rest[..cut]);
+            rest = rest[cut..].trim_start();
+        }
+    }
+    parts.retain(|p| !p.trim().is_empty());
+    parts
+}
+
 fn main() -> std::process::ExitCode {
     // Rust starts with SIGPIPE ignored, which turns `dream-tts storage | head` into a
     // panic on EPIPE — "failed printing to stdout: Broken pipe" and a backtrace note —
@@ -781,5 +871,31 @@ fn main() -> std::process::ExitCode {
             ui::report_error(&err);
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_long_text_splits_between_lines_and_loses_nothing() {
+        let lines: Vec<String> = (0..50)
+            .map(|i| format!("Paragraph {i} says something."))
+            .collect();
+        let text = lines.join("\n");
+        let parts = parts_of(&text, 300);
+        assert!(parts.len() > 1);
+        assert!(parts[..parts.len() - 1].iter().all(|p| p.len() >= 300));
+        assert_eq!(parts.join("\n"), text);
+    }
+
+    #[test]
+    fn a_line_longer_than_a_part_splits_at_a_sentence_end() {
+        let line = "One sentence here. ".repeat(100);
+        let parts = parts_of(line.trim_end(), 300);
+        assert!(parts.len() > 1);
+        assert!(parts.iter().all(|p| p.ends_with('.')));
+        assert_eq!(parts.join(" "), line.trim_end());
     }
 }

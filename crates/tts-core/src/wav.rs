@@ -77,7 +77,72 @@ pub fn write_mono(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> 
     Ok(())
 }
 
+/// A WAV written as it grows. The header's two sizes are rewritten after every append, so the file
+/// is complete and playable at any moment while memory holds one append at a time.
+pub struct Appender {
+    file: std::fs::File,
+    data: u32,
+    sample_rate: u32,
+}
+
+impl Appender {
+    pub fn create(path: &Path, sample_rate: u32) -> Result<Self> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(&encode(&[], sample_rate))?;
+        Ok(Self {
+            file,
+            data: 0,
+            sample_rate,
+        })
+    }
+
+    pub fn append(&mut self, samples: &[f32]) -> Result<()> {
+        use std::io::{Seek, SeekFrom};
+        let pcm = pcm_s16le(samples);
+        // A RIFF size is 32 bits: 24.8 hours of 24 kHz mono.
+        let data = u32::try_from(pcm.len())
+            .ok()
+            .and_then(|n| self.data.checked_add(n))
+            .filter(|d| *d <= u32::MAX - 36)
+            .ok_or_else(|| anyhow::anyhow!("past the 4 GB a WAV file can hold"))?;
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(&pcm)?;
+        self.file.seek(SeekFrom::Start(4))?;
+        self.file.write_all(&(36 + data).to_le_bytes())?;
+        self.file.seek(SeekFrom::Start(40))?;
+        self.file.write_all(&data.to_le_bytes())?;
+        self.data = data;
+        Ok(())
+    }
+
+    pub fn seconds(&self) -> f64 {
+        self.data as f64 / 2.0 / self.sample_rate as f64
+    }
+}
+
 /// `sample_rate * seconds` worth of silence, for gaps between segments.
 pub fn silence(sample_rate: usize, millis: usize) -> Vec<f32> {
     vec![0f32; sample_rate * millis / 1000]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_appended_file_is_the_file_written_at_once() {
+        let dir = std::env::temp_dir().join(format!("wav-append-{}", std::process::id()));
+        let samples: Vec<f32> = (0..1000).map(|i| (i as f32 * 0.01).sin() * 0.5).collect();
+        let mut w = Appender::create(&dir.join("a.wav"), 24_000).unwrap();
+        w.append(&samples[..300]).unwrap();
+        w.append(&samples[300..]).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("a.wav")).unwrap(),
+            encode(&samples, 24_000)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

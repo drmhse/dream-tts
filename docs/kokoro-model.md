@@ -141,34 +141,44 @@ Measured, not assumed:
   autoregression — but every custom kernel is single-batch today, so that is a
   project, not a patch.
 
-## The nano decoder
+## nano
 
-`--set decoder=nano` (`Model::load_with(.., DecoderKind::Nano)`, `src/nano.rs`) replaces the
-53.3M-parameter decoder with the 1.75M-parameter one from
-[nano-edge-tts](https://huggingface.co/drmhse/nano-edge-tts), read from `weights/nano/`. Same inputs and
-output length, so the text side and the word clock are untouched, and Kokoro's decoder is never read from
-the checkpoint. A mapper (80 frames/s) and a renderer (160 frames/s) set per-bin gains on a pulse train's
-25 ms STFT and white noise's 5 ms STFT. Nothing learned runs at audio rate: the pulse trains, framing and
-overlap-add are host loops, and the device only sees frame-rate matmuls.
+`--engine nano` (`src/standalone.rs`, `src/nano.rs`, `src/nano_engine.rs`) is
+[nano-edge-tts-standalone](https://huggingface.co/drmhse/nano-edge-tts-standalone): 3.27M parameters
+distilled from Kokoro-82M, read from `references/nano/weights/`. It keeps Kokoro's data and none of its
+networks: the same front end, phoneme vocabulary and voice tables, so it speaks the same 28 voices with the
+same lexicon. It replaced an earlier option, `--set decoder=nano`, that swapped only Kokoro's decoder for a
+1.75M one and kept Kokoro's 28.5M text side.
 
-The gate (`kokoro-validate`, fixtures from `references/kokoro/dump_nano.py` with the draws replayed)
-reads mapper 9e-7 relative, head 3e-3, audio SNR 54.9 dB against the PyTorch reference, on CPU and on
-Metal alike; float16 weights read 54.3 dB. It is not bit-exact for two reasons, both matched as far as
-they go: torch upsamples the F0 track with a fused f32 index when given a scale factor (not the
-size-based double index `source.rs` matches), and the training code's STFT table was built with the
-angle rounded through f32, which at `k * n` near 2e5 is 0.06 rad off; the port reproduces the table,
-because the network learned against it.
+- **Text side (1.52M).** Phonemes plus the spaCy part-of-speech tag of the word each came from (the
+  front end computes the tags anyway; `G2P::phonemize_tagged` returns them over the phonemes' bytes). Two
+  conv blocks, one attention block run four times over words and twice over phonemes, then per-phoneme
+  durations, features, and pitch and energy drawn as lines with a small frame network on top.
+- **Decoder (1.75M).** A mapper (80 frames/s) and a renderer (160 frames/s) set per-bin gains on a pulse
+  train's 25 ms STFT and white noise's 5 ms STFT. Nothing learned runs at audio rate. The harmonic gains
+  above 2 kHz are averaged over five bins, and a post-filter deepens the noise's formants above 3 kHz; both
+  need whole rows and columns of the head, so the tail runs on the host on every device.
 
-13.85 s sentence, M4, `kokoro-render`, 4 passes, last one, interleaved twice:
+The gate (`nano-validate`, fixtures from `references/nano/dump_fixtures.py` with the draws replayed):
+the front end's ids and tags are identical to misaki's on ten segments of awkward text in both accents;
+durations are identical, features read 1e-6 relative, mapper 7e-7, head 8e-4; audio from the reference's
+text side reads 64.6 dB SNR, and text to audio 42.4 dB on the CPU and 43.1 on Metal. Two things differ from
+the PyTorch release by design. `KPipeline` falls back to espeak (GPL) when it is installed, which reads
+`9:30` differently; the fixtures are taken without it. And the creak's jitter comes from a fixed torch seed
+there, which is not reproduced; a render draws its own from `--seed`.
 
-| | Metal RTF | decoder | CPU RTF | decoder | peak footprint Metal / CPU |
-|---|---:|---:|---:|---:|---:|
-| Kokoro decoder | 0.030 | 0.351 s | 0.318–0.327 | 4.05–4.17 s | 1685 / 1513 MB |
-| nano | 0.008–0.009 | 0.052–0.054 s | 0.039 | 0.18–0.19 s | 507 / 354 MB |
+It runs on the CPU on every machine. `examples/chapter.txt` on an M4, one session, builds interleaved:
 
-With nano the text side is half the Metal time and two thirds of the CPU time. Metal against CPU on the
-same text reads 33.5 dB for nano and 41.6 dB for Kokoro's decoder: the text side differs slightly
-between the two devices, and nano's pulse phase integrates its F0.
+| | voice | wall | RTF | peak footprint |
+|---|---|---:|---:|---:|
+| `nano`, CPU | `af_heart` | 3.5–3.9 s | 0.005 | 418–464 MB |
+| `nano`, CPU | `am_michael` | 3.6–4.1 s | 0.005 | 453–502 MB |
+| `nano`, Metal | `af_heart` | 6.0 s | 0.008 | |
+| `kokoro`, Metal | `af_heart` | 36.0–38.5 s | 0.049–0.052 | 1.95–2.01 GB |
+
+The session was a slow one (Kokoro took 27 s in an earlier one, and the build from before this change read
+the same 36–37 s with byte-identical audio), so the ratio is the number to take: ten times the speed on a
+quarter of the memory. On Metal each of the small kernels costs a dispatch, and that loses.
 
 ### The CPU path (Mac, iPhone, iPad)
 
@@ -177,7 +187,7 @@ On the CPU, candle's own `gemm` crate was 70% of a one-thread render. `tts-nn` t
 links the framework). What was left was scalar libm calls and allocating broadcasts, now one-pass kernels
 in `tts_nn::cpu` and `fused`:
 
-- nano: GELU (libm `erff`, half the trunk), the depthwise conv (14 broadcast ops), norm + voice gain and
+- nano's decoder: GELU (libm `erff`, half the trunk), the depthwise conv (14 broadcast ops), norm + voice gain and
   bias (8 ops), the scaled residual, and the renderer's head applied on the host straight into the
   inverse STFTs' rows. The creak's brick-wall uses a half-length complex FFT each way (real input).
 - Text side: ALBERT's softmax (a scalar `expf` per score), and the LSTM gate op, which was a quarter of
@@ -187,7 +197,8 @@ in `tts_nn::cpu` and `fused`:
   two directions run side by side. `RAYON_NUM_THREADS=1` keeps everything serial; the gate reads the
   same either way.
 
-`dream-tts speak --engine kokoro --set decoder=nano`, CPU-only build, five texts (55.4 s of audio), text
+The earlier `dream-tts speak --engine kokoro --set decoder=nano` (Kokoro's text side with the 1.75M decoder,
+since replaced by `nano`), CPU-only build, five texts (55.4 s of audio), text
 in and audio out, quiet M4, three rounds; PyTorch is the released `nano_edge_tts.py` through `KPipeline`
 on the same texts, measured between two Rust runs that agree:
 
@@ -197,7 +208,7 @@ on the same texts, measured between two Rust runs that agree:
 | after | **0.0115-0.0121** | **0.0105** | 338 MB |
 | PyTorch | 0.0135 | 0.0128 | 1,267 MB |
 
-Kokoro's own decoder, the same 12.2 s sentence (`kokoro-render --cpu --decoder kokoro`, builds alternated):
+Kokoro's own decoder, the same 12.2 s sentence (`kokoro-render --cpu`, builds alternated):
 
 | | 1 thread RTF | all cores RTF |
 |---|---:|---:|

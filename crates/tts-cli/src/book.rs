@@ -101,7 +101,8 @@ fn healthy(base: &str) -> bool {
 ///
 /// Spawned detached rather than as a child: the point of the split is that the work outlives
 /// the terminal that asked for it, and a child would die with this process.
-fn start_service(cfg: &Config, base: &str) -> Result<()> {
+/// `engine` is the voice asset's, when one was named: the service speaks with one engine.
+fn start_service(cfg: &Config, base: &str, engine: Option<&str>) -> Result<()> {
     let binary = crate::documents::sibling_binary("dream-tts-serve")?;
     ui::field("service", format!("starting {}", binary.display()));
     let log = cfg.data_path("jobs/service.log");
@@ -109,7 +110,11 @@ fn start_service(cfg: &Config, base: &str) -> Result<()> {
         std::fs::create_dir_all(parent).ok();
     }
     let out = std::fs::File::create(&log).with_context(|| format!("creating {}", log.display()))?;
-    std::process::Command::new(&binary)
+    let mut command = std::process::Command::new(&binary);
+    if let Some(engine) = engine {
+        command.args(["--engine", engine]);
+    }
+    command
         .stdout(out.try_clone()?)
         .stderr(out)
         .stdin(std::process::Stdio::null())
@@ -197,18 +202,23 @@ pub fn cmd_book(args: &Book, cfg: &Config) -> Result<()> {
     // Text first, locally: the service takes narration text, and doing the conversion here
     // means a failure in it costs seconds rather than being discovered an hour in.
     let texts = prepare(&args.source, &args.out)?;
+    let voice = match &args.voice {
+        Some(v) => Some(cfg.locate_or_err(v, "voice asset")?),
+        None => None,
+    };
     let base = base_url(cfg);
     if !healthy(&base) {
         if args.no_serve {
             bail!("no service at {base}, and --no-serve was given");
         }
-        start_service(cfg, &base)?;
+        let engine = voice
+            .as_deref()
+            .map(|p| tts_core::Voice::load(p))
+            .transpose()?
+            .map(|v| v.engine);
+        start_service(cfg, &base, engine.as_deref())?;
     }
-
-    let voice = match &args.voice {
-        Some(v) => Some(cfg.locate_or_err(v, "voice asset")?.display().to_string()),
-        None => None,
-    };
+    let voice = voice.map(|p| p.display().to_string());
     let body = serde_json::json!({
         "source": args.source.display().to_string(),
         "out_dir": args.out.display().to_string(),

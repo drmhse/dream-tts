@@ -25,11 +25,11 @@ cd dream-tts && ./scripts/bootstrap.sh
 
 ```sh
 # From a clone.
-./scripts/bootstrap.sh                       # qwen3tts, the default, ~4.3 GB
-./scripts/bootstrap.sh --all                 # all four engines, ~14 GB
+./scripts/bootstrap.sh                       # nano, the default, ~50 MB
+./scripts/bootstrap.sh --all                 # all five engines, ~14 GB
 ./scripts/bootstrap.sh --list                # the ids, their models, what each costs
 ./scripts/bootstrap.sh audio8 cosyvoice      # two of them
-./scripts/bootstrap.sh kokoro                # the cheap one, ~0.7 GB
+./scripts/bootstrap.sh qwen3tts              # best quality and cloning, ~4.3 GB
 ./scripts/bootstrap.sh --force audio8        # redo a conversion that already ran
 ./scripts/bootstrap.sh --prebuilt            # download the binaries rather than build them
 ```
@@ -39,8 +39,9 @@ checkpoints you asked for, fetches the fixtures, and either builds or downloads;
 is skipped if its output already exists, so re-running costs nothing. The rest of this
 section is what it does on your behalf, for when a step fails or you want to do one by hand.
 
-**Why the default is one engine.** `qwen3tts` alone is the only configuration whose setup is
-downloads and nothing else — no conversion, so no Python, so no torch venv. `audio8` folds a
+**Why the default is one engine.** `nano` alone is a 13 MB model, Kokoro's voice tables and its
+front end: downloads and nothing else — no conversion, so no Python, so no torch venv, and its gate's
+fixtures with it rather than every engine's. `qwen3tts` is downloads too, at 4.3 GB. `audio8` folds a
 `weight_norm` pickle, `cosyvoice` re-serialises a `torch.load` and `kokoro` folds 89 weight
 norms, and all three want python >= 3.10. Naming one is what buys that cost. The default used
 to be all of them, which meant every first run paid ~13 GB and a 2.5 GB venv to get an engine
@@ -66,7 +67,8 @@ fetched as assets.
 
 | level | you get | needs |
 |---|---|---|
-| 0. Qwen3-TTS | `dream-tts speak`, the default engine | curl, ~4.3 GB |
+| 0. nano | `dream-tts speak`, the default engine | curl, ~50 MB |
+| 0. Qwen3-TTS | `dream-tts speak --engine qwen3tts`, cloning | curl, ~4.3 GB |
 | 1. Audio8 | `dream-tts speak --engine audio8` | python >= 3.10, ~4 GB |
 | 2. CosyVoice | that engine | python >= 3.10, ~4 GB |
 | 3. Regenerate fixtures | the gates rebuilt from source | upstream CosyVoice repo, python 3.10 |

@@ -38,6 +38,22 @@ pub struct WordSpan {
     pub phonemes: std::ops::Range<usize>,
 }
 
+/// One token's part-of-speech tag, and the bytes of the phoneme string it produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagSpan {
+    pub tag: String,
+    pub phonemes: std::ops::Range<usize>,
+}
+
+/// What [`G2P::phonemize_tagged`] returns.
+#[derive(Clone, Debug)]
+pub struct TaggedPhonemes {
+    pub phonemes: String,
+    pub unknown: Vec<String>,
+    pub spans: Vec<WordSpan>,
+    pub tags: Vec<TagSpan>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct MToken {
     pub text: String,
@@ -482,7 +498,29 @@ impl G2P {
         self.run(text, true)
     }
 
+    /// [`Self::phonemize_all`] plus each token's part-of-speech tag over the bytes of its phonemes.
+    /// Bytes outside every range are the whitespace between tokens.
+    pub fn phonemize_tagged(&self, text: &str) -> TaggedPhonemes {
+        let (phonemes, unknown, spans, tags) = self.run_tagged(text, true);
+        TaggedPhonemes {
+            phonemes,
+            unknown,
+            spans,
+            tags,
+        }
+    }
+
     fn run(&self, text: &str, derive_unknown: bool) -> (String, Vec<String>, Vec<WordSpan>) {
+        let (phonemes, unknown, spans, _) = self.run_tagged(text, derive_unknown);
+        (phonemes, unknown, spans)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn run_tagged(
+        &self,
+        text: &str,
+        derive_unknown: bool,
+    ) -> (String, Vec<String>, Vec<WordSpan>, Vec<TagSpan>) {
         let mut unknown: Vec<String> = Vec::new();
         let mut words = self.retokenize(self.tokenize(text.trim_start()));
         if derive_unknown {
@@ -577,6 +615,7 @@ impl G2P {
             .collect();
         let mut out = String::new();
         let mut spans: Vec<WordSpan> = Vec::with_capacity(merged.len());
+        let mut tags: Vec<TagSpan> = Vec::with_capacity(merged.len());
         for tk in &merged {
             let start = out.len();
             match &tk.phonemes {
@@ -585,6 +624,10 @@ impl G2P {
                 Some(p) => out.push_str(&p.replace('ɾ', "T").replace('ʔ', "t")),
                 None => out.push_str(UNK),
             }
+            tags.push(TagSpan {
+                tag: tk.tag.clone(),
+                phonemes: start..out.len(),
+            });
             // A part of a merged compound carries no phonemes of its own — the head took
             // them all — so it joins the head rather than becoming a word that is said in no
             // time at all.
@@ -599,7 +642,7 @@ impl G2P {
             }
             out.push_str(&tk.whitespace);
         }
-        (out, unknown, spans)
+        (out, unknown, spans, tags)
     }
 
     /// The derivation stage, plus the lint. A word reported here is one the voice cannot

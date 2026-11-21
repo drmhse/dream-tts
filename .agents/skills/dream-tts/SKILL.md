@@ -5,9 +5,9 @@ description: Set up and drive dream-tts, the offline text-to-speech engine at ~/
 
 # dream-tts
 
-Offline TTS in Rust with Metal kernels. Four engines behind one CLI; `qwen3tts` is the default
-and the one to use unless something specific rules it out. `kokoro` is the exception worth
-knowing: 23x realtime in 1.3 GB, English only, and it cannot clone a voice.
+Offline TTS in Rust with Metal kernels. Five engines behind one CLI. `nano` is the default: a 13 MB
+model distilled from Kokoro, 200x realtime on the CPU in under 0.5 GB, English only, Kokoro's 28
+voices, and it cannot clone. `qwen3tts` is the one for a cloned voice or the best quality.
 
 Repository: `~/Desktop/projects/AI/tts/tts-rs`. Read `AGENTS.md` in the repo root first; it
 carries the rules that hold regardless of the task. `README.md` is the canonical guide and
@@ -27,6 +27,7 @@ numbers, because both carry measurements that this skill only summarises.
 ```sh
 ./dream-tts speak --text-file page.md --out page.wav
 ./dream-tts speak --text "Hello." --out hello.wav
+./dream-tts speak --text-file book.epub --out book.wav    # a whole book, one file, written as it goes
 ```
 
 **A book.** Look at the split before spending hours on it, then submit:

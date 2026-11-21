@@ -1,8 +1,8 @@
 # dream-tts
 
-Narrate anything in a cloned voice, on your own Mac, offline. A 1612-word chapter becomes
-11 minutes of speech in about 1m 15s — or 12 minutes in 27 seconds, if a built-in voice will do.
-One binary, no service, no API key, no Python at runtime.
+Narrate anything on your own Mac, offline. A 1612-word chapter becomes 12 minutes of speech in
+4 seconds with the default, a 13 MB model, or 11 minutes in about 1m 15s in a voice cloned from
+ten seconds of audio. One binary, no service, no API key, no Python at runtime.
 
 ### ▶ [Hear it first: one chapter, four engines, two voices each](https://drmhse.github.io/dream-tts/)
 
@@ -16,20 +16,33 @@ the CPU with `--no-default-features`, much more slowly.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/drmhse/dream-tts/main/install.sh | sh
-cd dream-tts && ./scripts/bootstrap.sh       # the model. ~4.3 GB, resumable, verified
+cd dream-tts && ./scripts/bootstrap.sh       # the model. ~50 MB, resumable, verified
 
 ./dream-tts speak --text "Hello from a fresh install." --out hello.wav
 ```
 
 No Rust toolchain and no Python: a `v*` tag publishes prebuilt arm64 binaries, and the default
-engine, `qwen3tts`, needs no conversion step. From a git clone with a toolchain,
+engine, `nano`, is a plain download. From a git clone with a toolchain,
 `./scripts/bootstrap.sh` builds instead. The other engines are one command each:
 
 ```sh
 ./scripts/bootstrap.sh --list              # the ids, their models, what each costs
-./scripts/bootstrap.sh kokoro              # 0.7 GB, and the fastest engine here
+./scripts/bootstrap.sh qwen3tts            # 4.3 GB: the best quality here, and voice cloning
 ./scripts/bootstrap.sh audio8 cosyvoice    # 44.1 kHz output, and the widest language coverage
 ```
+
+## A document to an audiobook, in one command
+
+```sh
+./dream-tts speak --text-file book.epub --out book.wav
+```
+
+EPUB, PDF, DOCX, ODT, Markdown, HTML, RTF, FictionBook, plain text, and scanned pages through
+OCR all work. The text is rewritten for the ear first, then spoken a part at a time, and each
+part is appended to `book.wav` as it is finished, so the file plays while it grows and memory
+holds one part. A 16-hour book takes about five minutes. Pick a voice with
+`--set voice=bm_george`; `./dream-tts engines` lists all 28. One WAV holds up to 24 hours; past
+that, `dream-tts book` (below) writes a file per chapter.
 
 Converting those checkpoints is where Python appears, once, in a venv; only the engines you
 ask for pay it. [Setup](docs/reference.md#setup) has the details.
@@ -45,14 +58,15 @@ references/qwen3tts/.venv/bin/python references/qwen3tts/export_voice.py \
     --text "the exact words spoken in the clip" \
     --name my-voice --out voices/my-voice
 
-./dream-tts speak --voice voices/my-voice --text-file chapter.md --out chapter.wav
+./dream-tts speak --engine qwen3tts --voice voices/my-voice --text-file chapter.md --out chapter.wav
 ```
 
-`kokoro` cannot clone; it carries 28 voices and takes one by name:
-`--engine kokoro --set voice=am_michael`.
-`--set decoder=nano` swaps Kokoro's 53M-parameter decoder for the 1.75M-parameter
-[nano-edge-tts](https://huggingface.co/drmhse/nano-edge-tts) one: same voices and timing, 3.5x faster on
-Metal, 8x on the CPU, with a slightly purer tone on some vowels ([measurements](docs/kokoro-model.md#the-nano-decoder)).
+`nano` and `kokoro` cannot clone. They carry Kokoro's 28 voices and take one by name:
+`--set voice=am_michael`. `nano` is
+[nano-edge-tts-standalone](https://huggingface.co/drmhse/nano-edge-tts-standalone): 3.27M parameters
+distilled from Kokoro-82M, with Kokoro's front end and voices and none of its networks. In a blind
+A/B against Kokoro it was heard as the same voice in 22 of 24 trials. It runs on the CPU, about
+10× faster than Kokoro on a quarter of the memory ([measurements](docs/kokoro-model.md#nano)).
 
 ## The engines
 
@@ -60,12 +74,15 @@ The same 1612-word chapter (`examples/chapter.txt`), each engine as it ships, tw
 
 | engine | RTF | wall time | peak memory | reach for it when |
 |---|---|---|---|---|
-| `qwen3tts` | **0.104–0.114** | **1m 12s–1m 19s** | 9.2 GB | the default. Best quality here, and the cloning engine that makes a book practical |
-| `kokoro` | **0.034–0.036** | **27 s** | 2.0 GB | English, no cloning, and you want it now — or have 2 GB to spare rather than 9 |
+| `nano` | **0.005** | **3.5–4.1 s** | 0.4–0.5 GB | the default. English in Kokoro's voices, at a fraction of everything else's cost |
+| `qwen3tts` | **0.104–0.114** | **1m 12s–1m 19s** | 9.2 GB | the best quality here, and the cloning engine that makes a book practical |
+| `kokoro` | **0.034–0.036** | **27 s** | 2.0 GB | the model `nano` was distilled from, when you want it exactly |
 | `audio8` | 0.527–0.536 | 5m 47s | 9.7 GB | you want 44.1 kHz, the highest-fidelity output here |
 | `cosyvoice` | 0.703–0.718 | 8m 15s | 5.0 GB | you want the widest language coverage |
 
-A 16-hour book costs about **1.7 hours** of compute on the default rather than 11.5. Compare
+`nano` was measured in a later session than the other rows; in that session Kokoro took 36 s,
+so the ratio between the two is 10×. A 16-hour book costs about **5 minutes** of compute on
+`nano`, **1.7 hours** on `qwen3tts`, and 11.5 on `cosyvoice`. Compare
 wall time, not only RTF: the engines speak at different speeds, and RTF flatters the slow ones.
 `qwen3tts` batches across segments, so it wants length — 0.314 on a 132-word passage — while
 the others are steady at any length. `audio8`'s and `cosyvoice`'s memory figures are for that
@@ -126,7 +143,7 @@ curl -X POST localhost:3003/tts -H "X-API-Key: secret" \
 ```rust
 use tts_core::{EngineConfig, SynthesisRequest, Voice};
 
-let id = tts_engines::default_id();                   // "qwen3tts"
+let id = "qwen3tts";                                  // the default, nano, takes no voice asset
 let engine = tts_engines::load(id, &EngineConfig::new(tts_engines::default_root(id)))?;
 let request = SynthesisRequest::new("Hello from Rust.")
     .with_voice(Voice::load(tts_engines::default_voice(id))?);
@@ -135,7 +152,7 @@ tts_core::wav::write("hello.wav", &out.audio)?;
 ```
 
 `tts_serve::Local` gives a host the server's synthesis without the server: one engine in your
-own process, single texts or batches. DreamReader runs Kokoro this way on the iPhone.
+own process, single texts or batches. DreamReader runs Kokoro and `nano` this way on the iPhone.
 
 ## Day to day
 
@@ -155,7 +172,7 @@ to swap. [Settings and storage](docs/reference.md#settings-and-storage) covers t
 
 - **`qwen3tts` speaks ten languages**: en, de, es, zh, ja, fr, ko, ru, it, pt. Outside them it
   warns, and `--engine audio8` or `cosyvoice` is the path.
-- **`kokoro` speaks English and cannot clone.** Its frontend has no espeak-ng, which is GPL;
+- **`nano` and `kokoro` speak English and cannot clone.** Their frontend has no espeak-ng, which is GPL;
   a word outside its lexicon is derived by rule or, in American English, guessed by g2p_en's
   small Apache-2.0 model, so an unusual word may come out a near miss. British voices name such
   words instead of saying them. [Out-of-lexicon words](docs/kokoro-frontend.md#out-of-lexicon-words)
@@ -167,7 +184,7 @@ to swap. [Settings and storage](docs/reference.md#settings-and-storage) covers t
 
 ## How it is built
 
-Four PyTorch models ported to Rust and candle, with the Metal kernels written here. Every stage
+Five PyTorch models ported to Rust and candle, with the Metal kernels written here. Every stage
 is checked against fp32 activations dumped from its reference, so a mismatch names the layer
 that caused it, and `./scripts/gates.sh` runs those checks from ~130 MB of published ground
 truth with no PyTorch installed.
@@ -183,7 +200,7 @@ crates/tts-engines/     the registry: the one place that knows which engines exi
 crates/tts-cli/         dream-tts            crates/tts-serve/   dream-tts-serve, and Local
 crates/tts-narrate/     text for the ear     crates/tts-import/  any document, chapters, web pages
 crates/tts-phoneme/     Kokoro's English frontend
-crates/{audio8,cosyvoice,qwen3tts,kokoro}/   one engine each, with its fixture gate
+crates/{audio8,cosyvoice,qwen3tts,kokoro}/   one engine each (and nano, in kokoro), with its fixture gate
 references/             the PyTorch side: conversion, fixtures, quality
 voices/  examples/  scripts/  docs/
 ```

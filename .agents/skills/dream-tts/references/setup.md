@@ -2,17 +2,17 @@
 
 ## The fast path
 
-`curl` is the only prerequisite. The default engine's checkpoint is a plain download with no
+`curl` is the only prerequisite. The default engine, `nano`, is a 13 MB plain download with no
 conversion step, and a `v*` tag publishes prebuilt arm64 binaries.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/drmhse/dream-tts/main/install.sh | sh
-cd dream-tts && ./scripts/bootstrap.sh       # ~4.3 GB, resumable, sha256-verified
+cd dream-tts && ./scripts/bootstrap.sh       # ~50 MB, resumable, sha256-verified
 ./dream-tts speak --text "Hello from a fresh install." --out hello.wav
 ```
 
 `install.sh` unpacks a release and stops; it prints the weights command rather than pulling
-4.3 GB unannounced. `DREAM_TTS_SETUP=1` makes it run that itself, `DREAM_TTS_DIR` moves the
+weights unannounced. `DREAM_TTS_SETUP=1` makes it run that itself, `DREAM_TTS_DIR` moves the
 install, `DREAM_TTS_VERSION` pins a release.
 
 From a git clone the same script does everything, and builds instead of downloading when it
@@ -24,34 +24,37 @@ finds a toolchain and sources:
 
 Every step is skipped when its output exists, so re-running after an interruption is cheap.
 
-## The other three engines
+## The other four engines
 
 ```sh
 ./scripts/bootstrap.sh --list              # ids, models, what each costs
+./scripts/bootstrap.sh qwen3tts            # ~4.3 GB, curl only: cloning and the best quality
+./scripts/bootstrap.sh kokoro              # ~0.7 GB, curl only
 ./scripts/bootstrap.sh audio8 cosyvoice
-./scripts/bootstrap.sh kokoro              # ~0.7 GB
 ./scripts/bootstrap.sh --all               # ~14 GB
 ```
 
-Each converts its checkpoint with PyTorch, so they want python >= 3.10 and a torch venv from
-`references/<engine>/requirements.txt`. That cost is paid only by whoever asks for them.
+`audio8` and `cosyvoice` convert their checkpoints with PyTorch, so they want python >= 3.10 and a
+torch venv from `references/<engine>/requirements.txt`. That cost is paid only by whoever asks.
 
 ## What it needs
 
 | engine | peak footprint | RTF on a short passage | reach for it when |
 |---|---|---|---|
-| `qwen3tts` | 6.7 GB | 0.314 | the default: best quality, and the only cloning engine practical for books |
+| `nano` | 0.5 GB | 0.005 | the default: English in Kokoro's voices, at a fraction of everything else's cost |
+| `qwen3tts` | 6.7 GB | 0.314 | best quality, and the only cloning engine practical for books |
 | `audio8` | 9.7 GB | 0.544 | 44.1 kHz output |
 | `cosyvoice` | 5.0 GB | 0.716 | widest language coverage |
 | `kokoro` | 1.6 GB | 0.036 | fastest and smallest by far, English only, cannot clone: `--set voice=<name>` |
 
-**16 GB for the default engine.** Most of its peak is the codec decoder's activations rather
+**16 GB for `qwen3tts`.** Most of its peak is the codec decoder's activations rather
 than weights — one 300-frame chunk is 5.5 GB — so no weight format moves the floor. Under 16 GB
 the engine says so on load and keeps going; it will swap, and swapping reads as the model being
 slow rather than as a mistake.
 
 `qwen3tts` speaks ten languages only: en, de, es, zh, ja, fr, ko, ru, it, pt. Anything else has
-no faithful path through it, and the CLI says so when it was chosen by default rather than named.
+no faithful path through it. `nano` and `kokoro` speak English only, and the CLI says so when the
+engine was chosen by default rather than named.
 
 ## Where things live
 

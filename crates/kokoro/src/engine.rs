@@ -7,7 +7,7 @@
 
 use crate::cfg::Config;
 use crate::decoder::SeededDraws;
-use crate::model::{DecoderKind, Model, Voices};
+use crate::model::{Model, Voices};
 use anyhow::{Context, Result};
 use candle_core::Device;
 use std::time::Instant;
@@ -102,12 +102,7 @@ impl KokoroEngine {
             Some(other) => anyhow::bail!("--set british= takes true or false, got {other:?}"),
             None => voice.starts_with('b'),
         };
-        // `--set decoder=nano` swaps Kokoro's 53M decoder for the 1.75M one in `nano/`.
-        let decoder = match config.overrides.get("decoder").and_then(|p| p.to_str()) {
-            Some(name) => name.parse()?,
-            None => DecoderKind::default(),
-        };
-        let model = Model::load_with(&config.model_root, &device, decoder)?;
+        let model = Model::load(&config.model_root, &device)?;
         let voices = Voices::load(&config.path("voices", "voices.safetensors"), &device)?;
         anyhow::ensure!(
             voices.names().contains(&voice.as_str()),
@@ -309,7 +304,7 @@ impl Engine for KokoroEngine {
 /// The pad ids at each end belong to no word and are given an offset past every span. Their
 /// frames still advance the clock, because they are real audio: a word's start is where it
 /// starts in the file, not where it starts among the words.
-fn word_times(
+pub(crate) fn word_times(
     spans: &[tts_phoneme::g2p::WordSpan],
     offsets: &[Option<usize>],
     durations: &[usize],
