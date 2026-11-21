@@ -123,7 +123,7 @@ say "Done: $fetched fetched, $skipped already present and verified."
 [ "$ignored" -gt 0 ] && [ -z "$ONLY" ] && printf '  (%d dataset file(s) this script does not install, e.g. the rendered samples)\n' "$ignored"
 
 # CosyVoice still needs its checkpoint converted; say so rather than implying it can run.
-if [ ! -f references/cosyvoice/weights/llm.safetensors ]; then
+if [ ! -f references/cosyvoice/weights/llm.safetensors ] && { [ -z "$ONLY" ] || [[ " $ONLY " == *" cosyvoice "* ]]; }; then
   printf '\n  * CosyVoice has its assets but not its weights — convert the checkpoint,\n'
   printf '    see docs/reference.md#setup. Everything else here is ready.\n'
 fi
