@@ -61,6 +61,7 @@ case "$BIN" in
   qwen3tts-validate)  CRATE=qwen3tts  ;;
   kokoro-validate)    CRATE=kokoro    ;;
   kokoro-render)      CRATE=kokoro    ;;
+  nano-validate)      CRATE=kokoro    ;;
   narrate-diff)       CRATE=tts-narrate ;;
   *) printf 'error: unknown binary `%s`\n' "$BIN" >&2; exit 2 ;;
 esac
