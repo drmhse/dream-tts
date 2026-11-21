@@ -166,11 +166,11 @@ static RULES: Lazy<Compiled> = Lazy::new(|| Compiled {
 pub fn speak_math(inner: &str) -> String {
     // `[0, 1]` is an interval, and its comma reads as a list unless the bounds are named.
     let mut s = re::sub_str(&INTERVAL, inner, " the range ${1} to ${2} ");
-    // Nested fractions, innermost first.
+    // Roots and fractions nest in each other, so both go innermost first, together.
     for _ in 0..3 {
+        s = re::sub_str(&SQRT, &s, " the square root of ${1} ");
         s = re::sub_str(&FRAC, &s, "${1} over ${2}");
     }
-    s = re::sub_str(&SQRT, &s, " the square root of ${1} ");
     s = re::sub_str(&FONT, &s, "${1}");
     for (regex, replacement) in &RULES.accents_braced {
         s = re::sub_str(regex, &s, replacement);

@@ -284,9 +284,10 @@ def speak_math(inner: str) -> str:
     s = inner
     # `[0, 1]` is an interval, and its comma reads as a list unless the bounds are named.
     s = re.sub(r"\[\s*([^\[\],]+?)\s*,\s*([^\[\],]+?)\s*\]", r" the range \1 to \2 ", s)
-    for _ in range(3):  # nested fractions, innermost first
+    # Roots and fractions nest in each other, so both go innermost first, together.
+    for _ in range(3):
+        s = re.sub(r"\\sqrt\s*\{([^{}]*)\}", r" the square root of \1 ", s)
         s = re.sub(r"\\[dt]?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}", r"\1 over \2", s)
-    s = re.sub(r"\\sqrt\s*\{([^{}]*)\}", r" the square root of \1 ", s)
     s = re.sub(r"\\(?:textrm|text|mathrm|mathbf|mathbb|mathcal|boldsymbol|operatorname)\s*\{([^{}]*)\}",
                r"\1", s)
     # Accents are spoken after the symbol, which is how they are named aloud: "theta hat".

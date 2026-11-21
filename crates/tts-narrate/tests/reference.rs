@@ -221,6 +221,14 @@ fn operators_and_accents() {
 }
 
 #[test]
+fn roots_and_fractions_nest() {
+    assert_eq!(
+        c(r"$\frac{QK^T}{\sqrt{d_k}}$ and $\sqrt{\frac{a}{b}}$"),
+        "QK to the power T over the square root of d k and the square root of a over b"
+    );
+}
+
+#[test]
 fn display_maths_is_shown_not_spoken() {
     assert_eq!(
         doc("Before.\n\n$$\n\\sum_{i=1}^{N} x_i\n$$\n\nAfter.\n"),
